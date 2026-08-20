@@ -313,8 +313,40 @@ E8P doğrulandı (`quantize.py`): 227 negatif-olmayan yarı-tam-sayı örüntü
 bit/ağırlık**. Yarı-tam-sayı seçimi tesadüf değil: koordinatlar asla sıfır
 olmadığından 128 işaret çevirmesinin hepsi ayrı vektör verir.
 
-> Checkpoint'in **gerçek dosya boyutundan** doğrulanmalı (katman ölçekleri ve
-> Hadamard seed'leri dahil).
+**Checkpoint'ten ölçüldü** (2026-08-21, `experiments/m0_vq_bits.py`,
+`relaxml/Llama-2-7b-E8P-2Bit`). Manifest aritmetiği ve toplam dosya boyutu
+birbirini **tam** tutturuyor:
+
+| | bit/ağırlık |
+|---|---|
+| kodsözcüğü yükü (`Qidxs`) | **2.000000** — tam |
+| + yan bilgi (SU, SV, Wscale, codebook_id, fuse_scales) | **2.005204** |
+
+Yük gerçekten tam 2 bit: `down_proj` satır başına 11008 ağırlık için 344 int64
+saklıyor ve `344·64 = 2·11008`. Şartnamenin varsayımı %0.26 eksik kalıyor —
+karar değiştirecek kadar büyük değil, sessizce atılacak kadar küçük değil.
+`accounting.E8P_STORED_BITS` bunu iki tam sayının bölümü olarak taşıyor.
+
+**Ama asıl bulgu SU ile SV'nin aynı şey olmaması.** SU (girdi ekseni) ince
+ayarın ±1'den zar zor kıpırdattığı bir işaret vektörü (`|x| ∈ [0.996, 1.004]`,
+11008 girdide 26 ayrık değer); SV (çıktı ekseni) gerçek kanal-başı ölçek
+taşıyor (`|x| ∈ [0.514, 1.461]`, %5.6'sı 1'in %1 yakınında). Yani dönüşüm
+ayrışıyor:
+
+```
+girdi ekseninde köşegen   → GLOBAL, n_in girdi, gather ile değişmeli
+                             (köşegen, sütun seçimiyle yer değiştirir)
+çıktı ekseninde köşegen   → GLOBAL, n_out girdi
+rotasyonun kendisi        → tile başına, ama seed'den üretilirse yük taşımaz
+```
+
+Bu, hattın maliyetini değiştiriyor. Her tile kendi sütun kümesine sahip olduğu
+için, tile başına **öğrenilmiş** bir sütun vektörü tutmak `entry_bits/T`
+(T=16'da 1.0 bit), paketlenmiş işaret olarak tutmak `1/T` (0.0625 bit) demekti —
+ikincisi bile indeksin üstüne aynı `1/T` şeklinde binen ve tile kazancının
+dörtte birini yiyen bir terim. **Ayrıştırılmış tasarımda bu terim oluşmuyor:**
+`accounting.rotation_side_bits(16, 7926, 4096, n_in=11008) = 0.0077` bit ve
+`T` ile neredeyse hiç değişmiyor.
 
 ### 3.3 API
 
@@ -502,7 +534,9 @@ ve istatistikler **sıkıştırılmış** modelden gelir (§7, tuzak 20).
 - [x] E8P codebook doğrulandı (227+29, 2¹⁶, 2.0 bit)
 - [x] HuggingFace adaptörü + katman-akışlı eval — 7B, 8 GB kartta, 4 dk/eval
 - [x] `vnm` formülü VENOM'dan doğrulandı — ve §0.4'ü daralttı
-- [ ] VQ checkpoint maliyetleri **dosya boyutundan** ölçüldü
+- [x] **VQ checkpoint maliyeti dosya boyutundan ölçüldü** (2026-08-21):
+      yük **tam 2.000000**, saklanan **2.005204**; iki bağımsız türetme
+      birbirini tam tutturuyor. SU/SV ayrışması §3.2'de.
 - [x] **Protokol kimliği** (2026-08-21): 2048 → **5.4675**, 4096 → **5.1143**;
       ikisi de yayımlanmıştan <0.006 sapıyor. **seqlen 4096 birincil** donduruldu.
 - [ ] `tau_sweep.py`: `Q(d)` 3 seed, `τ(T,d)` **eşleştirilmiş** 1 seed

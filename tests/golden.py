@@ -377,12 +377,58 @@ def rht_overhead_ratio(tile_size: int | str, density: float, n_idx: int) -> floa
 # rather than GPTQ-4bit.  E8P is a STRUCTURED codebook, so Spec v6 section 3.2's
 # amortization term is zero and W collapses from 532/128 to exactly 2.
 #
-# WARNING (plan H5/H7): vq_bits = 2.0 is the paper-arithmetic value and the
-# assumption that E8P holds its quality on a COMPACTED SURVIVOR submatrix is
-# explicitly untested.  Measure it from the checkpoint file size before it
-# anchors anything.
+# MEASURED 2026-08-21 against relaxml/Llama-2-7b-E8P-2Bit, by two independent
+# routes that agree exactly: adding up the manifest, and subtracting the fp16
+# parts from the total file size.  The payload really is 2 bits on the nose --
+# 344 int64 per down_proj row for 11008 weights, and 344*64 == 2*11008.
+#
+# WARNING (plan H5/H7): what remains untested is QUALITY, not cost -- whether
+# E8P holds 2-bit fidelity on a COMPACTED SURVIVOR submatrix.  The cost question
+# spec v6 raised here is closed.
 
 E8P_VQ_BITS = F(2)
+
+#: Side info the QuIP# release keeps per linear, over the whole checkpoint:
+#: SU (n_in), SV (n_out), Wscale, codebook_id, fuse_scales, all in bits.
+#: Written as the division so no digit of it is typed.
+E8P_SIDE_BITS = F(33_698_304)
+E8P_QUANTIZED_WEIGHTS = F(6_476_005_376)
+E8P_STORED = E8P_VQ_BITS + E8P_SIDE_BITS / E8P_QUANTIZED_WEIGHTS
+
+
+def e8p_layer_side_bits(n_in: int, n_out: int, *, fused: int = 1,
+                        entry_bits: int = 16) -> F:
+    """Side info for one QuIP# linear, from the released tensor list.
+
+    SU is n_in fp16, SV is n_out fp16, Wscale one fp16, codebook_id one int64,
+    and a fused linear adds one fp16 per fused part (`fuse_scales`).
+    """
+    n = F(entry_bits) * (n_in + n_out + 1) + 64
+    if fused > 1:
+        n += F(entry_bits) * fused
+    return n
+
+
+#: The four fused linears of a Llama-2-7B block, as the checkpoint stores them.
+#: (n_out, n_in, fused parts)
+E8P_LINEARS = (
+    (12288, 4096, 3),      # self_attn.qkv_proj
+    (4096, 4096, 1),       # self_attn.o_proj
+    (22016, 4096, 2),      # mlp.upgate_proj
+    (4096, 11008, 1),      # mlp.down_proj
+)
+N_BLOCKS_7B = 32
+
+
+def rotation_side_bits(tile_size: int | str, survivors_per_tile: int,
+                       n_out: int, n_in: int, *, entry_bits: int = 16,
+                       seed_bits: int = 32) -> F:
+    """Our per-tile rotation, in the separated design: two global diagonals
+    plus one seed per tile, over the surviving weights."""
+    t = n_out if tile_size == "max" else tile_size
+    return (F(seed_bits) * F(n_out, t) + F(entry_bits) * (n_in + n_out)) / (
+        F(n_out) * survivors_per_tile
+    )
 
 #: The whole live band moves below 2 bits -- which is the regime the thesis is
 #: about and where dense PTQ has no answer (QuIP# 2-bit 6.66, QuaRot-GPTQ 2-bit

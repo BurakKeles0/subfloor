@@ -112,6 +112,10 @@ Bu ayrımı açıkça yapmak gerekiyor.
   türetiliyor; `accounting.py` genel dispatch ile hesaplıyor. İki yol, tek cevap
 - E8P codebook kurgusu — 227+29 kaynak örüntüsü enumerasyonla, 2¹⁶ ayrık
   kodsözcüğü, kafes üyeliği, **tam 2 bit/ağırlık**
+- **`vq_bits = 2.0`'ın maliyet tarafı, gerçek checkpoint'ten** — QuIP# E8P ve
+  QTIP releases'lerinde kodsözcüğü yükü tam 2.000000; katman-başı yan bilgiyle
+  2.005204 / 2.006740. Manifest aritmetiği ve toplam dosya boyutu birbirini tam
+  tutturuyor (`experiments/m0_vq_bits.py`)
 - Rotasyonun maskeyi koruduğu (her iki eksende, her `T`'de)
 - Telafinin ileriye-only olduğu, ve kazancının kanal korelasyonundan geldiği
 - Kalibrasyonun sıkıştırılmış modeli okuduğu — sentetik bloklarda **ve gerçek bir Llama'da**
@@ -124,6 +128,9 @@ Bu ayrımı açıkça yapmak gerekiyor.
 > E8P'nin **kompaktlanmış survivor alt-matrisinde** 2 bit kalitesini koruduğu.
 > Survivor'lar tanım gereği dağılımın kalın kuyruğu; kafes quantizer Gauss'a
 > yakın girdi ister. Rotasyon bunu düzeltmeli ama gösterilmedi.
+>
+> Ölçüm **maliyeti** kapattı, kaliteyi değil: 2 bit ödendiği kesin, o 2 bitin
+> karşılığında 2 bitlik *kalite* alınıp alınmadığı açık.
 
 Bu varsayımı sınayacak ucuz deney bilinçli olarak atlandı. Erken uyarı kuralı ve
 geri dönüş yolu `preregistration.md` §9.1'de tanımlı.

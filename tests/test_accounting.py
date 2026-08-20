@@ -693,3 +693,118 @@ def test_new_primary_band_is_live(budget):
     for r in rows:
         assert r["live"]
         assert r["offset"] == pytest.approx(0.0, abs=1e-9)
+
+
+# --------------------------------------------------------------------------- #
+# E8P, measured from the checkpoint (STATUS item 4, spec v7 section 3.2)
+# --------------------------------------------------------------------------- #
+
+def test_e8p_payload_is_exactly_two_bits():
+    """The claim spec v7 hangs the live band on, checked against the release.
+
+    QuIP#'s Llama-2-7B stores 344 int64 per `down_proj` row for 11008 weights.
+    344 * 64 == 2 * 11008 exactly, and the same holds for every other linear --
+    so `idx_bits/dim` is not an approximation here, it is the file format.
+    """
+    assert A.E8P_PAYLOAD_BITS == 2.0
+    assert A.vq_bits_from_spec(16, 8) == A.E8P_PAYLOAD_BITS
+    for n_out, n_in, _ in G.E8P_LINEARS:
+        cols, rem = divmod(2 * n_in, 64)
+        assert rem == 0, "the release packs 4 codewords per int64 with no slack"
+        assert cols * 64 == 2 * n_in
+
+
+def test_e8p_side_info_reproduces_the_measured_total():
+    """Re-derive the checkpoint's side info from the tensor list.
+
+    `E8P_SIDE_BITS` is the one hand-entered number in this block, so it gets an
+    independent route: sum SU + SV + Wscale + codebook_id + fuse_scales over the
+    four fused linears of all 32 blocks and land on the same integer.
+    """
+    per_block = sum(G.e8p_layer_side_bits(n_in, n_out, fused=f)
+                    for n_out, n_in, f in G.E8P_LINEARS)
+    assert per_block * G.N_BLOCKS_7B == G.E8P_SIDE_BITS
+
+    weights = sum(F(n_out * n_in) for n_out, n_in, _ in G.E8P_LINEARS)
+    assert weights * G.N_BLOCKS_7B == G.E8P_QUANTIZED_WEIGHTS
+
+    assert A.E8P_STORED_BITS == approx(G.E8P_STORED)
+
+
+def test_the_side_info_correction_is_small_but_not_zero():
+    """0.26% -- too small to move a decision, too real to drop silently.
+
+    It is charged per surviving weight, so it scales the whole budget: at any
+    budget the density it buys drops by exactly the same relative amount.
+    """
+    assert 0.005 < A.E8P_STORED_BITS - A.E8P_PAYLOAD_BITS < 0.006
+
+    relative = None
+    for budget in G.E8P_BUDGETS:
+        d_paper = A.density_for_budget("tile", float(budget), None, N,
+                                       tile_size=16, vq_bits=A.E8P_PAYLOAD_BITS)
+        d_real = A.density_for_budget("tile", float(budget), None, N,
+                                      tile_size=16, vq_bits=A.E8P_STORED_BITS)
+        assert d_real < d_paper
+        r = (d_paper - d_real) / d_paper
+        if relative is None:
+            relative = r
+        assert r == pytest.approx(relative, rel=1e-9)
+    assert relative == pytest.approx(
+        1 - A.E8P_PAYLOAD_BITS / A.E8P_STORED_BITS, rel=1e-9)
+
+
+@pytest.mark.parametrize("tile", [4, 8, 16, 32, "max"])
+def test_rotation_side_bits_matches_the_exact_derivation(tile):
+    k = 7926                              # d = 0.72 of 11008
+    got = A.rotation_side_bits(tile, k, 4096, n_in=11008)
+    assert got == approx(G.rotation_side_bits(tile, k, 4096, 11008))
+
+
+def test_separated_rotation_has_no_one_over_t_term():
+    """The finding that keeps the rotation affordable at small T.
+
+    Holding a learned vector per tile would put a `1/T` term right on top of the
+    index -- at T=16 a packed sign vector alone is 0.0625 bits, a quarter of the
+    0.25 bits the tiling saves over T=4.  The separated design does not have
+    that shape: its cost is nearly flat in T, because only a 32-bit seed is per
+    tile and the diagonals are global.
+    """
+    k, n_out, n_in = 7926, 4096, 11008
+    sep = {t: A.rotation_side_bits(t, k, n_out, n_in=n_in)
+           for t in (4, 8, 16, 32, 64)}
+    per_tile = {t: A.rotation_side_bits(t, k, n_out, scheme="per_tile_sign")
+                for t in (4, 8, 16, 32, 64)}
+
+    # per-tile storage halves with every doubling of T; separated barely moves
+    for a, b in zip((4, 8, 16, 32), (8, 16, 32, 64)):
+        assert per_tile[a] / per_tile[b] == pytest.approx(2.0)
+    assert max(sep.values()) / min(sep.values()) < 1.15
+
+    # and it is two orders of magnitude cheaper where it matters
+    assert sep[16] < per_tile[16] / 8
+    assert A.rotation_side_bits(16, k, n_out, scheme="per_tile_fp16") == 1.0
+
+
+def test_rotation_side_bits_validates():
+    with pytest.raises(ValueError):
+        A.rotation_side_bits(16, 0, 4096, n_in=11008)
+    with pytest.raises(ValueError):
+        A.rotation_side_bits(8192, 100, 4096, n_in=11008)     # T > n_out
+    with pytest.raises(ValueError):
+        A.rotation_side_bits(16, 100, 4096)                   # separated needs n_in
+    with pytest.raises(ValueError):
+        A.rotation_side_bits(16, 100, 4096, n_in=11008, scheme="nope")
+
+
+def test_the_measured_constants_are_integers_over_integers():
+    """The rule at the top of `accounting.py`, applied to the new constants.
+
+    Both halves of the E8P side-info figure are counts read off a manifest.
+    Storing the quotient instead invites exactly the error the v6 audit found
+    four times over, and did produce one here on the first attempt.
+    """
+    assert isinstance(A.E8P_SIDE_INFO_BITS, int)
+    assert isinstance(A.E8P_QUANTIZED_WEIGHTS, int)
+    assert A.E8P_STORED_BITS == (
+        A.E8P_PAYLOAD_BITS + A.E8P_SIDE_INFO_BITS / A.E8P_QUANTIZED_WEIGHTS)

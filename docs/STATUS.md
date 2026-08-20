@@ -61,6 +61,7 @@ sırayla çağrılırsa hata fırlatır.
 | Akışlı eval == tam model eval | 1e-6 |
 | Kapı B'nin gürültüde geçmediği | 6 ayrı gürültü çekilişi |
 | **Dense ppl (gerçek model)** | 2048 → 5.4675, 4096 → 5.1143; yayımlanmıştan <0.006 |
+| **`vq_bits = 2.0` (maliyet)** | QuIP# E8P ve QTIP releases'lerinin manifest'i; kodsözcüğü yükü **tam 2.000000**, yan bilgiyle 2.005204 / 2.006740. Manifest ve dosya boyutu iki bağımsız yol, tam aynı sayı |
 
 ### Varsayım — doğrulanmadı
 
@@ -122,6 +123,22 @@ bir şey ortaya çıktı: VENOM `V` satırın paylaştığı bir sütun seçimi 
 yani indeksi `1/V` ile amortize ediyor. **İndeks amortizasyonu yeni değil.**
 Katkı "amortize etmek" değil, `(T, d)` düzlemini bir bütçe altında taramak.
 
+**SU ve SV aynı şey değil — ve bu hattın maliyetini kurtarıyor.** QuIP#'in yan
+bilgisini ölçerken çıktı: `SU` (girdi ekseni) ince ayarın ±1'den zar zor
+kıpırdattığı bir işaret vektörü (11008 girdide 26 ayrık değer, hepsi 1'in %0.4
+yakınında); `SV` (çıktı ekseni) gerçek kanal-başı ölçek. QTIP'te aynı asimetri
+daha da keskin (SU 8 ayrık değer; SV ~0.018 civarında saf ölçek).
+
+Önemi şu: her tile kendi sütun kümesine sahip olduğu için, tile başına
+**öğrenilmiş** bir sütun vektörü tutmak `16/T` bit (T=16'da 1.0 — bant bunu
+kaldırmaz), paketlenmiş işaret olarak tutmak `1/T` bit (0.0625) demekti.
+İkincisi bile indeksin üstüne aynı `1/T` şeklinde binen bir terim. Ölçüm bunu
+ödemek zorunda olmadığımızı gösteriyor: köşegen gather ile yer değiştirdiği
+için **girdi ekseni köşegeni global tutulabilir**, tile başına kalan tek şey
+rotasyonun kendisi, o da seed'den üretilirse yük taşımıyor. Ayrıştırılmış
+tasarımda maliyet **0.0077 bit/survivor** ve `T` ile neredeyse sabit.
+`accounting.rotation_side_bits`.
+
 **Protokol ayrımı dizi uzunluğuymuş.** Ölçümden önce hipotez olarak kaydedildi,
 ölçümde tuttu. Kural "birini seç" değil "pencereyi sabitle".
 
@@ -145,8 +162,11 @@ Katkı "amortize etmek" değil, `(T, d)` düzlemini bir bütçe altında taramak
    ayırmaya yetiyor mu? Kapı A provası çapa 1'de tam o iki hücreyi belirsiz
    bırakmıştı, yani bu teorik bir kaygı değil. **M1'den önce.**
 
-4. **`vq_bits = 2.0` doğrulaması** — E8P'nin katman-başı ölçekleri ve Hadamard
-   seed'leri dahil gerçek maliyeti, checkpoint dosya boyutundan.
+~~4. `vq_bits = 2.0` doğrulaması~~ — **yapıldı, 2026-08-21.** Yük tam 2.000000;
+   yan bilgi dahil 2.005204 (QTIP 2.006740). Izgara `vq_bits = 2.0`'da
+   donduruluyor, düzeltme raporlanan bütçeye geri ekleniyor — gerekçe
+   `preregistration.md` §2. `experiments/m0_vq_bits.py`, ağdan yalnızca
+   safetensors başlığını çekiyor.
 
 ### Sonra
 
@@ -221,6 +241,7 @@ işler için dar.
 | `eval/streamed.py` | katman-akışlı ppl (GPU'ya sığmayan model) |
 | `experiments/m1_gates.py` | M1'in iki kapısı |
 | `experiments/m0_dense_ppl.py` | dense ölçüm + protokol kimliği |
+| `experiments/m0_vq_bits.py` | VQ checkpoint maliyeti — manifest'ten, indirmeden |
 
 **Belgeler:** `spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı**) · `audit.md` (v6 denetimi, tarihsel kayıt) ·
@@ -231,6 +252,7 @@ işler için dar.
 python -m pytest tests/ -q                    # 353 test
 HF_HUB_DISABLE_XET=1 python experiments/m0_dense_ppl.py --seqlens 2048 4096 --device cuda
 python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --budgets 1.5
+python experiments/m0_vq_bits.py --all       # ~100 KB ağ trafiği, saniyeler
 ```
 
 ---
@@ -249,6 +271,8 @@ python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --budgets 1.5
 | `33d66a4` | Katman-akışlı eval — 7B'yi 8 GB'da ölçmenin yolu |
 | `3ee1628` | M0 dense ölçüm betiği (hipotez ölçümden önce kaydedildi) |
 | `d80ab14` | **İlk gerçek ölçüm**: protokol sorusu çözüldü |
+| `e5ec362` | Bu belge |
+| *(bu tur)* | VQ maliyeti checkpoint'ten ölçüldü; SU/SV ayrışması bulundu |
 
 ---
 

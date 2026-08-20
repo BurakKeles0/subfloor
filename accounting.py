@@ -45,6 +45,11 @@ __all__ = [
     "q_overhead",
     "weight_cost",
     "vq_bits_from_spec",
+    "E8P_PAYLOAD_BITS",
+    "E8P_SIDE_INFO_BITS",
+    "E8P_QUANTIZED_WEIGHTS",
+    "E8P_STORED_BITS",
+    "rotation_side_bits",
     "entropy_bits",
     "nm_index_bits",
     "vnm_index_bits",
@@ -112,6 +117,36 @@ LIVE_DENSITY_MAX = 0.9   # required: d(T=max) <  LIVE_DENSITY_MAX
 #: natural cost gets a signed offset column, flagged past this threshold.
 OFFSET_FLAG_THRESHOLD = 0.01
 
+# --------------------------------------------------------------------------- #
+# E8P, measured
+# --------------------------------------------------------------------------- #
+# Spec v7 section 3.2 requires the VQ cost to come off a real checkpoint before
+# it anchors anything, because the whole live band hangs off it.  Measured by
+# `experiments/m0_vq_bits.py` against relaxml/Llama-2-7b-E8P-2Bit, 2026-08-21;
+# the manifest arithmetic and the total file size agree exactly.
+
+#: Codeword payload alone: 2^16 codewords over 8 dims.  Verified against the
+#: released index shapes, not assumed -- e.g. down_proj stores 344 int64 per row
+#: for 11008 weights, and 344*64 == 2*11008 on the nose.
+E8P_PAYLOAD_BITS = 2.0
+
+#: Everything the QuIP# release keeps per linear besides the codewords: SU, SV,
+#: Wscale, codebook_id, fuse_scales, summed over all 32 blocks.  Two integers
+#: read off the manifest; the division is left to the machine, per the rule at
+#: the top of this file.  (Typing the quotient instead is not hypothetical --
+#: the first draft of this line was wrong in the seventh decimal, and
+#: `tests/golden.py` caught it.)
+E8P_SIDE_INFO_BITS = 33_698_304
+E8P_QUANTIZED_WEIGHTS = 6_476_005_376
+E8P_STORED_BITS = E8P_PAYLOAD_BITS + E8P_SIDE_INFO_BITS / E8P_QUANTIZED_WEIGHTS
+
+#: What our pipeline should pay instead.  QuIP#'s SU and SV turn out to be
+#: different objects: SU (input side) is a sign vector fine-tuning barely moved
+#: off +-1, SV (output side) carries real per-channel scale.  So the transform
+#: separates into two GLOBAL diagonals and a per-tile rotation, and a rotation
+#: drawn from a seed carries no payload.  See `rotation_side_bits`.
+ROTATION_SEED_BITS = 32
+
 
 # --------------------------------------------------------------------------- #
 # Weight cost
@@ -172,8 +207,11 @@ def vq_bits_from_spec(
     >>> round(vq_bits_from_spec(16, 8, weights_per_codebook=45.1e6), 6)
     2.186
 
-    WARNING: this is the paper-arithmetic value.  Spec v6 requires the real cost
-    to be measured from the checkpoint's file size before it anchors anything.
+    This is the paper-arithmetic value.  Spec v6 required the real cost to be
+    measured from a checkpoint before it anchors anything; that is now done for
+    E8P and the payload term is exact -- see `E8P_PAYLOAD_BITS`.  What the
+    formula omits is the per-linear side info, `E8P_STORED_BITS - 2.0` in the
+    QuIP# release, so keep using the measured constant to anchor budgets.
     """
     if dim <= 0:
         raise ValueError(f"dim must be positive, got {dim}")
@@ -335,6 +373,68 @@ def _elementwise_index(density: float, n_idx: int, model: str) -> float:
     if model == "info_theoretic":
         return entropy_bits(density)
     raise ValueError(f"unknown index_model {model!r}")
+
+
+def rotation_side_bits(
+    tile_size: int | str,
+    survivors_per_tile: int,
+    n_out: int,
+    *,
+    n_in: int | None = None,
+    scheme: str = "separated",
+    entry_bits: int = DEFAULT_SCALE_BITS,
+    seed_bits: int = ROTATION_SEED_BITS,
+) -> float:
+    """Bits per SURVIVING weight for the rotation's side information.
+
+    Rotating compacted survivors is not free of storage the way QuIP#'s is: each
+    tile owns a different column set, so anything held per column is held once
+    per tile.  Three ways to pay it, and which one applies is a design decision
+    the measurement settled rather than a fact about the scheme:
+
+      "per_tile_fp16"   a learned column vector per tile     -> entry_bits / T
+      "per_tile_sign"   a stored sign vector per tile        -> 1 / T
+      "separated"       two global diagonals plus a seeded rotation per tile
+
+    The first two carry a `1/T` term, which would sit right on top of the index
+    and eat a fixed share of the tiling gain -- a quarter of it at T=16 even in
+    the packed-sign form.  The third does not, and the third is available: a
+    diagonal commutes with the gather, so the input-side diagonal can be applied
+    before compaction and shared by every tile, while only the rotation proper
+    stays per-tile and a seeded orthogonal stores nothing but its seed.
+
+    >>> round(rotation_side_bits(16, 7926, 4096, n_in=11008), 6)
+    0.007696
+    >>> rotation_side_bits(16, 7926, 4096, scheme="per_tile_sign")
+    0.0625
+    """
+    if survivors_per_tile <= 0:
+        raise ValueError(f"survivors_per_tile must be positive, "
+                         f"got {survivors_per_tile}")
+    if n_out <= 0:
+        raise ValueError(f"n_out must be positive, got {n_out}")
+    t = n_out if tile_size == MAX_TILE else tile_size
+    if not isinstance(t, int) or t < 1:
+        raise ValueError(
+            f"tile_size must be a positive int or {MAX_TILE!r}, got {tile_size!r}"
+        )
+    if t > n_out:
+        raise ValueError(f"tile_size {t} exceeds n_out {n_out}")
+
+    if scheme == "per_tile_fp16":
+        return entry_bits / t
+    if scheme == "per_tile_sign":
+        return 1.0 / t
+    if scheme != "separated":
+        raise ValueError(f"unknown rotation side-info scheme {scheme!r}")
+    if n_in is None:
+        raise ValueError("scheme='separated' requires n_in for the input diagonal")
+    if n_in <= 0:
+        raise ValueError(f"n_in must be positive, got {n_in}")
+
+    n_tiles = n_out / t
+    n_survivors = n_out * survivors_per_tile
+    return (seed_bits * n_tiles + entry_bits * (n_in + n_out)) / n_survivors
 
 
 def _inv_tile(scheme: str, tile_size: int | str | None) -> float:

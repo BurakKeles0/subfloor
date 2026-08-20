@@ -31,6 +31,23 @@ geçersiz kılmaması.
 **Model:** Llama-2-7B. **Eksen:** B (row-tile). **Survivor quantizer:** QuIP# E8P,
 `vq_bits = 2.0`.
 
+> **Ölçülen düzeltme ve neden ızgaraya girmiyor (2026-08-21).** Gerçek
+> checkpoint'te kodsözcüğü yükü tam 2.000000, katman-başı yan bilgiyle birlikte
+> 2.005204 (QTIP'te 2.006740). Bizim hattımızda karşılığı
+> `accounting.rotation_side_bits` ile **0.0075–0.0085 bit/survivor** — `T` ile
+> neredeyse hiç değişmiyor.
+>
+> **Izgara `vq_bits = 2.0`'da donduruluyor.** Gerekçe: düzeltme her hücrede
+> **aynı göreli** miktarda (%0.26–0.42) yoğunluk düşürüyor — bütçeden bağımsız,
+> `T`'den bağımsız — yani hücreler arası bütçe-eşleşmesini bozmuyor, sadece
+> hepsini birlikte kaydırıyor. Buna karşılık tam 2, `B=1.5` ızgarasının
+> tamamını tam dyadic kesirler yapıyor (1/4, 1/2, 5/8, 11/16, 23/32, 47/64,
+> 3/4) ve `tests/golden.py`'nin bağımsız türetmesi buna dayanıyor.
+>
+> **Şart:** makalede raporlanan bit bütçesi düzeltmeyi **geri ekler**; yani
+> `B = 1.50` hücresi "1.50 bit" değil, "1.50 + 0.008 ≈ 1.51 bit" olarak
+> raporlanır. Bu satır dondurmadan önce yazıldı ki sonradan seçilmiş olmasın.
+
 E8P ile canlı bant **1.40 – 1.80** (Spec v6 §3.5 filtresi). Birincil bütçeler
 üçü de bu bandın içinde ve **tamamı 2 bitin altında** — yani yoğun PTQ'nun
 cevabının olmadığı rejim.
@@ -234,14 +251,24 @@ ayırmanın bütün amacı buydu.
       baseline'larını (QTIP/QuIP# 2-3-4 bit) birlikte taşıyor — Kapı A'nın
       rakibi QTIP 2-bit de orada. seqlen 2048 ikincil olarak raporlanır;
       SliceGPT ve QuaRot karşılaştırmaları yalnızca orada geçerli.
-- [ ] **QTIP checkpoint'inin ölçülen bit maliyeti** (dosya boyutundan)
-- [ ] **`vq_bits = 2.0` doğrulaması** — E8P'nin katman-başı ölçekleri ve
-      Hadamard seed'leri dahil gerçek maliyet
+- [x] **`vq_bits = 2.0` doğrulaması** — 2026-08-21, `experiments/m0_vq_bits.py`.
+      Kodsözcüğü yükü **tam 2.000000**; katman-başı yan bilgi dahil edilince
+      **2.005204**. Manifest aritmetiği ile toplam dosya boyutu birbirini tam
+      tutturuyor. Fark %0.26 ve bütçeden bağımsız olarak yoğunluğu aynı oranda
+      düşürüyor — `accounting.E8P_STORED_BITS`.
+- [x] **QTIP checkpoint'inin ölçülen bit maliyeti** — aynı koşu:
+      yük **tam 2.000000**, saklanan **2.006740**. Kapı A'nın rakibi 2 biti
+      gerçekten 2 bitte tutuyor; provanın QTIP 2-bit = 5.86 satırı bütçe
+      açısından dürüst.
 
 ### 9.1 Taşınan açık varsayım
 
 > **E8P'nin kompaktlanmış survivor alt-matrisinde `vq_bits ≈ 2.0` kalitesini
 > koruduğu VARSAYILIYOR; doğrulanmadı.**
+>
+> 2026-08-21 ölçümü **maliyeti** kapattı, kaliteyi değil. Açık olan tam olarak
+> şu: 2 bit ödeniyor, ama kalın kuyruklu survivor alt-matrisinde 2 bitlik
+> *kalite* alınıp alınmadığı bilinmiyor.
 
 Survivor'lar tanım gereği dağılımın kalın kuyruğu, kafes quantizer ise Gauss'a
 yakın girdi ister. Bu varsayımı sınayacak ucuz deney **bilinçli olarak atlandı**
