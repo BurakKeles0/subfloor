@@ -87,6 +87,7 @@ python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --seeds 3 --bud
 | `quantize.py` | QuIP# E8P codebook + LDLQ (Hessian-farkında yuvarlama) |
 | `calibrate.py` | sıralı kalibrasyon; istatistikler **sıkıştırılmış** modelden |
 | `eval/perplexity.py` | ppl + protokol koruması |
+| `hf_llama.py` | HuggingFace adaptörü — blok 0'ın girdilerini yakalar |
 | `experiments/m1_gates.py` | M1'in iki kapısı |
 
 **Belgeler:**
@@ -110,7 +111,9 @@ Bu ayrımı açıkça yapmak gerekiyor.
   kodsözcüğü, kafes üyeliği, **tam 2 bit/ağırlık**
 - Rotasyonun maskeyi koruduğu (her iki eksende, her `T`'de)
 - Telafinin ileriye-only olduğu, ve kazancının kanal korelasyonundan geldiği
-- Kalibrasyonun sıkıştırılmış modeli okuduğu
+- Kalibrasyonun sıkıştırılmış modeli okuduğu — sentetik bloklarda **ve gerçek bir Llama'da**
+- Adaptörün modelin kendi hesabını birebir yeniden ürettiği (elle sürülen
+  bloklar → modelin logit'leri, 1e-5)
 - Kapı B'nin gürültüde "interior" **demediği**
 
 **Varsayım — doğrulanmadı:**
@@ -122,8 +125,10 @@ Bu ayrımı açıkça yapmak gerekiyor.
 Bu varsayımı sınayacak ucuz deney bilinçli olarak atlandı. Erken uyarı kuralı ve
 geri dönüş yolu `preregistration.md` §9.1'de tanımlı.
 
-**Henüz hiç gerçek model koşulmadı.** Bütün ölçümler ya katman düzeyinde
-`tr(E H Eᵀ)` proxy'si ya da sentetik veri. Sentetik smoke testte hata eğrisi
+**Henüz gerçek bir checkpoint koşulmadı.** Hat uçtan uca çalışıyor ve
+rastgele başlatılmış küçük bir Llama üzerinde test edildi, ama eğitilmiş
+ağırlıklarla değil. Kalite ölçümleri hâlâ ya katman düzeyinde `tr(E H Eᵀ)`
+proxy'si ya da sentetik veri. Sentetik smoke testte hata eğrisi
 U şeklinde çıkıyor ve Kapı A geçiyor — ama **veriyi biz ürettik, bu tez lehine
 kanıt değil.**
 
@@ -131,10 +136,6 @@ kanıt değil.**
 
 ## Eksikler
 
-- **HuggingFace adaptörü.** `sequential_calibrate` herhangi bir `list[nn.Module]`
-  üzerinde çalışıyor; Llama'yı bağlamak için blok çıkarıcı ve `block_kwargs`
-  (attention mask, position embeddings) gerekiyor. Gerçek modelle denenmeden
-  yazılmamalı
 - **Ön-kayıt toleransı.** Transfer pilotundan türetilmeli, seed varyansından
   değil — yoksa prereg "tutmadı" dalına kilitlenir
 - **Kapı B'nin istatistiksel gücü.** 5 çekiliş `T=4` ile `T=16`'yı ayırmaya

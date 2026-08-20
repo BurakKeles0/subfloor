@@ -239,6 +239,7 @@ tilesparse/
 ├── rotation.py       maske-koruyan rotasyon
 ├── quantize.py       E8P codebook + LDLQ
 ├── calibrate.py      sıralı kalibrasyon, LayerProblem
+├── hf_llama.py       HuggingFace adaptörü (blok 0 girdilerini yakalar)
 ├── eval/perplexity.py  ppl + protokol koruması
 ├── experiments/m1_gates.py
 ├── preregistration.md   ← M1'den ÖNCE dondurulur
