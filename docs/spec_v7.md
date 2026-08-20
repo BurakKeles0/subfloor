@@ -542,7 +542,8 @@ ve istatistikler **sıkıştırılmış** modelden gelir (§7, tuzak 20).
 - [ ] `tau_sweep.py`: `Q(d)` 3 seed, `τ(T,d)` **eşleştirilmiş** 1 seed
 - [ ] **Transfer pilotu** — `τ`'yu bir noktada quantization'lı/suz ölç,
       ön-kayıt toleransını oradan türet (~2 GPU-saat)
-- [ ] Minimum saptanabilir fark (Kapı B'nin gücü)
+- [x] **Minimum saptanabilir fark ölçüldü** (2026-08-21): 5 çekiliş → 2.29 σ;
+      ölçülen etki 6.7 σ. `T*` artık küme, çekiliş ekseni kalibrasyon.
 - [ ] **`preregistration.md` donduruldu ve commit edildi**
 
 Maliyet: `Q` 5×3 + `τ` 25×1 + pilot ≈ **25 GPU-saat** (C4 eval'i dahil).
@@ -562,6 +563,19 @@ karşılaştırma *"2 bitin altında, 2 bite karşı"*. A fortiori geçerlidir.
 **Kapı B:** optimum `T` içeride mi, uçta mı? **Argmin değildir.** Üç koruma:
 ≥5 çekiliş, iç adaylar üzerinden Bonferroni, farklar üzerinde eşleştirilmiş
 bootstrap. A fortiori **geçerli değildir** — hem Wanda hem SparseGPT ile koşulur.
+
+**Gücü ölçüldü** (2026-08-21, `experiments/m0_gate_b_power.py`, gerçek `gate_b`
+üzerinden 600 deneme): 5 çekiliş **2.29 σ** saptıyor, ölçülen etki `T=max`
+ucunda **6.7 σ** — üç kat marj, `min_seeds=5` korunuyor. Tip-I her yerde %5'in
+altında.
+
+> ⚠️ **Ama `T*` bunun kapsamında değil.** Optimumu uçlardan ayırmak büyük,
+> komşu tile'dan ayırmak küçük bir farktır: `T=4` ↔ `T=8` sentetik katmanda
+> **0.31 σ**, %90 güvenilir bir argmin için ~53 çekiliş isterdi. Bu yüzden
+> `T*` **küme olarak** raporlanır (`m1_gates.t_star_set`). Ayrıca Kapı B'nin
+> çekiliş ekseni **kalibrasyondur**, rotasyon seed'i değil — ikincisi ölçülen
+> gürültünün yarısı ve iki kat fazla kendinden emin sonuç verir.
+> Ön-kayıt §7.1–7.4.
 
 > Karar tablosu ve okuma kuralları `preregistration.md` §6–§8'de.
 > **Kapı B düşerse proje durmaz**; Kapı A'nın bağımsız değeri vardır.

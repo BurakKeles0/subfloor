@@ -29,6 +29,7 @@ import argparse
 import json
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -269,6 +270,64 @@ def gate_a(records: list[dict], wall: dict, alpha: float = 0.05) -> dict:
     }
 
 
+def t_star_set(records: list[dict], alpha: float = 0.05) -> dict:
+    """Which granularities are NOT distinguishable from the best one.
+
+    Gate B's verdict and the headline T* are different claims with different
+    evidence behind them, and the second is the weaker one.  Separating the
+    optimum from the EDGES is a large difference; separating it from its
+    NEIGHBOUR is a small one, and the power analysis
+    (`experiments/m0_gate_b_power.py`) puts numbers on the gap: with a flat
+    interior at one sigma and twenty draws, the verdict is right 76% of the time
+    while the argmin is right 48% -- barely better than picking between the two
+    tiles nearest the bottom.
+
+    So T* is reported as a SET: the argmin, plus every interior tile whose
+    paired difference from it cannot be shown to be positive.  A one-element set
+    is a real claim about granularity; a four-element set says the curve is flat
+    and the honest headline is "interior", not "T = 8".
+
+    The test is one-sided by construction: every other tile has a mean at or
+    above the argmin's, so only the lower end of the interval can settle
+    anything.  Reading one end of a two-sided interval at `alpha_eff` makes the
+    effective level `alpha_eff / 2`, i.e. the set errs toward being too large.
+    That is the right direction to err -- an over-wide set understates the
+    claim, a too-narrow one manufactures a granularity result.
+    """
+    by_tile: dict[object, list[float]] = {}
+    for r in records:
+        if "skipped" not in r:
+            by_tile.setdefault(r["tile_size"], []).append(r["rel_output_error"])
+
+    tiles = [t for t in by_tile if t not in (1, Tl.MAX_TILE)]
+    if not tiles:
+        return {"t_star": None, "set": [], "reason": "no interior tiles"}
+
+    means = {t: sum(by_tile[t]) / len(by_tile[t]) for t in tiles}
+    t_star = min(tiles, key=lambda t: means[t])
+    alpha_eff = alpha / max(1, len(tiles) - 1)
+
+    keep, detail = [t_star], {}
+    for t in tiles:
+        if t == t_star:
+            continue
+        lo, hi = paired_bootstrap_ci(by_tile[t], by_tile[t_star], alpha=alpha_eff)
+        separated = lo > 0.0
+        detail[str(t)] = {"ci": (lo, hi), "separated_from_t_star": separated}
+        if not separated:
+            keep.append(t)
+
+    return {
+        "t_star": t_star,
+        "set": sorted(keep, key=lambda t: (t == Tl.MAX_TILE, t)),
+        "n_candidates": len(tiles),
+        "alpha_effective": alpha_eff,
+        "detail": detail,
+        "note": ("a set larger than one means the granularity axis is flat "
+                 "near the optimum; report the set, not the argmin"),
+    }
+
+
 def gate_b(records: list[dict], alpha: float = 0.05, min_seeds: int = 5) -> dict:
     """Is the optimum T interior, or at an edge?
 
@@ -356,6 +415,19 @@ def _git_hash() -> str:
 
 @dataclass
 class GateRun:
+    """The M1 grid: budgets x tile sizes x draws.
+
+    A DRAW is a calibration draw -- a different sample of text the layer sees --
+    and that is what `run` wants: pass a sequence of `LayerProblem`s, one per
+    draw, sharing a fixed rotation seed.
+
+    Passing a single problem instead falls back to varying the ROTATION seed,
+    which is a different and much smaller noise source: measured on a synthetic
+    layer at 0.72% of the error level against 1.41% for calibration draws
+    (`experiments/m0_gate_b_power.py`).  Gate B run on rotation seeds would
+    therefore be roughly twice as confident as the evidence supports, so the
+    fallback records what it did and `gate_b`'s output is marked.
+    """
     budgets: tuple = DEFAULT_BUDGETS
     tiles: tuple = DEFAULT_TILES
     seeds: tuple = (0, 1, 2)
@@ -365,20 +437,29 @@ class GateRun:
     rotate_axis: str | None = "index"
     records: list = field(default_factory=list)
 
-    def run(self, problem: LayerProblem) -> dict:
-        wall = dense_wall(problem)
+    def run(self, problem: LayerProblem | Sequence[LayerProblem]) -> dict:
+        problems = [problem] if isinstance(problem, LayerProblem) else list(problem)
+        if not problems:
+            raise ValueError("need at least one LayerProblem")
+        draw_axis = "calibration" if len(problems) > 1 else "rotation_seed"
+        # One draw per problem when problems vary; otherwise one per seed.
+        draws = ([(p, self.seeds[0]) for p in problems] if draw_axis == "calibration"
+                 else [(problems[0], s) for s in self.seeds])
+        wall = dense_wall(problems[0])
         out = {
             "meta": {
                 "git": _git_hash(),
                 "utc": datetime.now(timezone.utc).isoformat(),
-                "layer": problem.name,
-                "n_out": problem.n_out,
-                "n_in": problem.n_in,
+                "layer": problems[0].name,
+                "n_out": problems[0].n_out,
+                "n_in": problems[0].n_in,
                 "axis": self.axis,
                 "metric": self.metric,
                 "compensate": self.compensate,
                 "rotate_axis": self.rotate_axis,
                 "seeds": list(self.seeds),
+                "draw_axis": draw_axis,
+                "n_draws": len(draws),
                 "survivor_quantizer": "E8P",
                 "vq_bits": E8P_BITS,
             },
@@ -388,21 +469,23 @@ class GateRun:
         for b in self.budgets:
             recs = []
             for t in self.tiles:
-                for s in self.seeds:
+                for prob, s in draws:
                     r = run_config(
-                        problem, budget_bits=b, tile_size=t, axis=self.axis,
+                        prob, budget_bits=b, tile_size=t, axis=self.axis,
                         metric=self.metric, compensate=self.compensate,
                         rotate_axis=self.rotate_axis, seed=s,
                     )
+                    r["draw_axis"] = draw_axis
                     recs.append(r)
             self.records.extend(recs)
             out["budgets"][str(b)] = {
                 "records": recs,
                 "gate_a": gate_a(recs, wall),
-                "gate_b": gate_b(recs),
+                "gate_b": dict(gate_b(recs), draw_axis=draw_axis),
+                "t_star_set": t_star_set(recs),
                 "live": A.is_live(
-                    A.Config(scheme="tile", vq_bits=E8P_BITS, n_idx=problem.n_in,
-                             tile_size=16, budget_bits=b)
+                    A.Config(scheme="tile", vq_bits=E8P_BITS,
+                             n_idx=problems[0].n_in, tile_size=16, budget_bits=b)
                 ),
             }
         return out
@@ -411,7 +494,9 @@ class GateRun:
 def _report(out: dict) -> None:
     m = out["meta"]
     print(f"layer {m['layer']}  axis={m['axis']}  metric={m['metric']}  "
-          f"quantizer=E8P({m['vq_bits']} bit)  seeds={m['seeds']}")
+          f"quantizer=E8P({m['vq_bits']} bit)  "
+          f"{m.get('n_draws', len(m['seeds']))} draws over "
+          f"{m.get('draw_axis', 'rotation_seed')}")
     print(f"PTQ floor reference: dense E8P @ {out['wall']['bits_realized']} bit  "
           f"-> rel.err {out['wall']['rel_output_error']:.4f}\n")
     for b, blk in out["budgets"].items():
@@ -430,7 +515,10 @@ def _report(out: dict) -> None:
         print(f"  Gate A: {ga['verdict']}  (best T={ga.get('best_tile')}, "
               f"{ga.get('best_mean_error', float('nan')):.4f} vs wall "
               f"{ga.get('wall_error', float('nan')):.4f})")
-        print(f"  Gate B: {gb['verdict']}  (T*={gb.get('t_star')})\n")
+        ts = blk["t_star_set"]
+        members = ", ".join(str(t) for t in ts["set"])
+        print(f"  Gate B: {gb['verdict']}  (T*={gb.get('t_star')}; "
+              f"not separable from it: {{{members}}})\n")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -439,7 +527,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="run on generated data as a smoke test")
     ap.add_argument("--n-out", type=int, default=128)
     ap.add_argument("--n-in", type=int, default=256)
-    ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--draws", type=int, default=3,
+                    help="calibration draws -- the axis Gate B's CIs are over")
+    ap.add_argument("--rotation-seeds-as-draws", action="store_true",
+                    help="replicate over the rotation seed instead; measured at "
+                         "about half the noise, so Gate B comes out overconfident")
     ap.add_argument("--budgets", type=float, nargs="*", default=list(DEFAULT_BUDGETS))
     ap.add_argument("--axis", default="B", choices=["A", "B"])
     ap.add_argument("--no-compensate", action="store_true")
@@ -453,13 +545,16 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
-    problem = synthetic_problem(args.n_out, args.n_in)
     run = GateRun(
-        budgets=tuple(args.budgets), seeds=tuple(range(args.seeds)), axis=args.axis,
+        budgets=tuple(args.budgets), seeds=tuple(range(args.draws)), axis=args.axis,
         compensate=not args.no_compensate,
         rotate_axis=None if args.no_rotate else "index",
     )
-    out = run.run(problem)
+    if args.rotation_seeds_as_draws:
+        out = run.run(synthetic_problem(args.n_out, args.n_in))
+    else:
+        out = run.run([synthetic_problem(args.n_out, args.n_in, seed=d)
+                       for d in range(args.draws)])
     _report(out)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

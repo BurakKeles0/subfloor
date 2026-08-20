@@ -207,8 +207,85 @@ fark üzerinde eşleştirilmiş yeniden örnekleme yapılır.
 
 Uygulama: `experiments/m1_gates.gate_b`, testleri altı ayrı gürültü çekilişinde.
 
-**Minimum saptanabilir fark:** §9'da doldurulacak. 5 çekiliş bu ayrımı yapmaya
-yetmiyorsa **M1'den önce** öğrenilecek, sonra değil.
+### 7.1 Minimum saptanabilir fark — ölçüldü (2026-08-21)
+
+`experiments/m0_gate_b_power.py`, **gerçek `gate_b`'yi** çağırarak 600 denemelik
+simülasyon (idealize bir z-testi değil; Bonferroni düzeltmesi ve `min_seeds`
+kapısı dahil). Etki, eşleştirilmiş gürültü `σ` biriminde:
+
+| çekiliş | %80 güç | %50 güç | δ=0'da yanlış "interior" |
+|---|---|---|---|
+| 3 | *(karar yok)* | *(karar yok)* | 0.000 |
+| **5** | **2.29 σ** | 1.47 σ | 0.033 |
+| 8 | 1.76 σ | 1.28 σ | 0.010 |
+| 10 | 1.64 σ | 1.20 σ | 0.010 |
+| 15 | 1.37 σ | 0.98 σ | 0.005 |
+| 20 | 1.25 σ | 0.88 σ | 0.012 |
+| 30 | 0.95 σ | 0.73 σ | 0.003 |
+
+Tip-I hızı her yerde nominal %5'in altında — ①②③'ün üçü birlikte çalışıyor ve
+kapı gürültüde şişmiyor.
+
+**σ ölçümü** (sentetik katman, `B=1.5`, 8 çekiliş — büyüklük mertebesi, değer
+değil): kalibrasyon ekseninde `σ = 0.00446`, hata seviyesinin **%1.41**'i.
+Buna göre 5 çekilişte saptanabilir fark hata seviyesinin **%3.2**'si.
+
+**Aynı katmanda ölçülen gerçek etki:** uçlar iç optimumdan `T=1` için **26.5 σ**,
+`T=max` için **6.7 σ** uzakta. Bağlayıcı olan `T=max` ve o da eşiğin **3 katı**.
+
+> **KARAR: Kapı B'nin verdikti için 5 çekiliş yeterlidir** ve `gate_b`'nin
+> `min_seeds=5` eşiği korunur. Gerekçe yukarıdaki 3× marj.
+
+### 7.2 `T*` bir nokta değil, bir kümedir
+
+Aynı simülasyon ikinci ve daha sıkı bir kısıt buldu: **verdikt ile `T*` aynı
+güvenilirlikte değil.** Optimumu *uçlardan* ayırmak büyük bir farktır; *komşu
+tile'dan* ayırmak küçük. Düz bir iç bölgede (`spread=3`), `δ=1σ`, 20 çekiliş:
+verdikt %77 doğru, **argmin yalnızca %41**.
+
+Sentetik katmanda ölçülen komşu farkları bunu doğruluyor:
+
+| karşılaştırma | fark | 5 çekilişte argmin doğru | %90 için gereken çekiliş |
+|---|---|---|---|
+| `T=4` ↔ `T=16` | 2.69 σ | ~%99.9 | 2 |
+| **`T=4` ↔ `T=8`** | **0.31 σ** | **~%65** | **~53** |
+
+> **KURAL:** `T*` **tek başına raporlanmaz.** `m1_gates.t_star_set` argmin'den
+> ayrılamayan bütün iç tile'ları döndürür ve manşet o kümedir. Tek elemanlı bir
+> küme granülerlik hakkında gerçek bir iddiadır; dört elemanlı bir küme
+> *"eğri düz, optimum içeride ama yeri belirsiz"* demektir — ve bu da meşru bir
+> sonuçtur, sahte bir kesinlik değil.
+
+### 7.3 Çekiliş ekseni: kalibrasyon, rotasyon değil
+
+Aynı koşuda ölçüldü: rotasyon seed'i ekseninde `σ = 0.00228`, kalibrasyon
+ekseninin **yarısı** (oran 1.95×). `GateRun` bu ölçüme kadar çekilişleri
+rotasyon seed'i üzerinden üretiyordu; öyle koşulsa Kapı B kanıtın izin
+verdiğinden **iki kat kendinden emin** çıkacaktı.
+
+> **KURAL:** Kapı B'nin CI'ları **kalibrasyon çekilişleri** üzerinedir.
+> `GateRun.run` artık `LayerProblem` listesi alır. Tek problem verilirse
+> rotasyon seed'ine düşer ve çıktı `draw_axis` ile **etiketlenir**; o etiketi
+> taşıyan hiçbir sayı Kapı B kanıtı olarak raporlanamaz.
+
+**Not — eşleştirmenin kazancı beklenenden küçük.** Ölçülen eşleştirme kazancı
+yalnızca **1.16×**, yani kalibrasyon gürültüsü tile boyutları arasında büyük
+ölçüde bağımsız çıktı. Bu, §5.2'nin *"ortak gürültü sadeleşiyor"* gerekçesini
+zayıflatır **ama kuralı değiştirmez**: eşleştirme hiçbir koşulda zarar vermez,
+ve sentetik kurgu ortak bileşeni yapısı gereği eksik ölçüyor — her çekiliş
+**aynı** dağılımdan yeniden çiziliyor, oysa gerçek kalibrasyon çekilişleri
+içerik olarak birbirinden farklı. 1.16× bir **alt sınır** olarak okunmalıdır.
+
+### 7.4 M1'e girerken uyarlanabilir kontrol (önceden kaydedilir)
+
+Yukarıdaki σ sentetiktir. Gerçek σ ilk M1 bütçesinden gelecek. Sonradan
+seçilmiş görünmemesi için kural **şimdi** yazılıyor:
+
+> İlk bütçe `n = 5` çekilişle koşulur. O koşudan `σ` ve `δ = min(Δ(1), Δ(max)) −
+> Δ(T*)` hesaplanır. **`δ/σ < 2.29` ise** kalan bütçelere geçmeden önce çekiliş
+> sayısı, yukarıdaki tablodan `δ/σ`'yı karşılayan değere yükseltilir ve **ilk
+> bütçe de o sayıyla yeniden koşulur.** Çekiliş sayısı sonuca bakılarak
+> ayarlanmaz — yalnızca ölçülen `δ/σ`'ya bakılarak ayarlanır.
 
 **Saliency kuralı:** a fortiori Kapı B'ye **uygulanmaz.** SparseGPT'ye yükseltmek
 farklı `T`'leri eşit iyileştirmez ve yönü öngörülemez. Bu yüzden Kapı B hem Wanda
@@ -239,7 +316,10 @@ ayırmanın bütün amacı buydu.
       kesin aşılır ve prereg "tutmadı" dalına kilitlenir.
       *Pilot: `τ`'yu tek bir `(T,d)` noktasında hem quantization'sız hem E8P ile
       ölç, farkı tolerans olarak al. ~2 GPU-saat.*
-- [ ] **Minimum saptanabilir fark** (§7) — M0'ın seed varyansından
+- [x] **Minimum saptanabilir fark** (§7.1) — 2026-08-21 ölçüldü.
+      5 çekiliş → **2.29 σ**; ölçülen etki `T=max` ucunda 6.7 σ, yani
+      3× marj. `min_seeds=5` korunuyor. Ayrıca §7.2 (`T*` küme olarak),
+      §7.3 (çekiliş ekseni kalibrasyon) ve §7.4 (uyarlanabilir kontrol).
 - [ ] **`Δ(T)` tahmin eğrisi** — M0'ın `Q` ve `τ` yüzeyleri tamamlanınca
 - [ ] **`T*_tahmin`**
 - [x] **Dense ppl ölçümü ve protokol kimliği** (§4) — 2026-08-21, ölçüldü:

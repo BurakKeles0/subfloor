@@ -61,6 +61,7 @@ sırayla çağrılırsa hata fırlatır.
 | Akışlı eval == tam model eval | 1e-6 |
 | Kapı B'nin gürültüde geçmediği | 6 ayrı gürültü çekilişi |
 | **Dense ppl (gerçek model)** | 2048 → 5.4675, 4096 → 5.1143; yayımlanmıştan <0.006 |
+| **Kapı B'nin gücü** | 600 denemelik simülasyon, **gerçek `gate_b` çağrılarak**. 5 çekiliş → 2.29 σ saptıyor; ölçülen etki 6.7 σ. Tip-I her yerde %5'in altında |
 | **`vq_bits = 2.0` (maliyet)** | QuIP# E8P ve QTIP releases'lerinin manifest'i; kodsözcüğü yükü **tam 2.000000**, yan bilgiyle 2.005204 / 2.006740. Manifest ve dosya boyutu iki bağımsız yol, tam aynı sayı |
 
 ### Varsayım — doğrulanmadı
@@ -139,6 +140,23 @@ rotasyonun kendisi, o da seed'den üretilirse yük taşımıyor. Ayrıştırılm
 tasarımda maliyet **0.0077 bit/survivor** ve `T` ile neredeyse sabit.
 `accounting.rotation_side_bits`.
 
+**Kapı B'nin verdikti güvenli, `T*` değil.** Güç analizi ikiye ayrıldı ve iki
+farklı cevap verdi. Verdikt (içeride mi, uçta mı) 5 çekilişle rahat kararlanıyor
+— bağlayıcı uç `T=max` ve o da eşiğin üç katı uzakta. Ama **komşu tile'lar
+ayrılmıyor**: sentetik katmanda `T=4` ile `T=8` arası yalnızca **0.31 σ**,
+%90 güvenilir bir argmin için ~53 çekiliş gerekiyor. Düz bir iç bölgede 20
+çekilişle verdikt %77 doğru, argmin %41.
+
+Sonuç `m1_gates.t_star_set`: argmin değil, argmin'den **ayrılamayanların
+kümesi**. Duman testinde Kapı B "interior" derken küme `{2, 4, 8, 16}` çıkıyor —
+yani dürüst manşet "T=16 optimal" değil, "optimum içeride, yeri 2–16 arasında".
+
+**Çekilişler yanlış eksende üretiliyordu.** `GateRun` rotasyon seed'ini
+değiştiriyordu, ön-kayıt ise kalibrasyon çekilişi diyor. Ölçüldü: kalibrasyon
+gürültüsü rotasyon gürültüsünün **1.95 katı**. Öyle koşulsa Kapı B iki kat fazla
+kendinden emin çıkacaktı. `run()` artık `LayerProblem` listesi alıyor; tek
+problem verilirse eski davranışa düşüyor ama çıktıyı `draw_axis` ile etiketliyor.
+
 **Protokol ayrımı dizi uzunluğuymuş.** Ölçümden önce hipotez olarak kaydedildi,
 ölçümde tuttu. Kural "birini seç" değil "pencereyi sabitle".
 
@@ -158,9 +176,11 @@ tasarımda maliyet **0.0077 bit/survivor** ve `T` ile neredeyse sabit.
    E8P ile ölç. Ön-kaydın **toleransı** buradan türetilecek. Seed varyansından
    türetilirse prereg "tutmadı" dalına kilitlenir. ~2 GPU-saat.
 
-3. **Kapı B'nin minimum saptanabilir farkı** — 5 çekiliş `T=4` ile `T=16`'yı
-   ayırmaya yetiyor mu? Kapı A provası çapa 1'de tam o iki hücreyi belirsiz
-   bırakmıştı, yani bu teorik bir kaygı değil. **M1'den önce.**
+~~3. Kapı B'nin minimum saptanabilir farkı~~ — **yapıldı, 2026-08-21.**
+   Cevap ikiye ayrılıyor: verdikt için 5 çekiliş yeterli (2.29 σ saptıyor,
+   etki 6.7 σ); `T=4` ↔ `T=16` de ayrılıyor (2.69 σ). Ama `T=4` ↔ `T=8`
+   **ayrılmıyor** (0.31 σ) — bu yüzden `T*` artık küme olarak raporlanıyor.
+   Ön-kayıt §7.1–7.4. `experiments/m0_gate_b_power.py`.
 
 ~~4. `vq_bits = 2.0` doğrulaması~~ — **yapıldı, 2026-08-21.** Yük tam 2.000000;
    yan bilgi dahil 2.005204 (QTIP 2.006740). Izgara `vq_bits = 2.0`'da
@@ -197,8 +217,11 @@ durmaz, çerçeve daralır.
 **E8P varsayımı** (§3). Düşerse bant 1.83–2.83'e kayar ve tezin "2 bitin altı"
 motivasyonu zayıflar.
 
-**Kapı B'nin istatistiksel gücü.** 5 çekiliş yetmeyebilir. Yetmiyorsa ya daha
-çok çekiliş ya da daha büyük etki gerekir.
+**Kapı B'nin istatistiksel gücü** — verdikt tarafında **çözüldü** (5 çekiliş
+yeterli, §7.1). Kalan risk `T*`'ın kendisi: eğri iç bölgede düzse küme büyük
+çıkar ve *hangi* granülerlik sorusu cevapsız kalır. Bu bir başarısızlık değil,
+ama manşeti zayıflatır. Ölçülen σ **sentetik**; gerçeği ilk M1 bütçesinden
+gelecek ve §7.4'ün uyarlanabilir kontrolü onun için var.
 
 **Takvim.** Spec'in M0–M5 tahmini 8–10 hafta; gerçekçi olarak 2–3 katı.
 8 GB kart yerel geliştirme için yeterli ama `τ` süpürmesi gibi çok noktalı
@@ -242,6 +265,7 @@ işler için dar.
 | `experiments/m1_gates.py` | M1'in iki kapısı |
 | `experiments/m0_dense_ppl.py` | dense ölçüm + protokol kimliği |
 | `experiments/m0_vq_bits.py` | VQ checkpoint maliyeti — manifest'ten, indirmeden |
+| `experiments/m0_gate_b_power.py` | Kapı B'nin gücü + boru hattının gürültüsü |
 
 **Belgeler:** `spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı**) · `audit.md` (v6 denetimi, tarihsel kayıt) ·
@@ -251,7 +275,8 @@ işler için dar.
 ```bash
 python -m pytest tests/ -q                    # 353 test
 HF_HUB_DISABLE_XET=1 python experiments/m0_dense_ppl.py --seqlens 2048 4096 --device cuda
-python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --budgets 1.5
+python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --budgets 1.5 --draws 5
+python experiments/m0_gate_b_power.py --no-noise   # simülasyon (~15 dk), σ önbellekten
 python experiments/m0_vq_bits.py --all       # ~100 KB ağ trafiği, saniyeler
 ```
 
@@ -272,7 +297,8 @@ python experiments/m0_vq_bits.py --all       # ~100 KB ağ trafiği, saniyeler
 | `3ee1628` | M0 dense ölçüm betiği (hipotez ölçümden önce kaydedildi) |
 | `d80ab14` | **İlk gerçek ölçüm**: protokol sorusu çözüldü |
 | `e5ec362` | Bu belge |
-| *(bu tur)* | VQ maliyeti checkpoint'ten ölçüldü; SU/SV ayrışması bulundu |
+| `a1626c6` | VQ maliyeti checkpoint'ten ölçüldü; SU/SV ayrışması bulundu |
+| *(bu tur)* | Kapı B'nin gücü ölçüldü; `T*` küme oldu; çekiliş ekseni düzeldi |
 
 ---
 

@@ -326,3 +326,101 @@ def test_gate_run_produces_a_complete_report(problem):
 
 def test_cli_refuses_to_pretend_it_can_load_a_model():
     assert M.main([]) == 2
+
+
+# --------------------------------------------------------------------------- #
+# T* as a set, not a point
+# --------------------------------------------------------------------------- #
+
+def test_t_star_set_collapses_to_one_tile_when_the_optimum_is_sharp():
+    """A sharp optimum earns a point estimate."""
+    tiles = {1: [0.50] * 8, 2: [0.44] * 8, 4: [0.36] * 8, 8: [0.20] * 8,
+             16: [0.36] * 8, 32: [0.45] * 8, Tl.MAX_TILE: [0.52] * 8}
+    out = M.t_star_set(_records(tiles))
+    assert out["t_star"] == 8
+    assert out["set"] == [8]
+
+
+def test_t_star_set_keeps_every_tile_a_flat_interior_cannot_separate():
+    """The case the power analysis says to expect: a flat bottom.
+
+    T=4, 8 and 16 differ by less than the noise, so the argmin among them is
+    close to arbitrary and the honest report is all three.
+    """
+    g = torch.Generator().manual_seed(4)
+    base = {1: 0.50, 2: 0.42, 4: 0.301, 8: 0.300, 16: 0.302, 32: 0.44,
+            Tl.MAX_TILE: 0.52}
+    tiles = {t: (v + 0.02 * torch.randn(8, generator=g)).tolist()
+             for t, v in base.items()}
+    out = M.t_star_set(_records(tiles))
+    assert set(out["set"]) >= {4, 8, 16}
+    assert 2 not in out["set"] or 32 not in out["set"] or len(out["set"]) >= 3
+
+
+def test_t_star_set_never_reports_an_edge():
+    """The edges are what Gate B tests AGAINST; they are not granularity
+    candidates and must never appear in the set."""
+    tiles = {1: [0.10] * 6, 4: [0.40] * 6, 8: [0.41] * 6,
+             Tl.MAX_TILE: [0.11] * 6}
+    out = M.t_star_set(_records(tiles))
+    assert 1 not in out["set"] and Tl.MAX_TILE not in out["set"]
+    assert out["t_star"] in (4, 8)
+
+
+def test_t_star_set_handles_a_grid_with_no_interior():
+    out = M.t_star_set(_records({1: [0.3] * 5, Tl.MAX_TILE: [0.4] * 5}))
+    assert out["t_star"] is None and out["set"] == []
+
+
+def test_the_driver_reports_the_set_alongside_the_verdict():
+    tiles = {1: [0.50] * 6, 2: [0.44] * 6, 4: [0.36] * 6, 8: [0.20] * 6,
+             16: [0.36] * 6, 32: [0.45] * 6, Tl.MAX_TILE: [0.52] * 6}
+    recs = _records(tiles)
+    assert M.gate_b(recs)["t_star"] == M.t_star_set(recs)["t_star"]
+
+
+# --------------------------------------------------------------------------- #
+# Which axis the draws are over
+# --------------------------------------------------------------------------- #
+
+def test_a_list_of_problems_is_a_calibration_draw_axis(problem):
+    """Gate B's intervals are over calibration draws, so the driver has to
+    replicate over new DATA when it is given any."""
+    from calibrate import synthetic_problem
+
+    probs = [synthetic_problem(problem.n_out, problem.n_in, seed=d)
+             for d in range(3)]
+    out = M.GateRun(budgets=(1.5,), tiles=(1, 4, Tl.MAX_TILE)).run(probs)
+    assert out["meta"]["draw_axis"] == "calibration"
+    assert out["meta"]["n_draws"] == 3
+    assert len(out["budgets"]["1.5"]["records"]) == 3 * 3
+    assert out["budgets"]["1.5"]["gate_b"]["draw_axis"] == "calibration"
+
+
+def test_a_single_problem_falls_back_to_the_rotation_seed_and_says_so(problem):
+    """The fallback is legitimate but weaker -- rotation-seed noise measured at
+    roughly half the calibration noise -- so it must never pass unlabelled."""
+    out = M.GateRun(budgets=(1.5,), tiles=(1, 4, Tl.MAX_TILE),
+                    seeds=(0, 1)).run(problem)
+    assert out["meta"]["draw_axis"] == "rotation_seed"
+    assert out["meta"]["n_draws"] == 2
+    assert all(r["draw_axis"] == "rotation_seed"
+               for r in out["budgets"]["1.5"]["records"] if "skipped" not in r)
+
+
+def test_calibration_draws_actually_differ(problem):
+    """Guard against the draws collapsing to identical runs: if every draw gave
+    the same number, the CIs would be zero-width and Gate B would pass on
+    anything."""
+    from calibrate import synthetic_problem
+
+    probs = [synthetic_problem(problem.n_out, problem.n_in, seed=d)
+             for d in range(3)]
+    out = M.GateRun(budgets=(1.5,), tiles=(4,)).run(probs)
+    errs = [r["rel_output_error"] for r in out["budgets"]["1.5"]["records"]]
+    assert len(set(errs)) == 3
+
+
+def test_gate_run_rejects_an_empty_draw_list():
+    with pytest.raises(ValueError):
+        M.GateRun().run([])
