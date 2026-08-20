@@ -87,6 +87,7 @@ python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --seeds 3 --bud
 | `quantize.py` | QuIP# E8P codebook + LDLQ (Hessian-farkında yuvarlama) |
 | `calibrate.py` | sıralı kalibrasyon; istatistikler **sıkıştırılmış** modelden |
 | `eval/perplexity.py` | ppl + protokol koruması |
+| `eval/streamed.py` | GPU'ya sığmayan model için katman-akışlı ppl |
 | `hf_llama.py` | HuggingFace adaptörü — blok 0'ın girdilerini yakalar |
 | `experiments/m1_gates.py` | M1'in iki kapısı |
 
