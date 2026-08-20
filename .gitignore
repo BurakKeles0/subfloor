@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Experiment output: regenerate it, do not track it.
+results/
+*.json.gz
+
+# Model weights and calibration caches never belong in the repo.
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# IDE
+.idea/
+.vscode/
