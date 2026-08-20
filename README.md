@@ -122,6 +122,9 @@ Bu ayrımı açıkça yapmak gerekiyor.
 - Adaptörün modelin kendi hesabını birebir yeniden ürettiği (elle sürülen
   bloklar → modelin logit'leri, 1e-5)
 - Kapı B'nin gürültüde "interior" **demediği**
+- **`Δ = Q + τ` transfer sapması** — tahmin edici kurulup gerçek hattın yanında
+  koşuldu. `T=1` kimlik kontrolü tam sıfır; sapma çekiliş gürültüsünü 12.3×
+  aşıyor, yani ön-kaydın toleransı seed varyansından türetilemez
 - **Kapı B'nin gücü** — 5 çekiliş 2.29 σ saptıyor, ölçülen etki 6.7 σ.
   Ama komşu tile'lar (0.31 σ) ayrılmıyor, o yüzden `T*` nokta değil **küme**
   olarak raporlanıyor (`experiments/m0_gate_b_power.py`)

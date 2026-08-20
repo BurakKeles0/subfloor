@@ -135,6 +135,44 @@ T*_tahmin   = argmin_T Δ(T)_tahmin
 `Δ = Q + τ` bir teorem değildir. Eş-yoğunlukta ölçülen verginin bütçe-eşleşmiş
 ve quantize edilmiş ayara transfer olduğunu varsayar. **Test edilen şey budur.**
 
+**Transfer pilotu koşuldu** (2026-08-21, `experiments/m0_transfer_pilot.py`;
+sentetik 128×256 katman, `B=1.5`, 3 kalibrasyon çekilişi, her karşılaştırmanın
+dört koşusu da **aynı hizalamada**, dolayısıyla aynı gerçekleşen yoğunlukta):
+
+| T | d | ölçülen | tahmin | sapma | çekiliş gürültüsü | `τ` (quant'sız) | `τ` (E8P) |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.2500 | 0.40429 | 0.40429 | **+0.00000** | 0.00000 | 0.00000 | 0.00000 |
+| 2 | 0.5000 | 0.29894 | 0.29664 | −0.00229 | 0.00220 | 0.04861 | 0.05090 |
+| 4 | 0.6250 | **0.28273** | **0.28978** | +0.00704 | 0.00338 | 0.08575 | 0.07870 |
+| 8 | 0.6875 | 0.28426 | 0.29986 | +0.01560 | 0.00222 | 0.11186 | 0.09626 |
+| 16 | 0.7188 | 0.29389 | 0.31038 | +0.01650 | 0.00513 | 0.12935 | 0.11286 |
+| 32 | 0.7344 | 0.29369 | 0.31712 | +0.02343 | 0.00434 | 0.14070 | 0.11727 |
+| max | 0.7500 | 0.31123 | 0.34805 | **+0.03683** | 0.00073 | 0.17164 | 0.13481 |
+
+`T=1` satırı bir **kimlik kontrolüdür**: orada tahmin `Q(d(1)) + 0`'a indirgenir
+ve `Q(d(1))` ölçümün kendisidir. Tam sıfır çıkması, tahmin edicinin iddia ettiği
+şeyi ölçtüğünün en ucuz kanıtı; sıfırdan sapması yanlış yoğunlukta koşulduğu
+anlamına gelirdi.
+
+**Üç bulgu:**
+
+**① Sapma gürültüyü 12.3 kat aşıyor.** En kötü sapma 0.03683, ortalama çekiliş
+gürültüsü 0.00300. Denetimin B3 uyarısı ampirik olarak doğrulandı: seed
+varyansından türetilen bir tolerans **on kattan fazla küçük** olurdu ve ön-kayıt
+tanım gereği "tahmin tutmadı" dalına kilitlenirdi.
+
+**② `τ`, quantization'sız ölçüldüğünde sistematik olarak BÜYÜK çıkıyor.**
+`T=2` dışında her yerde `τ_quant < τ_noquant`, ve fark `T` ile büyüyor. Mekanizma
+makul: 2 bitte quantization hatası, maske kalitesi farkının bir kısmını zaten
+örtüyor. **Yönü kaydedilir: ayrılabilirlik modeli büyük `T`'ye karşı
+önyargılıdır** — tile'ların maliyetini olduğundan pahalı gösterir. Dolayısıyla
+M1'de büyük `T` tahminden iyi çıkarsa bu **beklenen** bir şeydir, tez lehine
+kanıt değildir.
+
+**③ Ama `T*` yine de kayıyor değil.** Tahmin ve ölçüm ikisi de `T*=4` veriyor.
+Sapma sabit bir kaydırma olmadığı (işaret değiştiriyor) için bu garanti değildi;
+bu katmanda tuttu. `argmin_agreement` her koşuda raporlanır.
+
 | Tahmin | `T*` | Okuma |
 |---|---|---|
 | Tuttu | içeride | **Tez destekleniyor**; `T*` anlamlı, ayrışma geçerli |
@@ -309,13 +347,18 @@ ayırmanın bütün amacı buydu.
 
 ## 9. Dondurma listesi — hepsi dolmadan bu belge geçerli değil
 
-- [ ] **Tolerans** `|Δ(T)_ölçülen − Δ(T)_tahmin| ≤ ___`
-      → **transfer pilotundan** türetilecek, seed varyansından değil.
-      Tahmin hatasına hakim olan şey seed gürültüsü değil, ayrılabilirlik
-      varsayımının yanlılığıdır; seed varyansından türetilen tolerans neredeyse
-      kesin aşılır ve prereg "tutmadı" dalına kilitlenir.
-      *Pilot: `τ`'yu tek bir `(T,d)` noktasında hem quantization'sız hem E8P ile
-      ölç, farkı tolerans olarak al. ~2 GPU-saat.*
+- [x] **Tolerans kuralı** — 2026-08-21, transfer pilotundan (§5.1):
+
+      > `tolerans = 1.5 × max_T |sapma(T)|`, `T=1` hariç (orada kimlik).
+
+      Sentetik katmanda bu **0.05524**, hata seviyesinin **%18.8**'i.
+      1.5× marj bir yargı kararıdır ve öyle yazılmıştır: gerçek modelin
+      transferi bu sentetik katmandan yarı yarıya daha kötü olabilir.
+      Yargı olmayan kısım şu: seed varyansından türetilseydi **12.3 kat**
+      küçük olurdu.
+
+      **Mutlak sayı M1'in ilk bütçesinden dondurulur**, yukarıdaki kural
+      aynen uygulanarak. Sentetik değer oran ve mertebe içindir, eşik değil.
 - [x] **Minimum saptanabilir fark** (§7.1) — 2026-08-21 ölçüldü.
       5 çekiliş → **2.29 σ**; ölçülen etki `T=max` ucunda 6.7 σ, yani
       3× marj. `min_seeds=5` korunuyor. Ayrıca §7.2 (`T*` küme olarak),

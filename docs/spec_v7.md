@@ -540,8 +540,10 @@ ve istatistikler **sıkıştırılmış** modelden gelir (§7, tuzak 20).
 - [x] **Protokol kimliği** (2026-08-21): 2048 → **5.4675**, 4096 → **5.1143**;
       ikisi de yayımlanmıştan <0.006 sapıyor. **seqlen 4096 birincil** donduruldu.
 - [ ] `tau_sweep.py`: `Q(d)` 3 seed, `τ(T,d)` **eşleştirilmiş** 1 seed
-- [ ] **Transfer pilotu** — `τ`'yu bir noktada quantization'lı/suz ölç,
-      ön-kayıt toleransını oradan türet (~2 GPU-saat)
+- [x] **Transfer pilotu** (2026-08-21) — tolerans kuralı `1.5 × max_T |sapma|`,
+      seed varyansından **değil**: sapma gürültüyü 12.3× aşıyor. Ayrıca
+      `τ`'nun quantization'sız ölçümü büyük `T`'ye karşı önyargılı çıktı
+      (ön-kayıt §5.1)
 - [x] **Minimum saptanabilir fark ölçüldü** (2026-08-21): 5 çekiliş → 2.29 σ;
       ölçülen etki 6.7 σ. `T*` artık küme, çekiliş ekseni kalibrasyon.
 - [ ] **`preregistration.md` donduruldu ve commit edildi**

@@ -83,6 +83,7 @@ def run_config(
     rotate_axis: str | None = "index",
     quantize: bool = True,
     ldlq: bool = True,
+    align: int | None = None,
     seed: int = 0,
     vq_bits: float = E8P_BITS,
 ) -> dict:
@@ -94,6 +95,11 @@ def run_config(
     basis as its block.  Without it the rotation costs inference time and buys
     nothing on the activation-weighted objective (plan section I3).  It needs
     the survivor count aligned to 8, so the mask is built with `align=8`.
+
+    `align=None` follows that rule.  Pass a number to force it, which the
+    transfer pilot needs: it compares a quantized run against an unquantized one
+    at EQUAL DENSITY, and letting the alignment differ between them would move
+    the realized density and quietly compare two different sparsity levels.
     """
     if ldlq and quantize and axis != "B":
         raise NotImplementedError(
@@ -115,7 +121,7 @@ def run_config(
         metric=metric, act_norm=problem.act_norm,
         H=problem.H if (compensate or metric == "obs_diag") else None,
         compensate=compensate,
-        align=Qz.E8P_DIM if (quantize and ldlq) else 1,
+        align=(Qz.E8P_DIM if (quantize and ldlq) else 1) if align is None else align,
     )
 
     W_hat = pruned.W
@@ -161,6 +167,8 @@ def run_config(
         "rotate_axis": rotate_axis,
         "quantize": quantize,
         "ldlq": ldlq,
+        "align": (Qz.E8P_DIM if (quantize and ldlq) else 1) if align is None else align,
+        "survivors_per_tile": int(pruned.mask.survivors_per_tile().max()),
         "seed": seed,
         "rel_output_error": problem.output_error(W_hat),
         "snr_db": Qz.quantization_snr(problem.W, W_hat),

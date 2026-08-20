@@ -61,6 +61,7 @@ sırayla çağrılırsa hata fırlatır.
 | Akışlı eval == tam model eval | 1e-6 |
 | Kapı B'nin gürültüde geçmediği | 6 ayrı gürültü çekilişi |
 | **Dense ppl (gerçek model)** | 2048 → 5.4675, 4096 → 5.1143; yayımlanmıştan <0.006 |
+| **Transfer sapması** | `Δ = Q + τ` tahmin edicisi kurulup gerçek hattın yanında koşuldu. `T=1` kimlik kontrolü **tam sıfır**; sapma gürültüyü **12.3×** aşıyor |
 | **Kapı B'nin gücü** | 600 denemelik simülasyon, **gerçek `gate_b` çağrılarak**. 5 çekiliş → 2.29 σ saptıyor; ölçülen etki 6.7 σ. Tip-I her yerde %5'in altında |
 | **`vq_bits = 2.0` (maliyet)** | QuIP# E8P ve QTIP releases'lerinin manifest'i; kodsözcüğü yükü **tam 2.000000**, yan bilgiyle 2.005204 / 2.006740. Manifest ve dosya boyutu iki bağımsız yol, tam aynı sayı |
 
@@ -140,6 +141,21 @@ rotasyonun kendisi, o da seed'den üretilirse yük taşımıyor. Ayrıştırılm
 tasarımda maliyet **0.0077 bit/survivor** ve `T` ile neredeyse sabit.
 `accounting.rotation_side_bits`.
 
+**Ayrılabilirlik varsayımı büyük `T`'ye karşı önyargılı.** Transfer pilotu
+`τ`'nun quantization'sız ölçüldüğünde sistematik olarak **büyük** çıktığını
+gösterdi — `T=2` dışında her yerde, ve fark `T` ile büyüyor (T=max'ta 0.172'ye
+karşı 0.135). Mekanizma makul: 2 bitte quantization hatası maske kalitesi
+farkının bir kısmını zaten örtüyor. Sonuç: **model tile'ların maliyetini
+olduğundan pahalı gösteriyor.** M1'de büyük `T` tahminden iyi çıkarsa bu
+beklenen bir şeydir, tez lehine kanıt değil — ön-kayıt §5.1'e yazıldı.
+
+İyi haber: sapma işaret değiştirdiği halde `T*` kaymadı, tahmin de ölçüm de
+`T*=4` verdi. Garanti değildi; her koşuda `argmin_agreement` olarak raporlanıyor.
+
+**Toleransın seed varyansından türetilmesi 12.3 kat küçük olurdu.** Denetimin B3
+uyarısı ampirik olarak doğrulandı: en kötü sapma 0.0368, ortalama çekiliş
+gürültüsü 0.0030. Kural artık `1.5 × max_T |sapma(T)|` ve ön-kayıtta.
+
 **Kapı B'nin verdikti güvenli, `T*` değil.** Güç analizi ikiye ayrıldı ve iki
 farklı cevap verdi. Verdikt (içeride mi, uçta mı) 5 çekilişle rahat kararlanıyor
 — bağlayıcı uç `T=max` ve o da eşiğin üç katı uzakta. Ama **komşu tile'lar
@@ -172,9 +188,10 @@ problem verilirse eski davranışa düşüyor ama çıktıyı `draw_axis` ile et
    kalibrasyon + budama + eval demek. Spec ~25 GPU-saat diyor; bu kartta
    **önce 1 nokta ölçülüp ekstrapole edilmeli.**
 
-2. **Transfer pilotu** — `τ`'yu bir `(T,d)` noktasında hem quantization'sız hem
-   E8P ile ölç. Ön-kaydın **toleransı** buradan türetilecek. Seed varyansından
-   türetilirse prereg "tutmadı" dalına kilitlenir. ~2 GPU-saat.
+~~2. Transfer pilotu~~ — **yapıldı, 2026-08-21.** Tolerans kuralı
+   `1.5 × max_T |sapma(T)|`; sentetik katmanda 0.0552 (hata seviyesinin %18.8'i).
+   Mutlak sayı M1'in ilk bütçesinden donacak. `experiments/m0_transfer_pilot.py`
+   (`--reuse` ile türetilmiş sayılar hattı yeniden koşmadan güncellenir).
 
 ~~3. Kapı B'nin minimum saptanabilir farkı~~ — **yapıldı, 2026-08-21.**
    Cevap ikiye ayrılıyor: verdikt için 5 çekiliş yeterli (2.29 σ saptıyor,
@@ -266,6 +283,7 @@ işler için dar.
 | `experiments/m0_dense_ppl.py` | dense ölçüm + protokol kimliği |
 | `experiments/m0_vq_bits.py` | VQ checkpoint maliyeti — manifest'ten, indirmeden |
 | `experiments/m0_gate_b_power.py` | Kapı B'nin gücü + boru hattının gürültüsü |
+| `experiments/m0_transfer_pilot.py` | `Δ = Q + τ` transfer sapması → tolerans |
 
 **Belgeler:** `spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı**) · `audit.md` (v6 denetimi, tarihsel kayıt) ·
@@ -277,6 +295,7 @@ python -m pytest tests/ -q                    # 353 test
 HF_HUB_DISABLE_XET=1 python experiments/m0_dense_ppl.py --seqlens 2048 4096 --device cuda
 python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --budgets 1.5 --draws 5
 python experiments/m0_gate_b_power.py --no-noise   # simülasyon (~15 dk), σ önbellekten
+python experiments/m0_transfer_pilot.py --draws 3  # ~8 dk; --reuse ile saniyeler
 python experiments/m0_vq_bits.py --all       # ~100 KB ağ trafiği, saniyeler
 ```
 
@@ -298,7 +317,8 @@ python experiments/m0_vq_bits.py --all       # ~100 KB ağ trafiği, saniyeler
 | `d80ab14` | **İlk gerçek ölçüm**: protokol sorusu çözüldü |
 | `e5ec362` | Bu belge |
 | `a1626c6` | VQ maliyeti checkpoint'ten ölçüldü; SU/SV ayrışması bulundu |
-| *(bu tur)* | Kapı B'nin gücü ölçüldü; `T*` küme oldu; çekiliş ekseni düzeldi |
+| `3d8658f` | Kapı B'nin gücü ölçüldü; `T*` küme oldu; çekiliş ekseni düzeldi |
+| *(bu tur)* | Transfer pilotu: tolerans kuralı, ve modelin büyük `T` önyargısı |
 
 ---
 
