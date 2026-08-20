@@ -385,10 +385,88 @@ def test_density_for_budget_raises_on_fixed_density_schemes(scheme):
         A.density_for_budget(scheme, 2.140625, 4, N)
 
 
-def test_vnm_index_is_an_m0_exit_condition():
-    """Spec v6 section 3.2 leaves the V:N:M formula unverified.  Refuse to guess."""
-    with pytest.raises(NotImplementedError, match="VENOM"):
+def test_vnm_requires_the_full_triple():
+    with pytest.raises(ValueError, match=r"vnm=\(V, N, M\)"):
         A.index_bits("vnm", 0.25, N, nm=(2, 8))
+
+
+# --------------------------------------------------------------------------- #
+# V:N:M  (VENOM, arXiv:2310.02065) -- the M0 exit condition, now filled in
+# --------------------------------------------------------------------------- #
+
+def test_vnm_matches_the_two_metadata_structures():
+    """m-indices at 2 bits per nonzero, plus a column-loc entry per selected
+    column amortized over the V rows that share it:
+
+        2N/M  +  4*ceil(log2 M)/(V*M)
+    """
+    v, n, m = 64, 2, 8
+    want = 2 * n / m + 4 * math.ceil(math.log2(m)) / (v * m)
+    assert A.vnm_index_bits(v, n, m) == pytest.approx(want, abs=TOL)
+    assert A.vnm_index_bits(64, 2, 8) == pytest.approx(0.5234375, abs=TOL)
+    assert A.vnm_index_bits(64, 2, 16) == pytest.approx(0.265625, abs=TOL)
+
+
+def test_vnm_reduces_to_plain_2_4():
+    """At M = 4 the vector stage picks 4 of 4 -- no information -- so the cost
+    collapses to the native 2:4 metadata, exactly 1.0 bit."""
+    assert A.vnm_index_bits(64, 2, 4, packing="combinatorial") == 1.0
+    assert A.nm_index_bits(2, 4) == 1.0
+
+
+def test_the_V_in_vnm_is_a_row_tile():
+    """THE structural point (spec v7 section 0.4).
+
+    VENOM's column-loc is one column selection shared by V rows -- which is this
+    project's Axis B at T=V.  So its index amortizes as 1/V, the same mechanism
+    as our 1/T, and VENOM is far closer prior work than Spec v6 credited.
+
+    The m-indices term does NOT amortize, because it is per-nonzero: that is
+    what a fixed 2:4 pattern inside the block costs, and it is the part our free
+    within-tile density removes.
+    """
+    n, m = 2, 8
+    base = 2 * n / m                                   # the un-amortizable part
+    costs = {v: A.vnm_index_bits(v, n, m) for v in (1, 2, 4, 8, 16, 32, 64)}
+
+    assert all(a > b for a, b in zip(costs.values(), list(costs.values())[1:]))
+    for v, c in costs.items():
+        assert (c - base) * v == pytest.approx(
+            (costs[1] - base), abs=1e-9
+        ), "the column-loc term must fall exactly as 1/V"
+    assert min(costs.values()) > base                  # never reaches the floor
+
+
+def test_vnm_beats_a_bitmap_at_the_same_density():
+    """A concrete instance of section 3.2's correction: a bitmap is not the
+    floor for a random-accessible index.  V:2:16 sits at d=0.125 and costs
+    0.266 bits, against a bitmap's 1.0."""
+    v, n, m = 64, 2, 16
+    density = n / m
+    assert density == 0.125
+    assert A.vnm_index_bits(v, n, m) < A.index_bits("unstructured", density, N)
+
+
+def test_vnm_bits_per_position_and_density():
+    """Density is fixed by N/M, and q_over does not scale with it."""
+    got = A.bits_per_position("vnm", None, 4, N, vnm=(64, 2, 8))
+    want = 0.25 * 4 + A.q_overhead(4) + A.vnm_index_bits(64, 2, 8)
+    assert got == pytest.approx(want, abs=TOL)
+    assert A.Q_OVERHEAD_SCALES_WITH_DENSITY["vnm"] is False
+
+    with pytest.raises(ValueError, match="implies density"):
+        A.bits_per_position("vnm", 0.4, 4, N, vnm=(64, 2, 8))
+
+
+def test_vnm_validates():
+    with pytest.raises(ValueError, match="0 < N <= 4"):
+        A.vnm_index_bits(64, 5, 8)
+    with pytest.raises(ValueError, match="multiple of 4"):
+        A.vnm_index_bits(64, 2, 6)
+    with pytest.raises(ValueError, match="V must be positive"):
+        A.vnm_index_bits(0, 2, 8)
+    with pytest.raises(ValueError, match="unknown packing"):
+        A.vnm_index_bits(64, 2, 8, packing="nope")
 
 
 def test_dense_rejects_a_non_unit_density():

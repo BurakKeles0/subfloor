@@ -139,8 +139,6 @@ kanıt değil.**
   değil — yoksa prereg "tutmadı" dalına kilitlenir
 - **Kapı B'nin istatistiksel gücü.** 5 çekiliş `T=4` ile `T=16`'yı ayırmaya
   yetiyor mu, M1'den *önce* ölçülmeli
-- `vnm` indeks formülü — VENOM'dan doğrulanmalı, tahmin edilmedi
-  (`NotImplementedError` fırlatıyor)
 - Axis A için LDLQ
 
 ---

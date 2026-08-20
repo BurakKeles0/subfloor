@@ -47,6 +47,7 @@ __all__ = [
     "vq_bits_from_spec",
     "entropy_bits",
     "nm_index_bits",
+    "vnm_index_bits",
     "index_bits",
     "bits_per_position",
     "anchor_budget_to",
@@ -264,6 +265,61 @@ def nm_index_bits(n: int, m: int, *, packing: str = "fixed_width") -> float:
     raise ValueError(f"unknown packing {packing!r}")
 
 
+def vnm_index_bits(
+    v: int, n: int, m: int, *, native_m: int = 4, packing: str = "fixed_width"
+) -> float:
+    """Index cost of VENOM's V:N:M format, in bits per position.
+
+    Reconstructed from Castro et al., SC'23 (arXiv:2310.02065).  An R x K matrix
+    is cut into V x M blocks and pruned in two stages:
+
+      1. vector-wise -- each block selects `native_m` (=4) of its M columns, and
+         all V rows of the block share that selection;
+      2. within those 4 columns the hardware's native 2:4 applies, so each row
+         keeps N of them.
+
+    Two metadata structures follow, and the paper gives their shapes:
+
+      m-indices   R x K/M x N,     2 bits each   -> 2N/M per position
+      column-loc  R/V x K/M x 4,   one column id -> 4*ceil(log2 M)/(V*M)
+
+    THE STRUCTURAL POINT: `V` is a row-tile.  A group of V rows sharing one
+    column selection is exactly this project's Axis B at T=V, with the extra
+    constraint that the selection is block-local (4 out of each M) rather than
+    free across the row.  VENOM is therefore much closer prior work than Spec v6
+    credited, and it is also a concrete instance of the block-local index that
+    section 3.2 says a bitmap is not the floor of.
+
+    The 2-bit width of m-indices is stated in the paper.  The width of a
+    column-loc entry is INFERRED as ceil(log2 M) from the array's shape and
+    meaning; it is not quoted.  At M == native_m the vector stage is degenerate
+    (choosing 4 of 4) and the honest cost is zero -- `packing="combinatorial"`
+    reports that, `fixed_width` reports what VENOM's array actually stores.
+
+    >>> round(vnm_index_bits(64, 2, 8), 6)
+    0.523438
+    >>> vnm_index_bits(64, 2, 4, packing="combinatorial")   # plain 2:4
+    1.0
+    """
+    if not (0 < n <= native_m):
+        raise ValueError(f"need 0 < N <= {native_m}, got N={n}")
+    if m < native_m or m % native_m:
+        raise ValueError(f"M must be a multiple of {native_m}, got M={m}")
+    if v < 1:
+        raise ValueError(f"V must be positive, got {v}")
+
+    per_nonzero = math.log2(native_m)                 # 2 bits for the native 2:4
+    m_indices = per_nonzero * n / m
+
+    if packing == "fixed_width":
+        column_loc = native_m * math.ceil(math.log2(m)) / (v * m)
+    elif packing == "combinatorial":
+        column_loc = math.log2(math.comb(m, native_m)) / (v * m)
+    else:
+        raise ValueError(f"unknown packing {packing!r}")
+    return m_indices + column_loc
+
+
 def _elementwise_index(density: float, n_idx: int, model: str) -> float:
     """Index cost of a free (unstructured) mask over `n_idx` positions, before
     any tile amortization.
@@ -310,6 +366,7 @@ def index_bits(
     *,
     tile_size: int | str | None = None,
     nm: tuple[int, int] | None = None,
+    vnm: tuple[int, int, int] | None = None,
     index_model: str = "practical",
     nm_packing: str = "fixed_width",
 ) -> float:
@@ -326,11 +383,9 @@ def index_bits(
             raise ValueError("scheme='nm' requires nm=(N, M)")
         return nm_index_bits(nm[0], nm[1], packing=nm_packing)
     if scheme == "vnm":
-        raise NotImplementedError(
-            "V:N:M index cost is unverified.  Spec v6 section 3.2 marks it as an "
-            "M0 exit condition: read it off VENOM/Spatha (arXiv:2310.02065) and "
-            "fill it in here rather than guessing."
-        )
+        if vnm is None:
+            raise ValueError("scheme='vnm' requires vnm=(V, N, M)")
+        return vnm_index_bits(*vnm, packing=nm_packing)
     if scheme in ("unstructured", "tile"):
         return _elementwise_index(density, n_idx, index_model) * _inv_tile(
             scheme, tile_size
@@ -350,6 +405,7 @@ def bits_per_position(
     *,
     tile_size: int | str | None = None,
     nm: tuple[int, int] | None = None,
+    vnm: tuple[int, int, int] | None = None,
     vq_bits: float | None = None,
     index_model: str = "practical",
     nm_packing: str = "fixed_width",
@@ -371,9 +427,14 @@ def bits_per_position(
             raise ValueError(f"scheme='dense' implies density=1.0, got {density}")
         density = 1.0
     elif scheme in ("nm", "vnm"):
-        if nm is None:
-            raise ValueError(f"scheme={scheme!r} requires nm=(N, M)")
-        implied = nm[0] / nm[1]
+        if scheme == "vnm":
+            if vnm is None:
+                raise ValueError("scheme='vnm' requires vnm=(V, N, M)")
+            implied = vnm[1] / vnm[2]
+        else:
+            if nm is None:
+                raise ValueError("scheme='nm' requires nm=(N, M)")
+            implied = nm[0] / nm[1]
         if density is not None and abs(density - implied) > 1e-12:
             raise ValueError(
                 f"scheme={scheme!r} with nm={nm} implies density={implied}, "
@@ -398,6 +459,7 @@ def bits_per_position(
         n_idx,
         tile_size=tile_size,
         nm=nm,
+        vnm=vnm,
         index_model=index_model,
         nm_packing=nm_packing,
     )
@@ -525,6 +587,7 @@ def scheme_floor(
     *,
     tile_size: int | str | None = None,
     nm: tuple[int, int] | None = None,
+    vnm: tuple[int, int, int] | None = None,
     vq_bits: float | None = None,
     index_model: str = "practical",
     nm_packing: str = "fixed_width",
@@ -550,6 +613,7 @@ def scheme_floor(
             weight_bits,
             n_idx,
             nm=nm,
+            vnm=vnm,
             vq_bits=vq_bits,
             index_model=index_model,
             nm_packing=nm_packing,

@@ -138,13 +138,27 @@ en az 2× olması gerekir.
 > **OBR'den farkımız:** OBR verili bir sırayı onarır; biz **sırayı değiştiririz**
 > (§4.6) ve granülerliği serbest değişken yaparız.
 >
-> **N:M ailesinden farkımız:** N:M bütçe ekseninde ayrık bir kafestir, tile
-> ailesi süreklidir. Ama ikisi aynı takasın iki ekseni — indeks ucuzluğu ile
-> maske özgürlüğü (§3.2). Rakip değil, aile üyesi olarak sunulur.
+> ⚠️ **VENOM'dan farkımız dar, ve dürüstçe yazılmalı.** V:N:M formülü M0'da
+> doğrulandı ve yapısal bir şey ortaya çıkardı: VENOM `R×K` matrisi `V×M`
+> bloklara böler ve **her bloğun `V` satırı ortak bir sütun seçimi paylaşır**
+> (`column-loc`, §3.2). Bu tam olarak Axis B'nin `T=V` hali. Yani indeksin
+> satır grubuna amortize edilmesi — manşet özdeşliğimizin arkasındaki mekanizma
+> — **yeni değildir**; VENOM'da zaten var ve maliyeti `1/V` ile düşüyor.
 >
-> Katkının çekirdeği: `1 − 1/T` özdeşliği, `B*` erime duvarı, granülerlik
-> vergisi yüzeyi `τ(T,d)`, ve **maske-önce sırasının kafes VQ'yu seyrek matriste
-> mümkün kılması**.
+> Geriye kalan gerçek farklar:
+> ① VENOM'un sütun seçimi **blok-yereldir** (her `M`'den 4 tane); bizimki satır
+> boyunca serbest — bizimki bir üst küme.
+> ② VENOM'un tile-içi yoğunluğu donanım tarafından `N/4`'e sabitlenmiştir;
+> bizimki serbest, yani aile `d`'de de sürekli.
+> ③ VENOM `V`'yi donanıma göre seçer (32/64/128); biz `V`'yi **optimize edilen
+> serbest değişken** yapıyoruz ve bir bit bütçesine karşı ölçüyoruz.
+>
+> Yani katkı *"indeksi amortize etmek"* değil, **`(T, d)` düzleminin tamamını
+> verili bir bütçe altında taramak** ve `T`'nin iç optimumunu aramaktır.
+>
+> Katkının çekirdeği: `1 − 1/T` özdeşliği ve `B*` erime duvarının kapalı formu,
+> granülerlik vergisi yüzeyi `τ(T,d)`, ve **maske-önce sırasının kafes VQ'yu
+> seyrek matriste mümkün kılması**.
 
 ### 0.5 Incoherence processing — risk değil, çekirdek mekanizma
 
@@ -260,7 +274,7 @@ Bu konvansiyon M1'in işaretini çevirir: `True` olsaydı 2:4 @ 4-bit = 3.078125
 | `unstructured` | `min(1, d·log₂(n_idx))` | bitmap / sabit-genişlikli liste kaskadı |
 | `tile` (T) | `min(1, d·log₂(n_idx))/T` | |
 | `nm` | `min(⌈log₂M⌉·N/M, log₂C(M,N)/M)` | **ikisi de pratiktir** |
-| `vnm` | VENOM'dan doğrulanmalı | M0 çıkış koşulu |
+| `vnm` | `2N/M + 4⌈log₂M⌉/(V·M)` | VENOM. **`V` bir row-tile** — §0.4 |
 
 > **v6 burada fazla iddialıydı.** "Rastgele erişim `H(d)`'yi yasaklar, entropi
 > kodlaması kullanılamaz" diyordu. Doğru değil: **blok-yerel sabit-sayılı
@@ -485,7 +499,7 @@ ve istatistikler **sıkıştırılmış** modelden gelir (§7, tuzak 20).
 - [x] `accounting.py` tam; §3.4'ün tümü geçiyor
 - [x] Kapı A kâğıt üstü provası (`docs/gate_a_dry_run.md`)
 - [x] E8P codebook doğrulandı (227+29, 2¹⁶, 2.0 bit)
-- [ ] `vnm` formülü VENOM'dan doğrulanmış
+- [x] `vnm` formülü VENOM'dan doğrulandı — ve §0.4'ü daralttı
 - [ ] VQ checkpoint maliyetleri **dosya boyutundan** ölçüldü
 - [ ] **Protokol kimliği:** dense ppl ölçülüp `identify_protocol` ile aile saptandı
 - [ ] `tau_sweep.py`: `Q(d)` 3 seed, `τ(T,d)` **eşleştirilmiş** 1 seed
@@ -660,3 +674,4 @@ Pool & Yu NeurIPS 2021 · RIA ICLR 2024
 | 21 | Attention koordinasyonu **formülleştirilmeli** olarak işaretlendi | v6 yalnızca ima ediyordu |
 | 22 | `d` notasyon çakışması giderildi (`d_out`) | Kod ajanında hata üretiyordu |
 | 23 | M0 maliyeti 15–17 → **~25 GPU-saat** | C4 eval'i ve transfer pilotu dahil |
+| 24 | **`vnm` formülü dolduruldu**, §0.4 daraltıldı | VENOM'un `V`'si bir row-tile: indeks amortizasyonu yeni değil |
