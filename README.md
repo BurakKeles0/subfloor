@@ -126,10 +126,20 @@ Bu ayrımı açıkça yapmak gerekiyor.
 Bu varsayımı sınayacak ucuz deney bilinçli olarak atlandı. Erken uyarı kuralı ve
 geri dönüş yolu `preregistration.md` §9.1'de tanımlı.
 
-**Henüz gerçek bir checkpoint koşulmadı.** Hat uçtan uca çalışıyor ve
-rastgele başlatılmış küçük bir Llama üzerinde test edildi, ama eğitilmiş
-ağırlıklarla değil. Kalite ölçümleri hâlâ ya katman düzeyinde `tr(E H Eᵀ)`
-proxy'si ya da sentetik veri. Sentetik smoke testte hata eğrisi
+**İlk gerçek ölçüm yapıldı (2026-08-21).** Llama-2-7B dense perplexity,
+WikiText-2, 8 GB kartta katman-akışlı:
+
+| seqlen | ölçtüğümüz | yayımlanan | fark |
+|---|---|---|---|
+| 2048 | **5.4675** | 5.47 | −0.0025 |
+| 4096 | **5.1143** | 5.12 | −0.0057 |
+
+Bu iki şeyi birden veriyor: hat yayımlanmış sayıları yeniden üretiyor, **ve**
+literatürdeki 5.12/5.47 ayrımının sebebi dizi uzunluğu olarak doğrulandı — ölçüm
+öncesinde kaydedilmiş bir hipotezdi.
+
+**Ama sıkıştırma kalitesi hâlâ ölçülmedi.** Dense baseline dışındaki her sayı
+ya katman düzeyinde `tr(E H Eᵀ)` proxy'si ya da sentetik veri. Sentetik smoke testte hata eğrisi
 U şeklinde çıkıyor ve Kapı A geçiyor — ama **veriyi biz ürettik, bu tez lehine
 kanıt değil.**
 

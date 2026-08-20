@@ -23,9 +23,20 @@ Aynı yöntemin aynı modeldeki sayısı protokole göre değişiyor — QuIP# 2
 makalesinde **6.66**, QTIP'in tablosunda **6.19**. Fark 0.47 ppl, yani Kapı A'da
 ölçmeye çalıştığımız etkiden büyük.
 
-Muhtemel sebep dizi uzunluğu (Llama-2'nin `max_position_embeddings` 4096; Wanda ve
-SparseGPT `model.seqlen`'i oradan alıyor, QuIP# ctx 2048 diyor). **Doğrulanması
-M0'ın işi.** Üçüncü bir protokol daha var: PALS aynı modele dense **5.33** ve %50
+**DOĞRULANDI (2026-08-21).** Sebep dizi uzunluğuymuş. Kendi ölçümümüz,
+Llama-2-7B fp16, WikiText-2 test:
+
+| seqlen | ölçtüğümüz | yayımlanan | fark |
+|---|---|---|---|
+| 2048 | **5.4675** | 5.47 | −0.0025 |
+| 4096 | **5.1143** | 5.12 | −0.0057 |
+
+Yani iki aile de yanlış değil — aynı model, farklı pencere. Sonuç "birini seç"
+değil, **"pencereyi sabitle"**: yayımlanmış bir sayı ancak bizim aynı `seqlen`'de
+aldığımız bir sayının yanına konabilir. Bu, aşağıdaki bütün karşılaştırmaları
+geçerli kılıyor — her satır tek bir aile içinde kalıyor.
+
+Üçüncü bir protokol daha var: PALS aynı modele dense **5.33** ve %50
 Wanda için **12.92** diyor — bu, Wanda'nın kendi 6.42'siyle uzlaşmıyor ve
 kullanılmadı.
 

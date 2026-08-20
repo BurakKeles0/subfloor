@@ -77,11 +77,16 @@ Llama-2-7B için literatürde **iki uyumsuz aile** var (dense 5.12 ve 5.47) ve
 aynı yöntemin sayısı 0.47 ppl değişiyor — Kapı B'nin çözmeye çalıştığı etkiden
 büyük. Ayrıntı: `docs/gate_a_dry_run.md`.
 
-**Kural:** önce dense modelimiz ölçülür; hangi baseline'ı yeniden ürettiğimiz
-`eval.perplexity.identify_protocol` ile saptanır. Yayımlanmış sayı **yalnızca o
-aileden** alıntılanır. İkisinin arasına düşersek hiçbirinden alıntı yapılmaz.
+**Kural (2026-08-21'de ölçüldü):** ayrımın sebebi dizi uzunluğuymuş. Kendi
+ölçümümüz seqlen 2048'de **5.4675**, 4096'da **5.1143** — ikisi de yayımlanmış
+değerlerin 0.006 içinde. Yani iki aile de yeniden üretilebiliyor; kural "birini
+seç" değil **"pencereyi sabitle"**.
 
-Ölçüm: WikiText-2 **ve** C4, `convention="gptq"`, seqlen dondurulacak (§9).
+Yayımlanmış bir sayı, ancak bizim **aynı `seqlen`'de** aldığımız bir sayının
+yanına konabilir. `eval.perplexity.compare` protokoller uyuşmazsa hata fırlatır.
+
+Ölçüm: WikiText-2 **ve** C4, `convention="gptq"`, **seqlen 4096 birincil**
+(§9'da donduruldu; 2048 ikincil olarak raporlanır).
 Zero-shot 5 görev ayrıca raporlanır ama kapılara girmez.
 
 ---
@@ -220,8 +225,15 @@ ayırmanın bütün amacı buydu.
 - [ ] **Minimum saptanabilir fark** (§7) — M0'ın seed varyansından
 - [ ] **`Δ(T)` tahmin eğrisi** — M0'ın `Q` ve `τ` yüzeyleri tamamlanınca
 - [ ] **`T*_tahmin`**
-- [ ] **Dense ppl ölçümü ve protokol kimliği** (§4)
-- [ ] **seqlen** — protokol saptandıktan sonra
+- [x] **Dense ppl ölçümü ve protokol kimliği** (§4) — 2026-08-21, ölçüldü:
+      seqlen 2048 → **5.4675** (aile `dense-5.47`), seqlen 4096 → **5.1143**
+      (aile `dense-5.12`). İkisi de yayımlanmış değerden 0.006'dan az sapıyor,
+      yani hattımız her iki aileyi de yeniden üretiyor.
+- [x] **seqlen = 4096** (birincil). Gerekçe: `dense-5.12` ailesi hem budama
+      baseline'larını (Wanda/SparseGPT %50, 2:4, 4:8) hem güçlü quantization
+      baseline'larını (QTIP/QuIP# 2-3-4 bit) birlikte taşıyor — Kapı A'nın
+      rakibi QTIP 2-bit de orada. seqlen 2048 ikincil olarak raporlanır;
+      SliceGPT ve QuaRot karşılaştırmaları yalnızca orada geçerli.
 - [ ] **QTIP checkpoint'inin ölçülen bit maliyeti** (dosya boyutundan)
 - [ ] **`vq_bits = 2.0` doğrulaması** — E8P'nin katman-başı ölçekleri ve
       Hadamard seed'leri dahil gerçek maliyet

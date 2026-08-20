@@ -78,10 +78,15 @@ def run(
             progress=lambda i: print(f"    block {i}", end="\r", flush=True),
         )
         elapsed = time.time() - t0
-        proto = PPL.identify_protocol(r)
+        # A truncated run measures a slice of the test set, not the test set.
+        # Perplexity varies enough between sections that a partial number
+        # cannot identify a protocol family -- so it is not allowed to.
+        proto = None if max_windows is not None else PPL.identify_protocol(r)
         print(f"  ppl = {r.perplexity:.4f}   ({elapsed:.0f}s, {r.n_windows} windows)",
               flush=True)
-        print(f"  protocol: {proto or 'NEITHER FAMILY'}", flush=True)
+        print(f"  protocol: "
+              f"{'(not claimed: truncated run)' if max_windows is not None else (proto or 'NEITHER FAMILY')}",
+              flush=True)
         results[str(seqlen)] = {
             "perplexity": r.perplexity,
             "nll": r.nll,
@@ -115,6 +120,19 @@ def _verdict(out: dict) -> None:
     res = out["results"]
     pred = out["hypothesis"]["predicts"]
     print("\n" + "=" * 62)
+
+    if out["meta"].get("max_windows") is not None:
+        n = out["meta"]["max_windows"]
+        print(f"  TRUNCATED RUN ({n} windows) -- no claim is made.")
+        print("  The wiring and the timing are real; the perplexity is not.")
+        print("  Measured on this machine: 4 windows gave 6.19 and 8 gave 5.03,")
+        print("  which is how much a slice of the test set can move the number.")
+        for seqlen, r in res.items():
+            print(f"    seqlen {seqlen}: {r['perplexity']:.4f} "
+                  f"({r['n_windows']} windows, {r['seconds']:.0f}s)")
+        print("=" * 62)
+        return
+
     for seqlen, want in pred.items():
         if seqlen not in res:
             continue

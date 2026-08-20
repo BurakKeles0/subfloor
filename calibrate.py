@@ -42,6 +42,10 @@ __all__ = [
     "load_calibration_tokens",
 ]
 
+#: WikiText moved under a namespace; a bare "wikitext" is rejected by current
+#: huggingface_hub ("Repository id must be 'namespace/name'").
+WIKITEXT_REPO = "Salesforce/wikitext"
+
 
 # --------------------------------------------------------------------------- #
 # The unit of work
@@ -335,7 +339,7 @@ def load_calibration_tokens(
         )
         field = "text"
     elif dataset == "wikitext2":
-        raw = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+        raw = load_dataset(WIKITEXT_REPO, "wikitext-2-raw-v1", split="train")
         field = "text"
     else:
         raise ValueError(f"unknown dataset {dataset!r}")

@@ -11,13 +11,17 @@ QuIP# 2-bit is 6.66 in its own paper and 6.19 in QTIP's table.  That 0.47 gap is
 larger than the effect Gate B is trying to resolve, so a number quoted from the
 wrong family does not just add noise -- it can invert a conclusion.
 
-The likely cause is the evaluation window (Llama-2 has
-max_position_embeddings=4096, and the pruning codebases take `model.seqlen` from
-there, while QuIP# states ctx 2048).  That is a HYPOTHESIS.  This module
-therefore keys protocols by their measured dense baseline, which is verified,
-rather than by the window length, which is inferred: run the dense model, see
-which baseline you land on, and only then quote published numbers from that
-family.  `identify_protocol` does exactly that.
+CONFIRMED (2026-08-21, results/m0_dense_ppl.json).  The cause is the evaluation
+window.  Measured on Llama-2-7B fp16, WikiText-2 test:
+
+    seqlen 2048 -> 5.4675   (published 5.47, off by 0.0025)
+    seqlen 4096 -> 5.1143   (published 5.12, off by 0.0057)
+
+So both families are reproducible here and neither is wrong -- they are the same
+model measured through different windows.  The consequence is not "pick one"
+but "pin the window": a published number may be quoted only next to one of ours
+taken at the SAME seqlen.  `identify_protocol` maps a measured dense baseline to
+its family, and `compare` refuses to subtract across them.
 
 Windowing follows the GPTQ/SparseGPT/Wanda convention so the numbers are
 comparable with the literature -- including its small quirk of dividing the
@@ -46,12 +50,24 @@ __all__ = [
     "load_eval_tokens",
 ]
 
+#: WikiText moved under a namespace; a bare "wikitext" is rejected by current
+#: huggingface_hub ("Repository id must be 'namespace/name'").
+WIKITEXT_REPO = "Salesforce/wikitext"
+
 
 # --------------------------------------------------------------------------- #
 # Published reference numbers, grouped by the protocol they belong to
 # --------------------------------------------------------------------------- #
 # Keyed by the DENSE baseline, which every one of these papers reports and which
 # we can reproduce.  Never mix families.  See docs/gate_a_dry_run.md.
+
+#: Our own reproduction, so later runs can be checked against a number we
+#: produced rather than one we read.  Llama-2-7B fp16, WikiText-2 test,
+#: convention="gptq" (results/m0_dense_ppl.json).
+MEASURED_DENSE = {
+    ("llama-2-7b", 2048): 5.4675,
+    ("llama-2-7b", 4096): 5.1143,
+}
 
 PUBLISHED: dict[str, dict] = {
     "llama-2-7b/dense-5.12": {
@@ -267,7 +283,7 @@ def load_eval_tokens(tokenizer, dataset: str = "wikitext2", split: str = "test")
     from datasets import load_dataset
 
     if dataset == "wikitext2":
-        raw = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+        raw = load_dataset(WIKITEXT_REPO, "wikitext-2-raw-v1", split=split)
         text = "\n\n".join(raw["text"])
     elif dataset == "c4":
         raw = load_dataset(
