@@ -93,6 +93,8 @@ python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --seeds 3 --bud
 
 **Belgeler:**
 
+- [`docs/STATUS.md`](docs/STATUS.md) — **buradan başla.** Ne doğrulandı, ne varsayıldı,
+  hangi karar neden alındı, sırada ne var, hangi ortam tuzakları saatlere mal oldu
 - [`docs/spec_v7.md`](docs/spec_v7.md) — şartname. Matematik, muhasebe ve protokol bağlayıcı
 - [`preregistration.md`](preregistration.md) — M1'in ön-kaydı. **Henüz dondurulmadı**; §9 eksikleri listeliyor
 - [`docs/audit.md`](docs/audit.md) — v6'nın M0 öncesi denetimi. Kararların hangi bilgiyle alındığının kaydı, olduğu gibi korunuyor

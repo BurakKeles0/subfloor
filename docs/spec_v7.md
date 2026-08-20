@@ -500,9 +500,11 @@ ve istatistikler **sıkıştırılmış** modelden gelir (§7, tuzak 20).
 - [x] `accounting.py` tam; §3.4'ün tümü geçiyor
 - [x] Kapı A kâğıt üstü provası (`docs/gate_a_dry_run.md`)
 - [x] E8P codebook doğrulandı (227+29, 2¹⁶, 2.0 bit)
+- [x] HuggingFace adaptörü + katman-akışlı eval — 7B, 8 GB kartta, 4 dk/eval
 - [x] `vnm` formülü VENOM'dan doğrulandı — ve §0.4'ü daralttı
 - [ ] VQ checkpoint maliyetleri **dosya boyutundan** ölçüldü
-- [ ] **Protokol kimliği:** dense ppl ölçülüp `identify_protocol` ile aile saptandı
+- [x] **Protokol kimliği** (2026-08-21): 2048 → **5.4675**, 4096 → **5.1143**;
+      ikisi de yayımlanmıştan <0.006 sapıyor. **seqlen 4096 birincil** donduruldu.
 - [ ] `tau_sweep.py`: `Q(d)` 3 seed, `τ(T,d)` **eşleştirilmiş** 1 seed
 - [ ] **Transfer pilotu** — `τ`'yu bir noktada quantization'lı/suz ölç,
       ön-kayıt toleransını oradan türet (~2 GPU-saat)
@@ -566,10 +568,21 @@ iki uyumsuz aile var (dense **5.12**: Wanda, QTIP · dense **5.47**: QuIP#,
 SliceGPT). Aynı yöntemin sayısı 0.47 ppl değişiyor — Kapı B'nin çözmeye
 çalıştığı etkiden büyük.
 
-> Önce dense modelimiz ölçülür; `identify_protocol` hangi aileyi yeniden
-> ürettiğimizi söyler. Yayımlanmış sayı **yalnızca o aileden** alıntılanır.
-> İkisinin arasına düşersek hiçbirinden alıntı yapılmaz.
-> `eval.perplexity.compare` protokoller uyuşmazsa **hata fırlatır**.
+> **ÖLÇÜLDÜ (2026-08-21).** Ayrımın sebebi dizi uzunluğuymuş:
+>
+> | seqlen | bizim | yayımlanan | fark |
+> |---|---|---|---|
+> | 2048 | **5.4675** | 5.47 | −0.0025 |
+> | 4096 | **5.1143** | 5.12 | −0.0057 |
+>
+> İki aile de yeniden üretilebiliyor, yani kural "birini seç" değil
+> **"pencereyi sabitle"**. Yayımlanmış bir sayı ancak bizim **aynı seqlen'de**
+> aldığımız bir sayının yanına konabilir; `eval.perplexity.compare` uyuşmazsa
+> **hata fırlatır**.
+>
+> **seqlen 4096 birincil** (ön-kayıt §9). Gerekçe: `dense-5.12` ailesi hem budama
+> baseline'larını hem QTIP/QuIP#'i taşıyor — Kapı A'nın rakibi orada. 2048
+> ikincil; SliceGPT ve QuaRot yalnızca orada.
 
 Her tabloda: **bit/pozisyon**, **`q_over` konvansiyonu**, **çapa**, **offset**,
 **`n_idx`**, **protokol ailesi**, **seqlen**, **convention**. Eş-sparsity yasak.
