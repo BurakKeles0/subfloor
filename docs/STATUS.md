@@ -182,11 +182,11 @@ problem verilirse eski davranışa düşüyor ama çıktıyı `draw_axis` ile et
 
 ### Hemen yapılabilir (model yerelde, hat çalışıyor)
 
-1. **`tau_sweep.py`** — `Q(d)` ve `τ(T,d)` yüzeyleri. Ön-kaydın tahmin eğrisi
-   buna dayanıyor. `Q` 5 nokta × 3 seed + `τ` 25 nokta × 1 seed.
-   ⚠️ Maliyet ölçülmeli: bir dense eval 4 dk sürüyor ama her `τ` noktası
-   kalibrasyon + budama + eval demek. Spec ~25 GPU-saat diyor; bu kartta
-   **önce 1 nokta ölçülüp ekstrapole edilmeli.**
+1. ⛔ **`tau_sweep.py` — BLOKE.** Maliyet modeli çıkarıldı
+   (`experiments/m0_cost_model.py`, 2026-08-21) ve süpürme bu makinede
+   koşulamıyor: spec'in 25 GPU-saat tahmini yerine **14–43 gün**, ve M1'in
+   kendisi **61–170 gün**. Ayrıntı ve seçenekler §7'de. Süpürmeden önce
+   hattın maliyeti düşürülmeli.
 
 ~~2. Transfer pilotu~~ — **yapıldı, 2026-08-21.** Tolerans kuralı
    `1.5 × max_T |sapma(T)|`; sentetik katmanda 0.0552 (hata seviyesinin %18.8'i).
@@ -226,7 +226,27 @@ problem verilirse eski davranışa düşüyor ama çıktıyı `draw_axis` ile et
 
 ## 7. Açık riskler
 
-**En büyüğü: Kapı A'nın düşme olasılığı yüksek.** Prova (`gate_a_dry_run.md`)
+**⛔ EN BÜYÜĞÜ ARTIK BU: hat gerçek katman boyutunda koşulamıyor.**
+Maliyet modeli (bu makinede ölçülen sabitlerle) üç ayrı duvar buluyor:
+
+| Duvar | Büyüklük | Sebep | Zorluk |
+|---|---|---|---|
+| **Bellek** | `T=2`'de **462 GiB** tek tensör | `tile_hessians` `[n_tiles, k, k]`'yı bir kerede ayırıyor | **Kolay** — tile'ları akıtmak 231 MiB'a düşürüyor |
+| **Cholesky** | Model başına 10¹⁶ flop; `T=16`'da 15 saat, `T=1`'de 10 saat | Her tile kendi sütun kümesine sahip → tile başına `k³` faktorizasyon | **Yapısal** |
+| **Codebook araması** | `T`'den bağımsız 12 saat (CPU f64) | 2¹⁶ kodsözcüğü üzerinde kaba kuvvet en yakın komşu | **Orta** — E8 kafesine doğrudan yuvarlama bunu ~0'a indirir |
+
+Cholesky duvarı **kaba kuvvet değil, tasarımdan geliyor**: her tile'ın kendi
+sütun kümesi + kendi rotasyonu var, dolayısıyla kendi alt-Hessian'ını
+faktorize etmesi gerekiyor. `T=1`'de bu **satır başına** bir faktorizasyon
+demek — yani SparseGPT'nin var oluş sebebi olan "row Hessian challenge"ı
+birebir yeniden üretiyoruz ve tam bedelini ödüyoruz.
+
+Maliyet `(n_out/T)·k³` olduğu için **ızgaranın ince ucunda yoğunlaşıyor**
+(3 bütçe × 5 çekiliş, cuda_f32): `T=2` 419 saat, `T=4` 384, `T=8` 254,
+`T=16` 150, `T=32` 86, `T=max` **15**. Yani granülerlik tezinin en çok
+veriye ihtiyaç duyduğu bölge, en pahalı bölge.
+
+**Kapı A'nın düşme olasılığı yüksek.** Prova (`gate_a_dry_run.md`)
 GPTQ-4bit survivor'larla her satırın düştüğünü gösterdi. E8P aritmetiği
 değiştiriyor ama **gösterilmedi**. Karar tablosunun `✗/✓` dalı hazır: proje
 durmaz, çerçeve daralır.
@@ -284,6 +304,7 @@ işler için dar.
 | `experiments/m0_vq_bits.py` | VQ checkpoint maliyeti — manifest'ten, indirmeden |
 | `experiments/m0_gate_b_power.py` | Kapı B'nin gücü + boru hattının gürültüsü |
 | `experiments/m0_transfer_pilot.py` | `Δ = Q + τ` transfer sapması → tolerans |
+| `experiments/m0_cost_model.py` | ölçülen sabitlerle gerçek koşu maliyeti |
 
 **Belgeler:** `spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı**) · `audit.md` (v6 denetimi, tarihsel kayıt) ·
@@ -296,6 +317,7 @@ HF_HUB_DISABLE_XET=1 python experiments/m0_dense_ppl.py --seqlens 2048 4096 --de
 python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --budgets 1.5 --draws 5
 python experiments/m0_gate_b_power.py --no-noise   # simülasyon (~15 dk), σ önbellekten
 python experiments/m0_transfer_pilot.py --draws 3  # ~8 dk; --reuse ile saniyeler
+python experiments/m0_cost_model.py               # ~1 dk, sabitler önbelleklenir
 python experiments/m0_vq_bits.py --all       # ~100 KB ağ trafiği, saniyeler
 ```
 
@@ -318,7 +340,8 @@ python experiments/m0_vq_bits.py --all       # ~100 KB ağ trafiği, saniyeler
 | `e5ec362` | Bu belge |
 | `a1626c6` | VQ maliyeti checkpoint'ten ölçüldü; SU/SV ayrışması bulundu |
 | `3d8658f` | Kapı B'nin gücü ölçüldü; `T*` küme oldu; çekiliş ekseni düzeldi |
-| *(bu tur)* | Transfer pilotu: tolerans kuralı, ve modelin büyük `T` önyargısı |
+| `7d1ee48` | Transfer pilotu: tolerans kuralı, ve modelin büyük `T` önyargısı |
+| *(bu tur)* | Maliyet modeli — ve hattın gerçek boyutta koşamadığının tespiti |
 
 ---
 
