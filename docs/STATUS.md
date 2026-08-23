@@ -251,6 +251,63 @@ bağlantılar gürültülü, onları atmak düzenlileştirme gibi davranıyor.
 kazanç hız değil kalite — §6.4'ün düzeltmesinden sonra Cholesky zaten pasın
 %10'u, yani bu M1'in 94 gününden 8 gün götürüyor.
 
+### 5.10 Ölçek uydurmayı örneklemek ucuz değil — gürültülü
+
+Süpürme toplandıktan sonra `fit_scale` bir tile'ın zamanının neredeyse tamamı,
+ve tavanı M1'i 48 → 14 güne indiriyordu. Ölçüldü (`m0_scale_fit.py`, 54 kol);
+**alınamaz.**
+
+Sebep ortalama bedel değil, **varyans**. Aynı ayar, yalnız hangi vektörlerin
+örneklendiği farklı:
+
+| T | tohum 0 | tohum 1 | tohum 2 | aralık |
+|---|---|---|---|---|
+| 4 | **+17.08%** | +1.49% | +1.25% | **15.8 pp** |
+| 16 | −3.70% | −3.14% | −3.38% | 0.6 pp |
+| max | −9.97% | +4.58% | −7.48% | **14.6 pp** |
+
+Kapı B'nin ayırmaya çalıştığı komşu tile farkı **0.31 σ**, 5 çekilişle
+saptanabilir fark hata seviyesinin **%3.2'si**. Hatta 15 puanlık, tile'dan
+tile'a bağımsız bir gürültü kaynağı sokmak, tam olarak ölçmeye çalıştığımız
+şeyi boğar. Ortalama bedel küçük olsa bile bu yeterli gerekçe.
+
+**Adım sayısını düşürmek de çalışmıyor:** `n6` +45.6 / +17.8 / +13.6%,
+`n12` +8.6 / −7.5 / −7.4% — işareti bile tutarsız.
+
+**Yan bulgu — `fit_scale` yanlış hedefi optimize ediyor.** T=16 ve T=max'te
+örnekleme sistematik olarak **iyileştiriyor** (s256/n12 T=max'te −20.8%).
+Sebep açık: `fit_scale` `‖x − αQ(x/α)‖²`'yi **ağırlık uzayında** minimize
+ediyor, oysa hattın hedefi `tr(E H Eᵀ)`. Daha kesin bir α, yanlış ölçüye göre
+daha kesin demek. Bu ayrı ve muhtemelen değerli bir iş: doğru hedefe uydurmak
+hem daha iyi hem daha ucuz olabilir. Ölçülmedi.
+
+**Ayrıca doğrulandı:** `sample=2048` T=4'te `full`'e **tam olarak eşit** çıktı —
+tile'ın 1,280 vektörü var, sınır ısırmıyor. §6.3'ün uyarısı ampirik olarak
+görüldü.
+
+### 5.11 fp16 arama: 1.5×, ölçülen bedeli ≤%1
+
+Kodsözcüğü araması fp16'da yapılıp kodsözcüğü fp32'den alınırsa
+(`search_dtype=torch.float16`): 262,144 vektörde satırların **%0.393'ü** farklı
+seçiliyor ve toplam kare hata **+0.0012%** artıyor. Farklı seçilen satırlarda
+mesafe artışı %0.24, ve fp16 hiçbir satırda daha iyi seçim yapmıyor — yani
+farklar gerçek berabere durumları.
+
+Uçtan uca, gerçek katmanda:
+
+| T | hız | kaliteye etkisi |
+|---|---|---|
+| 4 | 1.29× | −0.34% |
+| 16 | 1.45× | +0.90% |
+| max | 1.68× | −0.07% |
+
+**Örneklemeden kategorik olarak farklı: fp16 belirlenimci.** Bir sayıyı
+kaydırıyor, genişletmiyor. Tile'lar arası tutarsızlığı ~1.2 puan, 5 çekilişin
+saptayabildiğinin (%3.2) üçte biri. M1'i 48 → **33 güne** indirir.
+
+Varsayılan **kapalı** bırakıldı: kaliteyi ölçülebilir biçimde değiştiriyor ve
+bunun bir karar olarak kaydedilmesi gerekir, sessiz bir varsayılan olarak değil.
+
 ### 5.7 VENOM'un `V`'si bizim `T`'miz
 
 V:N:M formülü VENOM'dan dolduruldu ve yapısal bir şey çıktı: VENOM `V` satırın
@@ -391,20 +448,56 @@ bu sayı M1'in koşulup koşulmayacağını söyleyen sayı. 120 gün diyordu, d
 
 ---
 
+### 6.6 Izgarayı küçültmenin sınırları
+
+Hızlandırma kaldıraçları büyük ölçüde tükendi, o yüzden kalan eksen tasarım.
+Bağlayıcı olan iki şey var:
+
+- **`min_seeds=5`** — Kapı B'nin verdikti için 08-21'de ölçülerek donduruldu
+- **`T ∈ {1,2,4,8,16,32,max}`** — ön-kayıt `{1,16,max}` üçlüsünü *açıkça*
+  reddediyor ("yanlış-durdurma taşırdı"). Tile eksenini budamak tezin kendi
+  eksenini budamak
+
+Bağlı **olmayan**: 5 çekilişin kaç bütçede koşacağı. Ön-kayıtta Kapı B'nin üç
+bütçede de koşacağına dair bir taahhüt yok.
+
+| tasarım | şimdi | +fp16 |
+|---|---|---|
+| A. Tam M1 (3 bütçe × 7 tile × 5 çekiliş) | 48.2 g | 33.3 g |
+| **C. B=1.5'te 5 çekiliş, iç tile'lar 2, diğer bütçeler 1** | **16.9 g** | **11.6 g** |
+| D. Tek bütçe, 5 çekiliş, 7 tile | 14.2 g | 9.8 g |
+| F. Tek bütçe, 1 çekiliş, 7 tile — ilk gerçek U eğrisi | 2.8 g | 2.0 g |
+
+C, Kapı B'yi birincil bütçede tam güçte kararlarken tile eksenini budamıyor ve
+diğer iki bütçeyi sağlamlık kontrolü olarak tutuyor.
+
 ## 7. Sırada ne var
 
 ### Bir sonraki oturumun ilk işi
 
-**Tile-başı `fit_scale` örneklemesinin kalite bedelini ölç.** Maliyetin %84'ü
-orada ve tavanı M1'i 94 günden 28'e indiriyor — kalan tek büyük kaldıraç bu.
-Kurulum hazır: `m0_rotation_value.py`'nin kol yapısı aynen kullanılabilir,
-`sample ∈ {2048, 512, 256, 128}` süpürülür. Dikkat: örnekleme ancak tile'ın
-vektör sayısından küçük sınırlarda ısırıyor (§6.3), o yüzden süpürme küçük
-sayılarda olmalı. Bir de `fit_scale`'in `n_steps=24`'ü var — 24 aday ölçek,
-hiç sorgulanmadı; 8 aday muhtemelen aynı α'yı buluyor ve 3× getiriyor.
+**Tam model sürücüsünü yaz — `experiments/m1_run.py`.** Şu an yok, ve
+"sıkıştırılmış ppl hiç ölçülmedi" durumunun sebebi bilimsel bir karar değil,
+bu eksiklik. `calibrate.sequential_calibrate` (mevcut, `compress_fn` alıyor) ile
+`eval.streamed.streamed_perplexity` (mevcut) arasını bağlayacak.
 
-`ldlq_quantize(..., scale_sample=N)` için tile-başı yolda **tesisat henüz yok**
-— `scale_sample` şu an yalnız `per_layer` dalında kullanılıyor. Küçük iş.
+**Kesintiye dayanıklılık bunun parçası, sonradan eklenen bir şey değil.** 5–30
+günlük bir koşu dizüstünde kesilir. Kayıt birimi blok (nokta başına 32); anahtar
+`(model, budget, tile, draw, block)`. Dikkat: `sequential_calibrate` Hessian'ı
+**sıkıştırılmış** modelden okuyor (Spec v6 tuzak 20), yani devam ederken bir
+sonraki bloğun girdileri de kayıttan gelmeli — yoksa devam eden koşu kesilmeyenden
+farklı sonuç verir. Doğrulaması net: kesip devam ettirilen koşu, kesilmeden
+koşulanla aynı ppl vermeli (tiny Llama ile test edilebilir).
+
+Sonra **ilk gerçek koşu**: tek bütçe / tek çekiliş / 7 tile. Bugünkü hızda
+~3 gün, fp16 açılırsa ~2. Hattın gerçek modelde uçtan uca çalıştığını kanıtlar
+ve **ilk gerçek U eğrisini** verir.
+
+### Ölçülmemiş kalan tek büyük fikir
+
+**`fit_scale`'i doğru hedefe uydurmak** (§5.10). Şu an ağırlık uzayında
+`‖x − αQ(x/α)‖²` minimize ediliyor, oysa hattın hedefi `tr(E H Eᵀ)`. Örneklemenin
+T=16 ve T=max'te kaliteyi **iyileştirmesi** bunun belirtisi. Doğru hedefe
+uydurmak hem daha iyi hem daha ucuz olabilir; ölçülmedi.
 
 ### Ön-kaydı dondurmak için kalan iki kutu
 
@@ -427,9 +520,10 @@ Süpürme 29 gün olduğu için ikisi de bloke. Maliyet düşmeden ön-kayıt do
   quantization/maske hatası ayrımı, hizalama
 - **Attention koordinasyonu formülü** — `v_proj`↔`o_proj`, GQA, RoPE çiftleri;
   `T=max` için sert kısıt, hâlâ yalnızca ima edilmiş
-- **`fit_scale` örneklemesinin kalite etkisi** — §7'nin ilk işi; tile-başı yol
-  için tesisat da yazılacak (`scale_sample` şu an yalnız `per_layer`'da)
-- **`fit_scale(n_steps=24)`** — aday ölçek sayısı hiç sorgulanmadı
+- **Tam model sürücüsü + checkpoint** — §7'nin ilk işi, henüz yok
+- **`fit_scale`'in hedefi** — ağırlık uzayı yerine Hessian-ağırlıklı (§5.10)
+- **Eval maliyeti** — 4 dk yalnız WikiText-2; ön-kayıt §4 C4'ü de şart koşuyor
+  ve 5 zero-shot görev istiyor, ikisi de hiç ölçülmedi
 
 ---
 
@@ -447,9 +541,10 @@ altı" motivasyonu zayıflar.
 büyük çıkar ve *hangi* granülerlik sorusu cevapsız kalır. Başarısızlık değil
 ama manşeti zayıflatır.
 
-**Maliyet.** 94 gün bir dizüstünde koşulamaz. Ölçek kaldıracı tutarsa 28 güne
-iner ve kiralık bir A100'de günlere; tutmazsa proje ya donanım kiralamaya ya da
-ızgarayı daraltmaya mecbur — ve daraltmak tam da kanıtın olduğu yeri budar.
+**Maliyet.** 48 gün hâlâ bir dizüstünde koşulamaz, ve **ölçek kaldıracı
+denendi, tutmadı** (§5.10) — geriye fp16 (33 güne indirir), ızgarayı küçültmek
+ve donanım kiralamak kalıyor. Izgarayı küçültmenin sınırları §6.6'da; tile
+eksenini budamak tam da kanıtın olduğu yeri budar.
 
 **Maliyet modeli dört kez yanıldı.** Üçü iyimser, sonuncusu kötümser yöndeydi
 (§6.4). Bu belgedeki her gün rakamı ölçülmüş bir eğriye dayanıyor ama eğriler
@@ -503,6 +598,7 @@ kontrolü bunun için var.
 | `experiments/m0_transfer_pilot.py` | `Δ = Q + τ` transfer sapması → tolerans |
 | `experiments/m0_cost_model.py` | ölçülen tile sürelerinden gerçek koşu maliyeti |
 | `experiments/m0_rotation_value.py` | rotasyon gerçek katmanda kazandırıyor mu; blok genişliği süpürmesi |
+| `experiments/m0_scale_fit.py` | ölçek uydurmayı ucuzlatmanın kalite bedeli |
 
 **Belgeler:** `spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı** — iki kutu kaldı) · `audit.md` (v6 denetimi, tarihsel kayıt) ·
@@ -545,7 +641,9 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `31f9761` | **Rotasyon gerçek katmanda −70%**; hat GPU'ya taşındı |
 | `0201f93` | E8 kafes çözücü: CPU 3.5×, GPU 1.9×, çıktı birebir aynı |
 | `f425880` | Bu belge, bilinenin etrafında yeniden yazıldı |
-| *(bu oturum)* | Blok genişliği süpürmesi: **geri besleme daraltılır, rotasyon daraltılmaz**; maliyet modelinin Cholesky eğrisi düzeltildi (120 → 94 gün) |
+| `f00fe9c` | Blok genişliği: **geri besleme daraltılır, rotasyon daraltılmaz**; maliyet modelinin Cholesky eğrisi düzeltildi (120 → 94 gün) |
+| `40c8d9c` | Süpürme tile'lar arasında toplu — bit-birebir aynı çıktı, 94 → 48 gün |
+| *(bu oturum)* | Ölçek örneklemesi ölçüldü ve **reddedildi**; fp16 arama eklendi (varsayılan kapalı) |
 
 ---
 

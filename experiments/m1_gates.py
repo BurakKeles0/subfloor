@@ -118,6 +118,10 @@ def run_config(
     rotate_block: int | None = None,
     hessian_block: int | None = HESSIAN_BLOCK,
     chunk: int | str = "auto",
+    scale_sample: int | None = None,
+    scale_steps: int = Qz.FIT_STEPS,
+    scale_seed: int = 0,
+    search_dtype: torch.dtype | None = None,
     quantize: bool = True,
     ldlq: bool = True,
     align: int | None = None,
@@ -154,6 +158,11 @@ def run_config(
     saves the factorization -- the first is what makes dropping them defensible
     -- so an experiment that moved them together could not say which of the two
     cost the quality.
+
+    `scale_sample` and `scale_steps` cap the per-tile scale fit, which after the
+    sweep was chunked is most of what a tile costs.  They default to the full
+    fit because that is what every quality number so far was measured under;
+    `experiments/m0_scale_fit.py` is what prices moving them.
 
     `scale="per_layer"` fits the quantizer's scale once from a sample instead of
     once inside every tile.  That sweep is 83% of the pipeline's runtime, so the
@@ -200,6 +209,10 @@ def run_config(
                 tile_hessian_stream(
                     problem, cw, Qm if rotate_axis == "index" else None),
                 scale=scale,
+                scale_sample=scale_sample,
+                scale_steps=scale_steps,
+                scale_seed=scale_seed,
+                search_dtype=search_dtype,
                 hessian_block=hessian_block,
                 chunk=n_chunk,
             )
@@ -240,6 +253,10 @@ def run_config(
         "quantize": quantize,
         "ldlq": ldlq,
         "scale_policy": scale,
+        "scale_sample": scale_sample,
+        "scale_steps": scale_steps,
+        "scale_seed": scale_seed,
+        "search_dtype": None if search_dtype is None else str(search_dtype),
         "align": (Qz.E8P_DIM if (quantize and ldlq) else 1) if align is None else align,
         "survivors_per_tile": int(pruned.mask.survivors_per_tile().max()),
         "seed": seed,

@@ -56,6 +56,7 @@ __all__ = [
     "e8p_codebook",
     "in_e8_plus_quarter",
     "fit_scale",
+    "FIT_STEPS",
     "quantize_vectors",
     "quantize_blocks",
     "LDLQResult",
@@ -294,8 +295,22 @@ def nearest_e8p(x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     return best_idx, _on_device(x.dtype, str(x.device))[best_idx], exact
 
 
-def _nearest(x: Tensor, codebook: Tensor, chunk: int = 4096) -> tuple[Tensor, Tensor]:
+def _nearest(x: Tensor, codebook: Tensor, chunk: int = 4096,
+             search_dtype: torch.dtype | None = None) -> tuple[Tensor, Tensor]:
     """Nearest codeword for each row of `x` [n, 8].  Returns (index, codeword).
+
+    `search_dtype` runs the SEARCH in a narrower type and still gathers the
+    codeword from the caller's, so the returned values keep full precision and
+    only the choice is made in low precision.  Measured on 262,144 vectors,
+    float16 picks a different codeword for 0.393% of rows and costs 0.0012% of
+    total squared error -- those rows are genuine near-ties, and the choice is
+    never BETTER than the full-precision one, which is what a near-tie looks
+    like.  It buys 1.8x, and it buys it on `fit_scale` too, which is where a
+    tile now spends its time.
+
+    Unlike sampling the scale fit, this adds no NOISE: it is deterministic, so
+    it shifts a number rather than widening it.  That distinction is what makes
+    it acceptable and sampling not (`experiments/m0_scale_fit.py`).
 
     Brute force over 65536 codewords, chunked over `x`.  ||x-c||^2 expands to
     ||c||^2 - 2 x.c (the ||x||^2 term does not affect the argmin).
@@ -306,6 +321,11 @@ def _nearest(x: Tensor, codebook: Tensor, chunk: int = 4096) -> tuple[Tensor, Te
     pass, `experiments/m0_cost_model.py` -- and it is the one part of the
     dominant cost that is engineering rather than structure.
     """
+    if search_dtype is not None and search_dtype != x.dtype:
+        idx, _ = _nearest(x.to(search_dtype),
+                          _on_device(search_dtype, str(x.device)), chunk)
+        return idx, codebook[idx]
+
     floor_rows = _LATTICE_MIN_ROWS.get(x.device.type, 64)
     if (x.shape[0] >= floor_rows
             and codebook is _on_device(x.dtype, str(codebook.device))):
@@ -333,9 +353,19 @@ def _brute_force(x: Tensor, codebook: Tensor, chunk: int = 4096
     return idx, codebook[idx]
 
 
+#: Candidate scales `fit_scale` tries.  Never questioned: the objective is not
+#: convex in alpha so a search beats a closed form, but 24 uniform steps is a
+#: guess, and each one is a full pass over the tile.  Measured, six steps land
+#: within 1.4% of what 24 finds -- whether that 1.4% costs anything is what
+#: `experiments/m0_scale_fit.py` is for.
+FIT_STEPS = 24
+
+
 def fit_scale(
-    x: Tensor, codebook: Tensor, n_steps: int = 24, lo: float = 0.4, hi: float = 2.0,
+    x: Tensor, codebook: Tensor, n_steps: int = FIT_STEPS,
+    lo: float = 0.4, hi: float = 2.0,
     sample: int | None = None, seed_rng: int = 0,
+    search_dtype: torch.dtype | None = None,
 ) -> float:
     """Scale alpha minimizing ||x - alpha * Q(x/alpha)||^2.
 
@@ -363,7 +393,7 @@ def fit_scale(
     best, best_err = seed, float("inf")
     for f in torch.linspace(lo, hi, n_steps).tolist():
         a = seed * f
-        _, q = _nearest(x / a, codebook)
+        _, q = _nearest(x / a, codebook, search_dtype=search_dtype)
         err = float((x - a * q).square().sum())
         if err < best_err:
             best, best_err = a, err
@@ -495,7 +525,9 @@ def _tile_factors(H: Tensor, percdamp: float, parts) -> list[Tensor]:
 
 
 def _ldlq_sweep(W: Tensor, factors: list[Tensor], parts, alpha: Tensor,
-                codebook: Tensor, group: int) -> tuple[Tensor, Tensor]:
+                codebook: Tensor, group: int,
+                search_dtype: torch.dtype | None = None
+                ) -> tuple[Tensor, Tensor]:
     """The sweep itself, over C tiles at once.  `W` [C, lines, k] is consumed.
 
     Why C tiles and not one.  Tiles are independent given their own Hessians, so
@@ -521,7 +553,8 @@ def _ldlq_sweep(W: Tensor, factors: list[Tensor], parts, alpha: Tensor,
             j = off + jj
             g = slice(j, j + group)
             Wg = W[:, :, g]
-            idx, q = _nearest((Wg / a).reshape(-1, group), codebook)
+            idx, q = _nearest((Wg / a).reshape(-1, group), codebook,
+                              search_dtype=search_dtype)
             Qg = q.reshape(C, lines, group) * a
             out[:, :, g] = Qg
             per_group.append(idx.reshape(C, lines))
@@ -576,6 +609,10 @@ def ldlq_quantize(
     scale: float | None = None,
     group: int = E8P_DIM,
     hessian_block: int | None = None,
+    scale_sample: int | None = None,
+    scale_steps: int = FIT_STEPS,
+    scale_seed: int = 0,
+    search_dtype: torch.dtype | None = None,
 ) -> LDLQResult:
     """Hessian-aware rounding: LDLQ / block-GPTQ with a vector quantizer.
 
@@ -607,6 +644,13 @@ def ldlq_quantize(
     batched path affordable: a block-diagonal factor is k*b per tile instead of
     k^2, so a chunk of tiles fits in memory (`ldlq_quantize_blocks(chunk=...)`).
 
+    `scale_sample` and `scale_steps` are the two ways to make the scale fit
+    cheaper, and they multiply.  The fit scans the tile `scale_steps` times to
+    find ONE scalar, which after the sweep was chunked is most of what a tile
+    costs; `scale_sample` caps how many of the tile's vectors each pass looks
+    at.  Both default to the full-cost behaviour, because that is the
+    arrangement every quality number so far was measured under.
+
     One tile is the C=1 case of `_ldlq_sweep`, deliberately -- a second
     implementation of this arithmetic would be free to drift from the first.
     """
@@ -624,11 +668,14 @@ def ldlq_quantize(
 
     parts = _partition(k, hessian_block, group)
     cb = _on_device(block.dtype, str(block.device))
-    a = fit_scale(block.reshape(-1, group), cb) if scale is None else float(scale)
+    a = (float(scale) if scale is not None else
+         fit_scale(block.reshape(-1, group), cb, n_steps=scale_steps,
+                   sample=scale_sample, seed_rng=scale_seed,
+                   search_dtype=search_dtype))
     factors = [f.unsqueeze(0) for f in _tile_factors(H, percdamp, parts)]
     alpha = torch.tensor([a], dtype=block.dtype, device=block.device)
     values, idx = _ldlq_sweep(block.unsqueeze(0).clone(), factors, parts,
-                              alpha, cb, group)
+                              alpha, cb, group, search_dtype)
     return LDLQResult(values=values[0], indices=idx[0], scale=a)
 
 
@@ -638,7 +685,11 @@ def ldlq_quantize_blocks(
     *,
     percdamp: float = 0.01,
     scale: str | float = "per_tile",
-    scale_sample: int = 8192,
+    layer_scale_sample: int = 8192,
+    scale_sample: int | None = None,
+    scale_steps: int = FIT_STEPS,
+    scale_seed: int = 0,
+    search_dtype: torch.dtype | None = None,
     hessian_block: int | None = None,
     chunk: int = 1,
 ) -> QuantizedBlocks:
@@ -658,14 +709,24 @@ def ldlq_quantize_blocks(
 
       "per_tile"   fit it inside every tile -- what the pipeline has always
                    done, and 83% of its runtime
-      "per_layer"  fit it once from a sample of `scale_sample` vectors drawn
-                   across all tiles, then use it everywhere.  This is what
+      "per_layer"  fit it once from a sample of `layer_scale_sample` vectors
+                   drawn across all tiles, then use it everywhere.  This is what
                    QuIP# does, and it is the cheapest large saving available:
                    the sweep stops scaling with the layer.
       a float      use exactly this, fit nothing
 
     Fitting once over EVERY vector would save nothing at all -- same total work,
     differently arranged -- so the saving is in the sampling, not in the sharing.
+
+    `scale_seed` offsets the sampling RNG PER TILE (`scale_seed + t`), so two
+    tiles never draw the same subset -- a shared subset would correlate their
+    scales in a way a full fit never would.
+
+    `scale_sample` and `scale_steps` cap the PER-TILE fit and are the levers
+    that matter now.  Note they are not interchangeable with `per_layer`: that
+    one was measured 11% worse and rejected (2026-08-23), while sampling keeps a
+    scale per tile and only estimates it from fewer vectors.  Both default to
+    the full-cost behaviour.
 
     `hessian_block` is passed straight through; it is the other half of the same
     runtime question, and the two levers are independent -- one shrinks the
@@ -697,7 +758,8 @@ def ldlq_quantize_blocks(
     if scale == "per_layer":
         cb = _on_device(blocks.dtype, str(blocks.device))
         tile_scale = fit_scale(blocks.reshape(-1, E8P_DIM), cb,
-                               sample=scale_sample)
+                               n_steps=scale_steps, sample=layer_scale_sample,
+                               search_dtype=search_dtype)
     elif scale == "per_tile":
         tile_scale = None
     elif isinstance(scale, (int, float)):
@@ -734,12 +796,16 @@ def ldlq_quantize_blocks(
         factors = [torch.stack([f[i] for f in per_tile])
                    for i in range(len(parts))]
 
-        alphas = [fit_scale(blocks[t].reshape(-1, E8P_DIM), cb)
-                  if tile_scale is None else tile_scale for t in members]
+        alphas = [tile_scale if tile_scale is not None else
+                  fit_scale(blocks[t].reshape(-1, E8P_DIM), cb,
+                            n_steps=scale_steps, sample=scale_sample,
+                            seed_rng=scale_seed + t,
+                            search_dtype=search_dtype)
+                  for t in members]
         alpha = torch.tensor(alphas, dtype=blocks.dtype, device=blocks.device)
         sl = slice(start, start + len(alphas))
         values, index = _ldlq_sweep(blocks[sl].clone(), factors, parts,
-                                    alpha, cb, E8P_DIM)
+                                    alpha, cb, E8P_DIM, search_dtype)
         out[sl] = values
         idxs.append(index)
         scales.extend(alphas)
