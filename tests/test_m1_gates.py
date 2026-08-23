@@ -424,3 +424,44 @@ def test_calibration_draws_actually_differ(problem):
 def test_gate_run_rejects_an_empty_draw_list():
     with pytest.raises(ValueError):
         M.GateRun().run([])
+
+
+def test_tile_hessian_stream_matches_the_stacked_form(problem):
+    """The streaming path is what real layers use, so it has to agree with the
+    stacked one tile for tile -- including the rotation into the block's basis."""
+    import compact as C
+    import prune as P
+    import rotation as R
+
+    pruned = P.prune(problem.W, axis="B", tile_size=4, density=0.625,
+                     metric="wanda", act_norm=problem.act_norm, H=problem.H,
+                     compensate=True, align=8)
+    cw = C.compact(pruned.W, pruned.mask)
+    _, Qm = R.rotate(cw, axis="index", seed=0)
+
+    for Q_arg in (None, Qm):
+        stacked = M.tile_hessians(problem, cw, Q_arg)
+        stream = M.tile_hessian_stream(problem, cw, Q_arg)
+        for t in range(stacked.shape[0]):
+            assert torch.equal(stacked[t], stream(t))
+
+
+def test_streaming_does_not_change_what_run_config_reports(problem):
+    """run_config now streams; the numbers it produces must be the ones the
+    stacked path produced, or every measurement before today is orphaned."""
+    import compact as C
+    import prune as P
+    import quantize as Qz
+    import rotation as R
+
+    r = M.run_config(problem, budget_bits=1.5, tile_size=4)
+    pruned = P.prune(problem.W, axis="B", tile_size=4,
+                     density=r["density_requested"], metric="wanda",
+                     act_norm=problem.act_norm, H=problem.H, compensate=True,
+                     align=Qz.E8P_DIM)
+    cw = C.compact(pruned.W, pruned.mask)
+    rot, Qm = R.rotate(cw, axis="index", seed=0)
+    qb = Qz.ldlq_quantize_blocks(rot.blocks, M.tile_hessians(problem, cw, Qm))
+    W_hat = C.scatter(R.unrotate(rot.with_blocks(qb.values), Qm, axis="index"))
+    assert problem.output_error(W_hat) == pytest.approx(r["rel_output_error"],
+                                                        rel=1e-12)

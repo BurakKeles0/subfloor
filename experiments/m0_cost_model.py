@@ -18,6 +18,13 @@ codebook search is nearly all of that -- but `k` is small there, and the
 factorization grows as `k^3` while the search grows as `k`.  At real widths they
 end up the same order, which is why both are modelled rather than one.
 
+The first version of this file modelled one codebook search per group and was
+wrong by six times: `ldlq_quantize` runs `fit_scale` first, and that sweeps 24
+candidate scales searching the whole tile at each.  Measured directly on an
+o_proj-shaped tile it is 83% of the tile's time.  It is in the model now, and
+switchable, because it is also the cheapest thing in the pipeline to remove --
+QuIP# fits one scale per layer, not one per tile.
+
 The third quantity is memory, and it is the one that bites first: `tile_hessians`
 materializes [n_tiles, k, k] in one tensor.
 
@@ -58,6 +65,17 @@ CHOL_FLOPS_PER_K3 = 5.0 / 3.0
 #: One nearest-codeword search: a [rows, 8] x [8, 2^16] product.
 CODEBOOK_SIZE = 1 << 16
 E8P_DIM = Qz.E8P_DIM
+
+#: `ldlq_quantize` does not search the codebook once per group -- it first calls
+#: `fit_scale`, which sweeps 24 candidate scales and searches the WHOLE tile at
+#: each one.  Measured on an o_proj-shaped tile (4 lines x 2560 survivors), that
+#: sweep is 83% of the tile's total time, a 6x multiplier on everything below.
+#:
+#: It is also the most avoidable cost in the pipeline: QuIP# fits one scale per
+#: LAYER, and a per-tile scale buys little while costing this.  Left in the
+#: model as a measured multiplier rather than quietly assumed away, with
+#: `--no-scale-fit` to price the alternative.
+SCALE_FIT_MULTIPLIER = 6.0
 
 #: Measured, `experiments/m0_dense_ppl.py`: one streamed WikiText-2 pass at
 #: seqlen 4096 on this 8 GB card.
@@ -153,7 +171,8 @@ def _scheme(t):
 
 
 def layer_cost(n_out: int, n_in: int, tile_size, budget: float, *,
-               vq_bits: float = 2.0, dtype_bytes: int = 8) -> dict | None:
+               vq_bits: float = 2.0, dtype_bytes: int = 8,
+               scale_fit: bool = True) -> dict | None:
     """Flops and bytes for one linear at one tile size.
 
     `k` is the aligned survivor count, so it is what the code will really
@@ -174,8 +193,11 @@ def layer_cost(n_out: int, n_in: int, tile_size, budget: float, *,
         "lines_per_tile": lines_per_tile,
         # one factorization per tile
         "cholesky_flops": n_tiles * CHOL_FLOPS_PER_K3 * k ** 3,
-        # one search per tile per group of eight, over that tile's lines
-        "codebook_flops": n_out * (k / E8P_DIM) * 2 * E8P_DIM * CODEBOOK_SIZE,
+        # one search per tile per group of eight, over that tile's lines --
+        # times the scale-fitting sweep that precedes every tile
+        "codebook_flops": (n_out * (k / E8P_DIM) * 2 * E8P_DIM * CODEBOOK_SIZE
+                           * (SCALE_FIT_MULTIPLIER if scale_fit else 1.0)),
+        "scale_fit": scale_fit,
         # what `tile_hessians` allocates in one go
         "hessian_bytes": n_tiles * k * k * dtype_bytes,
         # what it would allocate if the tiles were streamed instead
@@ -184,8 +206,8 @@ def layer_cost(n_out: int, n_in: int, tile_size, budget: float, *,
 
 
 def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
-               batched: bool = False, inventory=LLAMA2_7B,
-               n_blocks: int = N_BLOCKS) -> dict:
+               batched: bool = False, scale_fit: bool = True,
+               inventory=LLAMA2_7B, n_blocks: int = N_BLOCKS) -> dict:
     """One full compression pass over Llama-2-7B at one tile size."""
     r = rates["setups"][setup]
     cb_rate = r["codebook_flops_per_s_large" if batched else
@@ -193,7 +215,7 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
 
     chol = cb = peak = peak_streamed = 0.0
     for n_out, n_in, count in inventory:
-        c = layer_cost(n_out, n_in, tile_size, budget)
+        c = layer_cost(n_out, n_in, tile_size, budget, scale_fit=scale_fit)
         if c is None:
             return {"tile_size": tile_size, "skipped": "budget unreachable"}
         chol += count * c["cholesky_flops"]
@@ -206,6 +228,7 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
     seconds = chol / r["cholesky_flops_per_s"] + cb / cb_rate
     return {
         "tile_size": tile_size, "setup": setup, "batched": batched,
+        "scale_fit": scale_fit,
         "cholesky_flops": chol, "codebook_flops": cb,
         "cholesky_seconds": chol / r["cholesky_flops_per_s"],
         "codebook_seconds": cb / cb_rate,

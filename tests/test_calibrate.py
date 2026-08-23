@@ -228,3 +228,67 @@ def test_pipeline_plugs_into_calibration():
     assert len(records) == 4
     assert all("skipped" not in c for c in calls)
     assert all(c["bits_realized"] == pytest.approx(1.5, abs=1e-9) for c in calls)
+
+
+# --------------------------------------------------------------------------- #
+# Calibration windows
+# --------------------------------------------------------------------------- #
+
+class _FakeTokenizer:
+    """Whitespace tokenizer, enough to exercise the windowing logic."""
+
+    def __call__(self, text, return_tensors=None):
+        ids = torch.tensor([[abs(hash(w)) % 32000 for w in text.split()]])
+        return type("Enc", (), {"input_ids": ids})()
+
+
+def test_wikitext_windows_come_from_the_joined_stream(monkeypatch):
+    """The bug this replaces: WikiText rows are single LINES, so requiring one
+    row to exceed 2048 tokens found zero windows and the loader raised.  The
+    reference implementations join the split first, which is also what
+    `eval.perplexity.load_eval_tokens` does for the test split."""
+    lines = [f"line {i} " + " ".join(f"w{i}_{j}" for j in range(20))
+             for i in range(500)]
+
+    def fake_load_dataset(*args, **kwargs):
+        return {"text": lines}
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "datasets",
+        type("M", (), {"load_dataset": staticmethod(fake_load_dataset)}))
+
+    out = Cal.load_calibration_tokens(_FakeTokenizer(), n_samples=5, seqlen=64,
+                                    seed=0, dataset="wikitext2")
+    assert out.shape == (5, 64)
+
+
+def test_calibration_windows_are_reproducible_and_the_seed_is_the_draw(monkeypatch):
+    """Spec section 6: the seed IS the calibration draw.  Same seed must give
+    the same windows, a different seed different ones -- otherwise the paired
+    comparisons Gate B relies on are not paired at all."""
+    lines = [f"line {i} " + " ".join(f"w{i}_{j}" for j in range(20))
+             for i in range(500)]
+    monkeypatch.setitem(
+        __import__("sys").modules, "datasets",
+        type("M", (), {"load_dataset": staticmethod(lambda *a, **k: {"text": lines})}))
+
+    kw = dict(n_samples=4, seqlen=32, dataset="wikitext2")
+    a = Cal.load_calibration_tokens(_FakeTokenizer(), seed=0, **kw)
+    b = Cal.load_calibration_tokens(_FakeTokenizer(), seed=0, **kw)
+    c = Cal.load_calibration_tokens(_FakeTokenizer(), seed=1, **kw)
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
+
+
+def test_a_corpus_shorter_than_one_window_says_so(monkeypatch):
+    monkeypatch.setitem(
+        __import__("sys").modules, "datasets",
+        type("M", (), {"load_dataset": staticmethod(lambda *a, **k: {"text": ["a b c"]})}))
+    with pytest.raises(RuntimeError, match="need >"):
+        Cal.load_calibration_tokens(_FakeTokenizer(), n_samples=1, seqlen=64,
+                                  dataset="wikitext2")
+
+
+def test_an_unknown_calibration_dataset_is_rejected():
+    with pytest.raises(ValueError, match="unknown dataset"):
+        Cal.load_calibration_tokens(_FakeTokenizer(), dataset="nope")

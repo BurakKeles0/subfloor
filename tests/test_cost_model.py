@@ -190,3 +190,39 @@ def test_m1_cost_scales_with_the_draw_count():
     a = CM.m1_cost(RATES, "fake", n_draws=5)
     b = CM.m1_cost(RATES, "fake", n_draws=10)
     assert b["seconds"] == pytest.approx(2 * a["seconds"])
+
+
+# --------------------------------------------------------------------------- #
+# The scale-fitting sweep
+# --------------------------------------------------------------------------- #
+
+def test_the_scale_fit_multiplier_hits_only_the_codebook_term():
+    """`fit_scale` searches the codebook; it does not touch the Hessian.
+
+    The first version of the model left it out entirely and understated every
+    codebook figure sixfold, so the term is asserted rather than trusted.
+    """
+    with_fit = CM.layer_cost(4096, 11008, 16, 1.5, scale_fit=True)
+    without = CM.layer_cost(4096, 11008, 16, 1.5, scale_fit=False)
+    assert with_fit["cholesky_flops"] == without["cholesky_flops"]
+    assert with_fit["codebook_flops"] == pytest.approx(
+        CM.SCALE_FIT_MULTIPLIER * without["codebook_flops"])
+
+
+def test_dropping_the_per_tile_scale_fit_is_worth_real_time():
+    """Priced so the option can be compared against the harder fixes rather
+    than argued about."""
+    a = CM.model_cost(16, 1.5, RATES, "fake", scale_fit=True)
+    b = CM.model_cost(16, 1.5, RATES, "fake", scale_fit=False)
+    assert b["compress_seconds"] < a["compress_seconds"]
+    assert a["cholesky_seconds"] == pytest.approx(b["cholesky_seconds"])
+    saved = a["codebook_seconds"] - b["codebook_seconds"]
+    assert saved == pytest.approx(
+        b["codebook_seconds"] * (CM.SCALE_FIT_MULTIPLIER - 1))
+
+
+def test_scale_fit_is_on_by_default_because_that_is_what_the_code_does():
+    """The default has to describe the pipeline as written, not as we would
+    like it -- an optimistic default is how a cost model stops being one."""
+    assert CM.layer_cost(4096, 4096, 16, 1.5)["scale_fit"] is True
+    assert CM.model_cost(16, 1.5, RATES, "fake")["scale_fit"] is True

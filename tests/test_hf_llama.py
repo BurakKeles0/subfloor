@@ -195,3 +195,38 @@ def test_head_only_lm_feeds_perplexity(harness):
     assert r.n_windows == 8
     # An untrained model over a uniform stream should sit near the vocabulary.
     assert 1.0 < r.perplexity < 10 * VOCAB
+
+
+# --------------------------------------------------------------------------- #
+# Moving a captured context to a device
+# --------------------------------------------------------------------------- #
+
+def test_to_device_recurses_into_the_structures_block_kwargs_actually_use():
+    """The bug this exists to prevent: `block_kwargs` holds the rotary
+    embeddings as a TUPLE of tensors, so a flat comprehension over the dict
+    moves the mask and leaves the rotary halves behind.  The failure surfaces
+    several frames deep inside transformers as a device mismatch, which is a
+    long way from the line that caused it.
+    """
+    kwargs = {
+        "attention_mask": torch.zeros(2, 2),
+        "position_embeddings": (torch.zeros(3), torch.ones(3)),
+        "past_key_values": [torch.zeros(1), {"inner": torch.ones(1)}],
+        "use_cache": False,
+        "position_ids": None,
+    }
+    moved = HF.to_device(kwargs, "cpu")
+
+    assert torch.is_tensor(moved["attention_mask"])
+    assert isinstance(moved["position_embeddings"], tuple)
+    assert all(torch.is_tensor(t) for t in moved["position_embeddings"])
+    assert isinstance(moved["past_key_values"], list)
+    assert torch.is_tensor(moved["past_key_values"][1]["inner"])
+    assert moved["use_cache"] is False and moved["position_ids"] is None
+
+
+def test_to_device_leaves_values_unchanged():
+    kwargs = {"a": torch.arange(4.0), "b": (torch.ones(2),)}
+    moved = HF.to_device(kwargs, "cpu")
+    assert torch.equal(moved["a"], kwargs["a"])
+    assert torch.equal(moved["b"][0], kwargs["b"][0])

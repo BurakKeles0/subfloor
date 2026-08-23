@@ -332,19 +332,32 @@ def load_calibration_tokens(
     """
     from datasets import load_dataset
 
-    if dataset == "c4":
-        raw = load_dataset(
-            "allenai/c4", data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
-            split="train",
-        )
-        field = "text"
-    elif dataset == "wikitext2":
+    g = torch.Generator().manual_seed(seed)
+
+    if dataset == "wikitext2":
+        # WikiText rows are single LINES, and a line almost never reaches 2048
+        # tokens -- sampling per row finds nothing.  The reference
+        # implementations join the split and cut windows out of the stream, the
+        # same way `eval.perplexity.load_eval_tokens` does for the test split.
         raw = load_dataset(WIKITEXT_REPO, "wikitext-2-raw-v1", split="train")
-        field = "text"
-    else:
+        stream = tokenizer("\n\n".join(raw["text"]),
+                           return_tensors="pt").input_ids.reshape(-1)
+        if stream.numel() <= seqlen:
+            raise RuntimeError(
+                f"wikitext-2 train has {stream.numel()} tokens, need > {seqlen}"
+            )
+        starts = torch.randint(stream.numel() - seqlen, (n_samples,), generator=g)
+        return torch.stack([stream[s:s + seqlen] for s in starts.tolist()])
+
+    if dataset != "c4":
         raise ValueError(f"unknown dataset {dataset!r}")
 
-    g = torch.Generator().manual_seed(seed)
+    # C4 rows are whole documents, so per-document sampling is right here and is
+    # what the reference implementations do.
+    raw = load_dataset(
+        "allenai/c4", data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
+        split="train",
+    )
     out = []
     tries = 0
     while len(out) < n_samples:
@@ -354,7 +367,7 @@ def load_calibration_tokens(
                 f"only found {len(out)}/{n_samples} windows of {seqlen} tokens"
             )
         i = int(torch.randint(len(raw), (1,), generator=g))
-        enc = tokenizer(raw[i][field], return_tensors="pt").input_ids
+        enc = tokenizer(raw[i]["text"], return_tensors="pt").input_ids
         if enc.shape[1] <= seqlen:
             continue
         start = int(torch.randint(enc.shape[1] - seqlen, (1,), generator=g))

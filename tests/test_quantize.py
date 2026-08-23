@@ -345,3 +345,42 @@ def test_rotation_pays_only_when_the_weights_are_not_already_isotropic():
         "rotating heavy-tailed weights should help substantially"
     )
     assert h["best"] < h["nn_plain"], "LDLQ+rotation should be the best combination"
+
+
+# --------------------------------------------------------------------------- #
+# Streaming the sub-Hessians
+# --------------------------------------------------------------------------- #
+
+def test_streamed_hessians_give_bit_identical_results():
+    """The memory fix must be a pure refactor.
+
+    LDLQ consumes tiles in order, so handing it a callable instead of a stacked
+    tensor changes nothing about the arithmetic -- and at real widths it is the
+    difference between 119 GiB and 239 MiB.  Identical to the last bit, not
+    approximately: any drift would mean the callable is serving a different
+    tile than the index it was given.
+    """
+    g = torch.Generator().manual_seed(0)
+    blocks = torch.randn(5, 6, 16, generator=g, dtype=torch.float64)
+    hs = []
+    for _ in range(5):
+        a = torch.randn(16, 16, generator=g, dtype=torch.float64)
+        hs.append(a @ a.T + torch.eye(16, dtype=torch.float64))
+    stacked = torch.stack(hs)
+
+    a = Q.ldlq_quantize_blocks(blocks, stacked)
+    b = Q.ldlq_quantize_blocks(blocks, lambda t: stacked[t])
+    assert torch.equal(a.values, b.values)
+    assert torch.equal(a.indices, b.indices)
+    assert torch.equal(a.scales, b.scales)
+
+
+def test_a_streamed_hessian_of_the_wrong_shape_is_rejected():
+    """Named per tile, because a callable cannot be shape-checked up front and a
+    silently wrong tile would just produce worse numbers."""
+    g = torch.Generator().manual_seed(0)
+    blocks = torch.randn(3, 4, 16, generator=g, dtype=torch.float64)
+    good = torch.eye(16, dtype=torch.float64)
+    bad = torch.eye(8, dtype=torch.float64)
+    with pytest.raises(ValueError, match="tile 1"):
+        Q.ldlq_quantize_blocks(blocks, lambda t: good if t == 0 else bad)

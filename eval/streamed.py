@@ -27,22 +27,10 @@ from typing import Any, Callable, Sequence
 import torch
 from torch import Tensor, nn
 
+import hf_llama as HF
 from perplexity import PerplexityResult
 
 __all__ = ["streamed_perplexity", "stream_blocks"]
-
-
-def _to_device(obj: Any, device: torch.device | str) -> Any:
-    """Move tensors inside a nested structure; leave everything else alone."""
-    if torch.is_tensor(obj):
-        return obj.to(device)
-    if isinstance(obj, tuple):
-        return tuple(_to_device(o, device) for o in obj)
-    if isinstance(obj, list):
-        return [_to_device(o, device) for o in obj]
-    if isinstance(obj, dict):
-        return {k: _to_device(v, device) for k, v in obj.items()}
-    return obj
 
 
 def _block_out(out: Any) -> Tensor:
@@ -64,7 +52,7 @@ def stream_blocks(
     activations stay on the GPU between blocks (faster, needs them to fit);
     otherwise they live on the host and each chunk is copied across per block.
     """
-    kwargs_dev = _to_device(block_kwargs or {}, device)
+    kwargs_dev = HF.to_device(block_kwargs or {}, device)
     for i, block in enumerate(blocks):
         block.to(device)
         try:
@@ -98,8 +86,6 @@ def streamed_perplexity(
     Numerically identical to `perplexity.perplexity`; the difference is only
     where the weights live while the arithmetic happens.
     """
-    import hf_llama as HF
-
     if convention not in ("gptq", "exact"):
         raise ValueError(f"unknown convention {convention!r}")
     if tokens.ndim != 1:

@@ -124,6 +124,27 @@ def capture_block_inputs(
     return catcher.hidden, catcher.kwargs or {}
 
 
+def to_device(obj: Any, device: torch.device | str) -> Any:
+    """Move every tensor inside a nested structure; leave everything else alone.
+
+    `capture_block_inputs` returns `block_kwargs` holding the causal mask and the
+    rotary embeddings, and the rotary entry is a TUPLE of tensors.  A flat
+    `{k: v.to(device) ...}` therefore leaves half of it behind and the block
+    forward dies on a device mismatch several frames deep in transformers -- so
+    this lives next to the function that produces the structure rather than
+    being rewritten by each caller.
+    """
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    if isinstance(obj, tuple):
+        return tuple(to_device(o, device) for o in obj)
+    if isinstance(obj, list):
+        return [to_device(o, device) for o in obj]
+    if isinstance(obj, dict):
+        return {k: to_device(v, device) for k, v in obj.items()}
+    return obj
+
+
 def _locate_blocks(model: nn.Module) -> tuple[Any, int]:
     """The container holding the blocks, so block 0 can be swapped in place."""
     for path in (("model", "layers"), ("transformer", "h"), ("layers",)):

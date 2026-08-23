@@ -41,6 +41,7 @@ breaking and the fallback is rotation + GPTQ-3bit.
 from __future__ import annotations
 
 import itertools
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -340,23 +341,39 @@ def ldlq_quantize(
 
 def ldlq_quantize_blocks(
     blocks: Tensor,
-    hessians: Tensor,
+    hessians: Tensor | Callable[[int], Tensor],
     *,
     percdamp: float = 0.01,
 ) -> QuantizedBlocks:
-    """`ldlq_quantize` over every tile.  `hessians` is [n_tiles, k, k], each one
-    the tile's sub-Hessian in the SAME basis as its block."""
+    """`ldlq_quantize` over every tile.
+
+    `hessians` is either a [n_tiles, k, k] tensor -- each entry the tile's
+    sub-Hessian in the SAME basis as its block -- or a callable returning one
+    tile's [k, k] on demand.
+
+    Prefer the callable at real widths.  The tiles are consumed strictly one at
+    a time, so materializing all of them costs `n_tiles` times more memory for
+    no benefit, and `n_tiles` is in the hundreds: a Llama-2-7B `down_proj` at
+    T=16 wants 119 GiB as a single tensor and 239 MiB one tile at a time.  See
+    `experiments/m0_cost_model.py`.
+    """
     if blocks.ndim != 3:
         raise ValueError(f"blocks must be 3-D, got {tuple(blocks.shape)}")
     n_tiles, lpt, k = blocks.shape
-    if hessians.shape != (n_tiles, k, k):
+    streaming = callable(hessians)
+    if not streaming and hessians.shape != (n_tiles, k, k):
         raise ValueError(
             f"hessians must be ({n_tiles}, {k}, {k}), got {tuple(hessians.shape)}"
         )
     out = torch.empty_like(blocks)
     idxs, scales = [], []
     for t in range(n_tiles):
-        r = ldlq_quantize(blocks[t], hessians[t], percdamp=percdamp)
+        h = hessians(t) if streaming else hessians[t]
+        if h.shape != (k, k):
+            raise ValueError(
+                f"tile {t}: hessian must be ({k}, {k}), got {tuple(h.shape)}"
+            )
+        r = ldlq_quantize(blocks[t], h, percdamp=percdamp)
         out[t] = r.values
         idxs.append(r.indices)
         scales.append(r.scale)

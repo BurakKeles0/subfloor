@@ -72,6 +72,33 @@ def tile_hessians(
     return Ht if Q is None else Q @ Ht @ Q.transpose(-1, -2)
 
 
+def tile_hessian_stream(problem: LayerProblem, cw: C.CompactWeights,
+                        Q: Tensor | None = None):
+    """The same thing, one tile at a time.
+
+    `tile_hessians` builds every tile's sub-Hessian in a single tensor, which is
+    fine at test widths and impossible at real ones: a Llama-2-7B `down_proj` at
+    T=16 is 256 tiles of 7912 x 7912, or 119 GiB.  LDLQ consumes them strictly in
+    order, so nothing is gained by holding them all.
+
+    Returns a callable, because that is what `ldlq_quantize_blocks` takes.
+    """
+    H = problem.H
+    S = cw.idx_index                                     # [n_tiles, k]
+
+    def one(t: int) -> Tensor:
+        idx = S[t]
+        Ht = H[idx.unsqueeze(-1), idx.unsqueeze(0)]      # [k, k]
+        if Q is None:
+            return Ht
+        # Q is [n_tiles, k, k] when the rotation differs per tile, [k, k] when
+        # every tile shares it; both are accepted so the caller need not care.
+        q = Q[t] if Q.ndim == 3 else Q
+        return q @ Ht @ q.transpose(-1, -2)
+
+    return one
+
+
 def run_config(
     problem: LayerProblem,
     *,
@@ -130,9 +157,11 @@ def run_config(
         rotated, Qm = (R.rotate(cw, axis=rotate_axis, seed=seed)
                        if rotate_axis else (cw, None))
         if ldlq:
+            # Streamed: at real widths the stacked form is hundreds of GiB.
             qb = Qz.ldlq_quantize_blocks(
                 rotated.blocks,
-                tile_hessians(problem, cw, Qm if rotate_axis == "index" else None),
+                tile_hessian_stream(
+                    problem, cw, Qm if rotate_axis == "index" else None),
             )
         else:
             qb = Qz.quantize_blocks(rotated.blocks)
