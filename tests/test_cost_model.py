@@ -306,7 +306,7 @@ def test_the_factorization_is_per_tile_because_of_the_column_set():
     rotation width can make the factorization shared.  What the model charges
     is n_tiles factorizations, and n_tiles comes from the tiling alone.
     """
-    c = CM.layer_cost(4096, 11008, 16, 1.5)
+    c = CM.layer_cost(4096, 11008, 16, 1.5, hessian_block=None)
     assert c["n_tiles"] == 4096 // 16
     assert c["cholesky_flops"] == pytest.approx(
         c["n_tiles"] * CM.CHOL_FLOPS_PER_K3 * c["k"] ** 3)
@@ -314,7 +314,7 @@ def test_the_factorization_is_per_tile_because_of_the_column_set():
 
 @pytest.mark.parametrize("block", [2048, 512, 128])
 def test_block_diagonal_feedback_turns_k_cubed_into_k_times_b_squared(block):
-    full = CM.layer_cost(4096, 11008, 16, 1.5)
+    full = CM.layer_cost(4096, 11008, 16, 1.5, hessian_block=None)
     blocked = CM.layer_cost(4096, 11008, 16, 1.5, hessian_block=block)
     k = full["k"]
     assert blocked["k"] == k
@@ -328,7 +328,7 @@ def test_block_diagonal_feedback_turns_k_cubed_into_k_times_b_squared(block):
 
 
 def test_block_width_wider_than_k_is_the_unconstrained_cost():
-    full = CM.layer_cost(4096, 4096, Tl.MAX_TILE, 1.5)
+    full = CM.layer_cost(4096, 4096, Tl.MAX_TILE, 1.5, hessian_block=None)
     assert CM.layer_cost(4096, 4096, Tl.MAX_TILE, 1.5,
                          hessian_block=10 ** 6)["cholesky_flops"] == pytest.approx(
         full["cholesky_flops"])
@@ -360,8 +360,13 @@ def test_the_cost_curve_flattens_long_before_width_eight():
 def test_m1_records_the_block_width_it_priced():
     """A cost claim that does not carry its assumptions is how the model was
     wrong three times already."""
-    assert CM.m1_cost(RATES, "fake")["hessian_block"] is None
-    assert CM.m1_cost(RATES, "fake", hessian_block=512)["hessian_block"] == 512
+    assert CM.m1_cost(RATES, "fake")["hessian_block"] == CM.DEFAULT_HESSIAN_BLOCK
+    assert CM.m1_cost(RATES, "fake", hessian_block=None)["hessian_block"] is None
+    # The default must track the pipeline, not history: `m1_gates` confines the
+    # feedback to this width, so pricing an unconfined run by default would
+    # quote a configuration nobody runs.
+    import m1_gates
+    assert CM.DEFAULT_HESSIAN_BLOCK == m1_gates.HESSIAN_BLOCK
 
 
 def test_sampling_the_per_tile_scale_is_inert_where_the_cost_lives():
@@ -448,10 +453,17 @@ def test_the_codebook_sweep_is_the_wall_not_the_factorization():
     STATUS 6.3 reads the factorization as the structural wall and a block width
     as the fix.  Measured, the factorization is a fraction of the pass and the
     scale-fitting sweep is most of it.  Evaluated at the configuration the
-    pipeline actually runs -- feedback confined to 512, sweep chunked -- the
-    codebook term outweighs the Cholesky and the rotation together by 5x or
-    more at every tile size, and dropping the per-tile scale fit is worth four
-    times what confining the feedback is.
+    pipeline actually runs -- feedback confined to 512, sweep chunked, unsettled
+    rows resolved analytically -- the codebook term still outweighs the Cholesky
+    and the rotation together at every tile size, and dropping the per-tile
+    scale fit is still worth more than twice what confining the feedback is.
+
+    Both margins have NARROWED -- the first from over 5x to 3.6x, the second
+    from 4x to 2.2x -- and that is progress rather than drift: the codebook term
+    fell 2.6x when the scan went away while the rotation did not move.  Once
+    they approach parity the rotation becomes worth attacking (TF32 buys 1.66x
+    on it), so the thresholds below are loose enough to keep passing and tight
+    enough to notice.
 
     The block width is still worth taking: it is free, it is what makes the
     chunked sweep affordable, and the measurement says it IMPROVES quality.  It
@@ -468,7 +480,7 @@ def test_the_codebook_sweep_is_the_wall_not_the_factorization():
 
     for tile in (1, 4, 16):
         c = CM.model_cost(tile, 1.5, rates, "cuda_f32", hessian_block=512)
-        assert c["codebook_seconds"] >= 5 * (c["cholesky_seconds"]
+        assert c["codebook_seconds"] >= 2 * (c["cholesky_seconds"]
                                              + c["rotation_seconds"])
 
     base = CM.m1_cost(rates, "cuda_f32")["days"]
@@ -476,4 +488,4 @@ def test_the_codebook_sweep_is_the_wall_not_the_factorization():
     no_fit = CM.m1_cost(rates, "cuda_f32", scale_fit=False,
                         hessian_block=512)["days"]
     assert blocked > 0.7 * base                  # the block width: a minor saving
-    assert (base - no_fit) > 4 * (base - blocked)   # the scale fit: the major one
+    assert (base - no_fit) > 2 * (base - blocked)   # the scale fit: still larger

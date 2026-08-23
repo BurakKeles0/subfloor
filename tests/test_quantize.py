@@ -668,3 +668,105 @@ def test_auto_chunk_is_bounded_by_memory_and_by_saturation():
     assert Q.auto_chunk(3, 16, 512, item, hessian_block=512) == 3
     assert Q.auto_chunk(1000, 1, 8192, item, hessian_block=None,
                         budget_bytes=1) == 1
+
+
+# --------------------------------------------------------------------------- #
+# ANALYTIC NEAREST CODEWORD
+# --------------------------------------------------------------------------- #
+# The scan over 65536 codewords was the pipeline's dominant cost and it was
+# never necessary.  A codeword is sigma*p + s with p one of 256 NON-NEGATIVE
+# patterns, so for a fixed pattern the best signs are read off coordinate by
+# coordinate; and since every coordinate is a half-integer, flipping any single
+# sign flips the parity, so an infeasible assignment is repaired by the single
+# cheapest flip.  The 128 sign choices are arithmetic, not a search space.
+#
+# It replaces the SCAN, not the lattice decoder: when the decoder settles a row
+# it is cheaper still, being launch-bound rather than compute-bound.  What the
+# analytic form fixes is `fit_scale`'s small-scale steps, where the decoder
+# settles under 1% of rows and everything else used to fall back to the scan.
+
+@pytest.mark.parametrize("scale", [0.01, 0.6, 3.0, 20.0])
+def test_analytic_search_matches_the_scan_exactly(scale):
+    """Not "close" -- the same index, including how ties are broken.  The scan
+    takes the lowest index among equals, so the analytic form has to prefer the
+    lowest source pattern and, among equal-cost repairs, the flip that leaves
+    the sign field smallest."""
+    torch.manual_seed(0)
+    x = torch.randn((4096, 8), dtype=DT) * scale
+    cb = Q.e8p_codebook(DT)
+    ref_i, ref_c = Q._brute_force(x, cb)
+    got_i, got_c = Q.nearest_e8p_analytic(x)
+    assert torch.equal(got_i, ref_i)
+    assert torch.equal(got_c, ref_c)
+
+
+def test_analytic_search_handles_the_heavy_tail():
+    """The distribution that matters: survivors are the fat tail by
+    construction, and it is also where the lattice decoder misses most."""
+    torch.manual_seed(1)
+    x = torch.randn((4096, 8), dtype=DT) * torch.rand((4096, 1), dtype=DT).pow(3) * 8
+    cb = Q.e8p_codebook(DT)
+    assert torch.equal(Q.nearest_e8p_analytic(x)[0], Q._brute_force(x, cb)[0])
+
+
+def test_every_codeword_analytically_decodes_to_itself():
+    """The strongest available check, and it exercises every sign pattern, every
+    source pattern and both shifts at distance zero."""
+    cb = Q.e8p_codebook(DT)
+    idx, code = Q.nearest_e8p_analytic(cb)
+    assert torch.equal(idx, torch.arange(cb.shape[0]))
+    assert torch.equal(code, cb)
+
+
+def test_analytic_search_chunks_without_changing_the_answer():
+    torch.manual_seed(2)
+    x = torch.randn((3000, 8), dtype=DT) * 0.6
+    whole = Q.nearest_e8p_analytic(x, chunk=1 << 20)
+    parts = Q.nearest_e8p_analytic(x, chunk=257)      # deliberately ragged
+    assert torch.equal(whole[0], parts[0])
+
+
+def test_analytic_search_validates_its_input():
+    with pytest.raises(ValueError, match=r"must be \[n, 8\]"):
+        Q.nearest_e8p_analytic(torch.randn((4, 7), dtype=DT))
+
+
+def test_the_fallback_is_the_analytic_form_not_a_scan():
+    """`_nearest` must route unsettled rows to the analytic search once there
+    are enough of them to pay its fixed cost.  This is where the runtime went:
+    at the small end of `fit_scale`'s sweep the decoder settles under 1% of
+    rows, so the fallback IS the cost."""
+    torch.manual_seed(3)
+    cb = Q._on_device(DT, "cpu")
+    x = torch.randn((4096, 8), dtype=DT) * 6.0       # far outside the ball
+    _, _, exact = Q.nearest_e8p(x)
+    assert float(exact.float().mean()) < 0.5         # the decoder really does miss
+    assert (~exact).sum() >= Q._ANALYTIC_MIN_ROWS
+    assert torch.equal(Q._nearest(x, cb)[0], Q._brute_force(x, cb)[0])
+
+
+def test_float32_disagreements_are_ties_not_errors():
+    """The honest limit of the exactness claim.
+
+    In exact arithmetic the analytic search and the scan agree on every row --
+    float64 shows zero disagreements over a million vectors.  In float32 they
+    disagree about once per million, and every such row is a genuine TIE: the
+    two codewords are the same distance away to within float32's epsilon, and
+    the two computations round the comparison differently.
+
+    So the claim is "exact", not "bit-identical in float32", and the test says
+    which.  What must never happen is a disagreement with a real distance gap --
+    that would be a wrong answer, not a tie.
+    """
+    torch.manual_seed(0)
+    cb = Q.e8p_codebook(torch.float32)
+    for scale in (0.05, 0.6, 3.0):
+        x = torch.randn((1 << 15, 8), dtype=torch.float32) * scale
+        i_scan, c_scan = Q._brute_force(x, cb)
+        i_an, c_an = Q.nearest_e8p_analytic(x)
+        differ = i_scan != i_an
+        if not bool(differ.any()):
+            continue
+        gap = ((x - c_an).square().sum(1) - (x - c_scan).square().sum(1))[differ]
+        assert float(gap.abs().max()) < 1e-4, "a disagreement with a real gap"
+        assert float(differ.float().mean()) < 1e-4, "ties should be rare"

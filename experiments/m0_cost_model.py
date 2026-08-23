@@ -80,6 +80,12 @@ LLAMA2_7B = (
 )
 N_BLOCKS = 32
 
+#: The width the pipeline confines its LDLQ feedback to
+#: (`m1_gates.HESSIAN_BLOCK`).  This model's default has to describe what the
+#: code DOES, not what it once did -- an optimistic default is how a cost model
+#: stops being one, and so is a pessimistic one.
+DEFAULT_HESSIAN_BLOCK = 512
+
 #: Cholesky, cholesky_inverse, cholesky again -- roughly k^3/3 + k^3 + k^3/3.
 CHOL_FLOPS_PER_K3 = 5.0 / 3.0
 
@@ -121,6 +127,15 @@ SCALE_FIT_MULTIPLIER = 6.0
 #: scan where it pays.  The scan numbers it supersedes, for the record:
 #:   cpu_f64  (2560,4,4.49) (2944,16,29.26) (3072,128,266.04)
 #:   cuda_f32 (2560,4,0.28) (2944,16, 0.83) (3072,128,  5.93)
+#: `cuda_f32` re-measured again 2026-08-23 after `quantize.nearest_e8p_analytic`
+#: replaced the SCAN that unsettled rows used to fall back to: 1.35x / 2.65x /
+#: 5.62x per tile on top of what the chunked sweep already gave.  The gain grows
+#: with the line count, the opposite of the chunking's, because the two fix
+#: different things -- chunking made small tiles fill the card, and this makes
+#: `fit_scale` stop scanning 65536 codewords per vector per candidate scale.
+#:   superseded chunked+scan: (2560,4,0.1194) (2944,16,0.3177) (3072,128,2.1827)
+#:
+#: Earlier note, still true of `cpu_f64`:
 #: `cuda_f32` re-measured 2026-08-23 with the chunked sweep and
 #: `hessian_block=512`, which is what the pipeline now does.  Per tile it is
 #: 2.07x / 1.43x / 1.06x faster than the one-tile-at-a-time arrangement it
@@ -138,7 +153,7 @@ SCALE_FIT_MULTIPLIER = 6.0
 #:   superseded cuda_f32, chunk=1: (2560,4,0.247) (2944,16,0.454) (3072,128,2.309)
 TILE_TIMINGS = {
     "cpu_f64": ((2560, 4, 1.741), (2944, 16, 8.721), (3072, 128, 95.83)),
-    "cuda_f32": ((2560, 4, 0.1194), (2944, 16, 0.3177), (3072, 128, 2.1827)),
+    "cuda_f32": ((2560, 4, 0.0887), (2944, 16, 0.1201), (3072, 128, 0.3883)),
 }
 
 #: Seconds for ONE `quantize._upper_inverse_factor` call, measured on this
@@ -280,7 +295,7 @@ def _scheme(t):
 def layer_cost(n_out: int, n_in: int, tile_size, budget: float, *,
                vq_bits: float = 2.0, dtype_bytes: int = 8,
                scale_fit: bool = True,
-               hessian_block: int | None = None) -> dict | None:
+               hessian_block: int | None = DEFAULT_HESSIAN_BLOCK) -> dict | None:
     """Flops and bytes for one linear at one tile size.
 
     `k` is the aligned survivor count, so it is what the code will really
@@ -424,7 +439,7 @@ def codebook_seconds_per_vector(rates: dict, setup: str,
 
 def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
                batched: bool = False, scale_fit: bool = True,
-               hessian_block: int | None = None,
+               hessian_block: int | None = DEFAULT_HESSIAN_BLOCK,
                inventory=LLAMA2_7B, n_blocks: int = N_BLOCKS) -> dict:
     """One full compression pass over Llama-2-7B at one tile size.
 
@@ -562,7 +577,8 @@ def sweep_cost(rates: dict, setup: str, *, budget: float = 1.5,
 
 def m1_cost(rates: dict, setup: str, *, budgets=(1.75, 1.60, 1.50),
             n_draws: int = 5, tiles=TILES, batched: bool = False,
-            scale_fit: bool = True, hessian_block: int | None = None) -> dict:
+            scale_fit: bool = True,
+            hessian_block: int | None = DEFAULT_HESSIAN_BLOCK) -> dict:
     """M1's own grid, for scale: budgets x tiles x draws."""
     total = 0.0
     for b in budgets:

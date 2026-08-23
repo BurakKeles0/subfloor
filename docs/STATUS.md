@@ -14,8 +14,8 @@ içinde) ve rotasyonun katman düzeyindeki değeri (**−70%**). M0'ın uçuş-�
 kalemlerinin dördü kapandı (`vq_bits`, Kapı B'nin gücü, transfer pilotu,
 maliyet modeli). **Ama sıkıştırılmış modelin perplexity'si hâlâ hiç ölçülmedi**
 — Kapı A'nın ve Kapı B'nin tek bir gerçek verisi yok. Ve önümüzdeki asıl engel
-bilimsel değil, **hesaplama maliyeti**: M1 bu makinede **48 gün** (120'den
-düştü), ve kalanın neredeyse tamamı tek bir fonksiyonda: `fit_scale`.
+bilimsel değil, **hesaplama maliyeti**: M1 bu makinede **29 gün**, 120'den
+düştü.
 
 ---
 
@@ -331,26 +331,61 @@ iyimser yönde yanılttı, §6.2).
 
 ### 6.1 Bugünkü tablo (cuda/float32, bir sıkıştırma geçişi)
 
-**08-23'te iki kez değişti:** modelin Cholesky eğrisi düzeltildi (§6.4) ve hat
-hızlandırıldı (§6.5). Sıra: 120 → 94 → **48 gün**.
-
-Aşağıdaki tablo hattın **şu an koştuğu** düzen: geri besleme 512'ye daraltılmış,
-süpürme tile'lar arasında toplu.
+**08-23'te üç kez değişti:** modelin Cholesky eğrisi düzeltildi (§6.4), süpürme
+toplandı (§6.5), tarama kaldırıldı (§6.7). Sıra: 120 → 94 → 48 → **29 gün**.
 
 | T | toplam | codebook | rotasyon | cholesky |
 |---|---|---|---|---|
-| 1 | 5.3 h | 4.4 h | 0.46 h | 0.34 h |
-| 4 | **13.2 h** | 11.0 h | 1.92 h | 0.21 h |
-| 16 | 9.1 h | 8.3 h | 0.72 h | 0.06 h |
-| max | 7.5 h | 7.4 h | 0 | 0 |
+| 1 | 3.9 h | 3.0 h | 0.46 h | 0.34 h |
+| 4 | **9.8 h** | 7.6 h | 1.92 h | 0.21 h |
+| 16 | 3.7 h | 2.8 h | 0.72 h | 0.06 h |
+| max | 1.3 h | 1.3 h | 0 | 0 |
 
-**M1 (3 bütçe × 7 tile × 5 çekiliş): 48 gün.**
+**M1 (3 bütçe × 7 tile × 5 çekiliş): 29 gün.**
 
-**Baskın terim Cholesky değil, codebook taraması** — ve onun da içinde
-`fit_scale`. Cholesky artık pasın %2'si; kalan neredeyse tamamen ölçek uydurma,
-ve onu düşürmenin tavanı **14 gün**. `affordable()` bir zaman bütçesine neyin
-sığdığını hesaplıyor ve `T=1` ile `T=max`'ı asla düşürmüyor (onlar kapının
-tanımı).
+Baskın terim hâlâ codebook, ama **payı daralıyor**: diğer ikisinin toplamının
+5 katıydı, şimdi 3.6 katı. Rotasyon (`Q@H@Qᵀ`) T=4'te 1.92 saatle ikinci sıraya
+yerleşti ve TF32 ona 1.66× veriyor (§6.8) — bir sonraki eşik orada.
+
+### 6.7 Aramayı taramaktan çıkarmak (08-23)
+
+Profil, GPU zamanının ~%30'unun minik elementwise çekirdeklerde olduğunu ve bir
+chunk için ~962 bin çekirdek çağrısı yapıldığını gösterdi. Ama asıl bulgu
+mikro-optimizasyon değildi: **65536 kodsözcüğünü taramaya hiç gerek yokmuş.**
+
+Bir kodsözcüğü `σ⊙p + s`: `p` 256 **negatif olmayan** kaynak örüntüsünden biri,
+`σ` ilk yedi koordinatta serbest, sekizinci koordinat toplamı çift yapacak
+şekilde belirli. `p` negatif olmadığı için sabit `p` altında en iyi işaretler
+koordinat koordinat okunuyor (`σ_i = sign(z_i)`); bu atama tek parite ise
+geçersiz, ve her koordinat yarım-tamsayı olduğundan **herhangi bir tek işaret
+çevirisi pariteyi değiştiriyor** — yani onarım tek ve en ucuz çeviri, bedeli
+`2|z_i|p_i`. 128 işaret seçimi bir arama uzayı değil, aritmetik.
+
+Bu, taramanın yerine değil **geri düşme yolunun** yerine kondu. Kafes çözücü bir
+satırı çözebildiğinde hâlâ daha ucuz (8K ve 80K satırda aynı 0.2 ms — fırlatma
+bağımlı); analitik biçim ise verildiği satırla orantılı gerçek iş yapıyor.
+Düzelttiği şey `fit_scale`'in küçük-α adımları: orada kesinlik **%0.7**'ye
+düşüyordu ve 5,888 satırın 5,845'i tam taramaya gidiyordu.
+
+| ölçüm | kazanç |
+|---|---|
+| `fit_scale`, 5,888 vektör | 3.25× |
+| `fit_scale`, 196,608 vektör (T=max) | **10.8×** |
+| tile başına uçtan uca (4 / 16 / 128 satır) | 1.35× / 2.65× / **5.62×** |
+| gerçek katman, uçtan uca (T=4 / 16 / max) | 1.29× / 2.17× / **3.96×** |
+
+**Kesinlik.** float64'te bir milyon vektörde **sıfır** uyuşmazlık; her
+kodsözcüğü kendine çözülüyor. float32'de milyonda bir satır farklı seçiliyor ve
+o satırlar gerçek berabere — mesafe farkı 3e-6, float32 epsilon düzeyinde.
+İddia "kesin", "float32'de bit-birebir" değil, ve test hangisi olduğunu söylüyor.
+
+### 6.8 TF32 — ölçüldü, henüz alınmadı
+
+Hiçbir yerde açılmıyor. Ölçülen: Hessian birikimi 1.74×, Hessian rotasyonu
+1.66×, **kodsözcüğü araması 1.04×**, Cholesky 1.01×. Baskın terime dokunmuyordu
+— ama §6.7 baskın terimi küçülttüğü için rotasyon artık ikinci sırada ve TF32
+kazancı anlamlı hâle geldi. Mantisi 10 bite düşürüyor ve Hessian LDLQ'nun
+girdisi, o yüzden **kalite etkisi ölçülmeden alınmamalı**.
 
 ### 6.5 Süpürmeyi tile'lar arasında toplamak (08-23)
 
@@ -463,10 +498,10 @@ bütçede de koşacağına dair bir taahhüt yok.
 
 | tasarım | şimdi | +fp16 |
 |---|---|---|
-| A. Tam M1 (3 bütçe × 7 tile × 5 çekiliş) | 48.2 g | 33.3 g |
-| **C. B=1.5'te 5 çekiliş, iç tile'lar 2, diğer bütçeler 1** | **16.9 g** | **11.6 g** |
-| D. Tek bütçe, 5 çekiliş, 7 tile | 14.2 g | 9.8 g |
-| F. Tek bütçe, 1 çekiliş, 7 tile — ilk gerçek U eğrisi | 2.8 g | 2.0 g |
+| A. Tam M1 (3 bütçe × 7 tile × 5 çekiliş) | 29.0 g | 20.0 g |
+| **C. B=1.5'te 5 çekiliş, iç tile'lar 2, diğer bütçeler 1** | **9.8 g** | **6.8 g** |
+| D. Tek bütçe, 5 çekiliş, 7 tile | 8.3 g | 5.8 g |
+| F. Tek bütçe, 1 çekiliş, 7 tile — ilk gerçek U eğrisi | **1.7 g** | 1.2 g |
 
 C, Kapı B'yi birincil bütçede tam güçte kararlarken tile eksenini budamıyor ve
 diğer iki bütçeyi sağlamlık kontrolü olarak tutuyor.
@@ -541,9 +576,9 @@ altı" motivasyonu zayıflar.
 büyük çıkar ve *hangi* granülerlik sorusu cevapsız kalır. Başarısızlık değil
 ama manşeti zayıflatır.
 
-**Maliyet.** 48 gün hâlâ bir dizüstünde koşulamaz, ve **ölçek kaldıracı
-denendi, tutmadı** (§5.10) — geriye fp16 (33 güne indirir), ızgarayı küçültmek
-ve donanım kiralamak kalıyor. Izgarayı küçültmenin sınırları §6.6'da; tile
+**Maliyet.** 29 gün hâlâ uzun ama artık tasarım C ile **10 güne**,
+ilk gerçek U eğrisiyle **1.7 güne** iniyor. Ölçek kaldıracı denendi ve
+tutmadı (§5.10); geriye fp16, TF32 (§6.8) ve donanım kiralamak kalıyor. Izgarayı küçültmenin sınırları §6.6'da; tile
 eksenini budamak tam da kanıtın olduğu yeri budar.
 
 **Maliyet modeli dört kez yanıldı.** Üçü iyimser, sonuncusu kötümser yöndeydi

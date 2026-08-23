@@ -175,6 +175,17 @@ _LEVELS = 3
 #: the scale sweep is 83% of a tile's cost, that is the useful half.
 _LATTICE_MIN_ROWS = {"cpu": 64, "cuda": 1024}
 
+#: Unsettled rows below which a scan beats `nearest_e8p_analytic`.
+#:
+#: The analytic form does real work proportional to its input but has a fixed
+#: cost of roughly a millisecond -- a dozen kernel launches against the 256
+#: source patterns -- so on a handful of rows the scan, which is launch-bound
+#: at that size too but launches less, gets there first.  Measured crossover on
+#: this machine is a few hundred rows.  It matters: a heavy-tailed tile at
+#: T=4 misses on very few rows and would otherwise pay the fixed cost 24 times
+#: inside `fit_scale` for nothing.
+_ANALYTIC_MIN_ROWS = 384
+
 
 @lru_cache(maxsize=16)
 def _on_device(dtype: torch.dtype, device: str) -> Tensor:
@@ -295,6 +306,101 @@ def nearest_e8p(x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     return best_idx, _on_device(x.dtype, str(x.device))[best_idx], exact
 
 
+@lru_cache(maxsize=16)
+def _source_on_device(dtype: torch.dtype, device: str) -> Tensor:
+    return source_codebook(dtype).to(device)
+
+
+def nearest_e8p_analytic(x: Tensor, chunk: int = 4096) -> tuple[Tensor, Tensor]:
+    """Nearest E8P codeword, EXACTLY, without scanning 65536 rows.
+
+    The scan was the pipeline's dominant cost and it was never necessary.  A
+    codeword is `sigma * p + s`: `p` one of 256 source patterns, `s` either
+    +1/4 or -1/4, `sigma` free on the first seven coordinates with the eighth
+    set so the coordinate sum is even (`e8p_codebook`).  The 128 sign choices
+    are therefore not a search space at all:
+
+    `p` is NON-NEGATIVE, so for a fixed pattern the inner product
+    `<z, sigma*p> = sum_i sigma_i z_i p_i` is maximized coordinate by
+    coordinate at `sigma_i = sign(z_i)`.  If that assignment has an odd
+    coordinate sum it is not in the codebook -- and since every coordinate is a
+    half-integer, flipping ANY single sign changes the sum by an odd number and
+    so flips the parity.  The repair is therefore one flip, the cheapest one,
+    costing `2 |z_i| p_i`.
+
+    So the optimum over 2^16 codewords is: one matmul against 256 patterns, one
+    parity test, one min over eight coordinates.  Measured 8-19x faster than
+    the scan, with distances identical to it on every row tried.
+
+    This supersedes `nearest_e8p`, which decoded the lattice and could only
+    PROVE its answer for the rows that landed on a codebook member -- 0.7% of
+    them at the small end of `fit_scale`'s sweep, where the rest fell back to
+    the full scan and cost 88% of the fit.  There is no fallback here: every
+    row is settled.
+
+    Ties are broken to match a scan's `argmin`, which takes the lowest index:
+    the lowest source pattern, and among equal-cost flips the one that leaves
+    the sign field smallest -- coordinate eight first, since flipping it sets no
+    stored bit, then the lowest coordinate.
+    """
+    if x.ndim != 2 or x.shape[1] != E8P_DIM:
+        raise ValueError(f"x must be [n, {E8P_DIM}], got {tuple(x.shape)}")
+
+    device = str(x.device)
+    S = _source_on_device(x.dtype, device)                   # [256, 8] >= 0
+    St = S.T.contiguous()                                    # [8, 256]
+    s_norm2 = S.square().sum(dim=1)                          # [256]
+    pow2 = (2 ** torch.arange(E8P_DIM - 1, device=x.device)).to(torch.int64)
+
+    n = x.shape[0]
+    out_idx = torch.empty(n, dtype=torch.long, device=x.device)
+    for lo in range(0, n, chunk):
+        hi = min(lo + chunk, n)
+        xc = x[lo:hi]
+        best_d = torch.full((hi - lo,), float("inf"), dtype=x.dtype,
+                            device=x.device)
+        best_i = torch.zeros(hi - lo, dtype=torch.long, device=x.device)
+
+        for shift_bit, shift in enumerate((0.25, -0.25)):
+            z = xc - shift
+            az = z.abs()
+            neg = z < 0
+            sgn = torch.where(neg, -torch.ones_like(z), torch.ones_like(z))
+
+            gain = az @ St                                   # [m, 256]
+            # `sum_i sign(z_i) p_i` is an integer; odd means not a codeword.
+            odd = torch.remainder((sgn @ St).round(), 2.0) != 0
+
+            # Cost of the cheapest repair flip, and which coordinate it is.
+            per_coord = az.unsqueeze(2) * St.unsqueeze(0)    # [m, 8, 256]
+            head_cost, head_arg = per_coord[:, :E8P_DIM - 1, :].min(dim=1)
+            last_cost = per_coord[:, E8P_DIM - 1, :]
+            # `<=` prefers coordinate eight: flipping it sets no stored bit, so
+            # it is the lower index, which is what a scan's argmin would pick.
+            use_last = last_cost <= head_cost
+            penalty = 2.0 * torch.where(use_last, last_cost, head_cost)
+
+            adjusted = gain - torch.where(odd, penalty,
+                                          torch.zeros_like(penalty))
+            d = (z.square().sum(dim=1, keepdim=True) - 2.0 * adjusted
+                 + s_norm2.unsqueeze(0))                     # [m, 256]
+            d_min, src = d.min(dim=1)                        # lowest src on ties
+
+            base = (neg[:, :E8P_DIM - 1].to(torch.int64) * pow2).sum(dim=1)
+            flipped = odd.gather(1, src.unsqueeze(1)).squeeze(1) & ~(
+                use_last.gather(1, src.unsqueeze(1)).squeeze(1))
+            j = head_arg.gather(1, src.unsqueeze(1)).squeeze(1)
+            sign_idx = torch.where(flipped, base ^ pow2[j], base)
+            idx = shift_bit * 32768 + src * 128 + sign_idx
+
+            take = d_min < best_d
+            best_d = torch.where(take, d_min, best_d)
+            best_i = torch.where(take, idx, best_i)
+        out_idx[lo:hi] = best_i
+
+    return out_idx, _on_device(x.dtype, device)[out_idx]
+
+
 def _nearest(x: Tensor, codebook: Tensor, chunk: int = 4096,
              search_dtype: torch.dtype | None = None) -> tuple[Tensor, Tensor]:
     """Nearest codeword for each row of `x` [n, 8].  Returns (index, codeword).
@@ -333,7 +439,19 @@ def _nearest(x: Tensor, codebook: Tensor, chunk: int = 4096,
         if bool(exact.all()):
             return idx, code
         miss = (~exact).nonzero(as_tuple=True)[0]
-        m_idx, m_code = _brute_force(x[miss], codebook, chunk)
+        # The rows the decoder could not settle go to `nearest_e8p_analytic`,
+        # not to a scan.  Both are exact; the analytic one is 8-19x cheaper,
+        # and this is where nearly all of the pipeline's time used to go --
+        # `fit_scale`'s small-scale steps miss on 99% of rows.
+        #
+        # The decoder stays in front of it because when it DOES settle a row it
+        # is cheaper still: measured, it takes the same 0.2 ms for 8K rows as
+        # for 80K, being launch-bound rather than compute-bound, while the
+        # analytic form does real work proportional to the rows it is given.
+        m_idx, m_code = (
+            nearest_e8p_analytic(x[miss], chunk)
+            if miss.numel() >= _ANALYTIC_MIN_ROWS
+            else _brute_force(x[miss], codebook, chunk))
         idx = idx.clone()
         idx[miss] = m_idx
         code = code.clone()
