@@ -264,6 +264,18 @@ Maliyet modeli (bu makinede ölçülen sabitlerle) üç ayrı duvar buluyor:
 | **Codebook araması** | `T`'den bağımsız 12 saat (CPU f64) | 2¹⁶ kodsözcüğü üzerinde kaba kuvvet en yakın komşu | **Orta** — E8 kafesine doğrudan yuvarlama bunu ~0'a indirir |
 | **`fit_scale`** | Yukarıdakinin **6 katı** | LDLQ her tile için 24 aday ölçeği tarıyor, her taramada tüm tile'ı arıyor — ölçüldü, LDLQ'nun **%83'ü** | **En kolay** — ama katman-başı ölçek %11 kalite kaybettiriyor (ölçüldü); doğrusu tile-başı ölçeği **örneklemek** |
 
+✅ **E8 kafesine doğrudan yuvarlama uygulandı (2026-08-23).** `nearest_e8p`,
+2¹⁶ kodsözcüğünü taramak yerine kafesi çözüyor. Ölçülen tile hızlanması:
+**CPU 3.51×, GPU 1.87×**, ve çıktı kaba kuvvetle **birebir aynı**.
+
+Kritik nokta: E8P **tam bir kafes değil** — kafesin norm topuyla kesişimi artı
+lexicographic seçilmiş 29 dolgu örüntüsü. Dolayısıyla "en yakın kafes noktasına
+yuvarla" tek başına yanlış cevap verebilir. Kesinlik şöyle kanıtlanıyor:
+codebook iki kaydırılmış kafesin birleşiminin içinde, o birleşimin en yakın
+noktası herhangi bir kodsözcüğüne olan mesafenin **alt sınırı**; o nokta
+kodsözcüğüyse en yakın kodsözcüğüdür. Değilse satır kaba kuvvete düşüyor.
+Kesinlik oranı çalışma ölçeğinde **%72**.
+
 > ⚠️ **Baskın terim Cholesky değilmiş.** Maliyet modeli artık uçtan uca ölçülen
 > tile sürelerine oturuyor (kernel mikro-benchmark'larına değil, çünkü onlar iki
 > kez iyimser yönde yanılttı). GPU'da tek geçişin **%79'u codebook araması**,
@@ -387,7 +399,8 @@ python experiments/m0_vq_bits.py --all       # ~100 KB ağ trafiği, saniyeler
 | `7d1ee48` | Transfer pilotu: tolerans kuralı, ve modelin büyük `T` önyargısı |
 | `797aa2e` | Maliyet modeli — ve hattın gerçek boyutta koşamadığının tespiti |
 | `baa38a7` | Bellek duvarı kapandı, iki yükleyici hatası düzeldi, `fit_scale` modele girdi |
-| *(bu tur)* | **Rotasyon gerçek katmanda −70%**; hat GPU'ya taşındı; maliyet modeli ölçüme oturdu |
+| `31f9761` | **Rotasyon gerçek katmanda −70%**; hat GPU'ya taşındı; maliyet modeli ölçüme oturdu |
+| *(bu tur)* | E8 kafes çözücü: CPU 3.5×, GPU 1.9×, çıktı birebir aynı |
 
 ---
 

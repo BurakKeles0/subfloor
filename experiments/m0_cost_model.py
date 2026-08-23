@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from datetime import datetime, timezone
@@ -86,9 +87,13 @@ SCALE_FIT_MULTIPLIER = 6.0
 #: for SIXTEEN rows in a tight loop -- where the codebook stays in cache across
 #: repetitions -- when the real calls interleave with Hessian updates that evict
 #: it.  A microbenchmark measures a kernel; this measures the pipeline.
+#: Re-measured 2026-08-23 after `quantize.nearest_e8p` replaced the brute-force
+#: scan where it pays.  The scan numbers it supersedes, for the record:
+#:   cpu_f64  (2560,4,4.49) (2944,16,29.26) (3072,128,266.04)
+#:   cuda_f32 (2560,4,0.28) (2944,16, 0.83) (3072,128,  5.93)
 TILE_TIMINGS = {
-    "cpu_f64": ((2560, 4, 4.49), (2944, 16, 29.26), (3072, 128, 266.04)),
-    "cuda_f32": ((2560, 4, 0.28), (2944, 16, 0.83), (3072, 128, 5.93)),
+    "cpu_f64": ((2560, 4, 1.741), (2944, 16, 8.721), (3072, 128, 95.83)),
+    "cuda_f32": ((2560, 4, 0.247), (2944, 16, 0.454), (3072, 128, 2.309)),
 }
 
 #: Measured, `experiments/m0_dense_ppl.py`: one streamed WikiText-2 pass at
@@ -219,16 +224,23 @@ def layer_cost(n_out: int, n_in: int, tile_size, budget: float, *,
     }
 
 
-def codebook_seconds_per_vector(rates: dict, setup: str) -> float:
-    """Seconds per quantized 8-vector, fitted from the measured tile times.
+def codebook_seconds_per_vector(rates: dict, setup: str,
+                                lines: int | None = None) -> float:
+    """Seconds per quantized weight, from the measured tile times.
 
     The Cholesky is subtracted first at its microbenchmarked rate -- that one
     IS a clean LAPACK measurement -- and what is left is charged to the codebook
-    work, which includes the scale-fitting sweep.
+    work, the scale-fitting sweep included.
 
-    The residuals span about 1.6x across the three tiles, so the linear form is
-    an approximation.  The WORST residual is returned, not the mean: this model
-    has been wrong twice already and both times in the flattering direction.
+    The constant is NOT one number.  A tile's line count is its tile size, and
+    per-weight cost falls sharply with it: bigger batches amortize both the
+    codebook load and the lattice decoder's fixed cost, and below a threshold
+    the decoder is not used at all.  On this machine the residual runs 1.72e-5
+    at four lines down to 5.6e-6 at 128.  Charging every tile size the
+    four-line rate would overstate the coarse end threefold, which is precisely
+    the end the granularity question cares about.
+
+    `lines=None` keeps the old conservative behaviour and returns the worst.
     """
     samples = (rates["setups"][setup].get("tile_timings")
                or TILE_TIMINGS.get(setup))
@@ -239,15 +251,18 @@ def codebook_seconds_per_vector(rates: dict, setup: str) -> float:
         )
     chol_rate = rates["setups"][setup]["cholesky_flops_per_s"]
 
-    worst = 0.0
-    for k, lines, seconds in samples:
+    fitted = []
+    for k, sample_lines, seconds in samples:
         residual = seconds - CHOL_FLOPS_PER_K3 * k ** 3 / chol_rate
-        if residual <= 0:
-            continue
-        worst = max(worst, residual / (lines * k))
-    if worst == 0.0:
+        if residual > 0:
+            fitted.append((sample_lines, residual / (sample_lines * k)))
+    if not fitted:
         raise ValueError(f"tile timings for {setup!r} leave nothing to fit")
-    return worst
+    if lines is None:
+        return max(v for _, v in fitted)
+    # Nearest measured line count in log space -- the samples are octaves apart,
+    # so interpolating between them would invent precision the data lacks.
+    return min(fitted, key=lambda s: abs(math.log(s[0] / max(lines, 1))))[1]
 
 
 def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
@@ -260,7 +275,6 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
     already contain whatever batching the code does.
     """
     r = rates["setups"][setup]
-    per_vector = codebook_seconds_per_vector(rates, setup)
 
     chol = cb = peak = peak_streamed = 0.0
     chol_seconds = cb_seconds = 0.0
@@ -272,6 +286,8 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
         cb += count * c["codebook_flops"]
         chol_seconds += count * c["cholesky_flops"] / r["cholesky_flops_per_s"]
         # n_tiles * lines * k == n_out * k, and the tile fit is per vector
+        per_vector = codebook_seconds_per_vector(rates, setup,
+                                                 c["lines_per_tile"])
         vectors = n_out * c["k"] / E8P_DIM
         cb_seconds += count * vectors * E8P_DIM * per_vector * (
             1.0 if scale_fit else 1.0 / SCALE_FIT_MULTIPLIER)
@@ -289,7 +305,7 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
         "cholesky_flops": chol, "codebook_flops": cb,
         "cholesky_seconds": chol_seconds,
         "codebook_seconds": cb_seconds,
-        "codebook_seconds_per_vector": per_vector,
+        "codebook_seconds_per_vector": per_vector,   # last layer's
         "compress_seconds": seconds,
         "eval_seconds": EVAL_SECONDS,
         "point_seconds": seconds + EVAL_SECONDS,

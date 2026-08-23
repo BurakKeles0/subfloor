@@ -156,12 +156,173 @@ def in_e8_plus_quarter(x: Tensor, atol: float = 1e-9) -> Tensor:
 # Quantization
 # --------------------------------------------------------------------------- #
 
+#: |h_i| for a codeword's unshifted part is 0.5, 1.5 or 2.5 -- 3.5 is impossible
+#: because 3.5^2 alone exceeds the largest norm^2 the codebook keeps.  Three
+#: levels per coordinate makes the whole pattern space 3^8 = 6561 entries.
+_LEVELS = 3
+
+#: Rows below which the decoder is not worth it.  Its cost is fixed -- some
+#: forty small elementwise kernels and two gathers, regardless of how few rows
+#: it is given -- while the scan it replaces is proportional to them.  Measured
+#: crossovers on this machine: around 64 rows on CPU, around 1000 on GPU, where
+#: launch overhead is far heavier.
+#:
+#: This is why the win lands where it does.  `fit_scale` sweeps whole tiles at
+#: once (thousands of rows) and takes the fast path; the LDLQ group sweep asks
+#: for one group of lines at a time (sixteen, say) and keeps the scan.  Since
+#: the scale sweep is 83% of a tile's cost, that is the useful half.
+_LATTICE_MIN_ROWS = {"cpu": 64, "cuda": 1024}
+
+
+@lru_cache(maxsize=16)
+def _on_device(dtype: torch.dtype, device: str) -> Tensor:
+    """The codebook, cached PER DEVICE.
+
+    `e8p_codebook(dtype).to(device)` copies two megabytes on every call, which
+    is more work than the search it was meant to serve and makes an `is` check
+    against it always false.  Caching the moved tensor is what lets the fast
+    path be selected at all.
+    """
+    return e8p_codebook(dtype).to(device)
+
+
+@lru_cache(maxsize=16)
+def _table_on_device(device: str) -> Tensor:
+    return _source_index_table().to(device)
+
+
+@lru_cache(maxsize=2)
+def _source_index_table() -> Tensor:
+    """[3^8] -> position in the source codebook, or -1 for "not a codeword".
+
+    The key is the per-coordinate level of |h|, base 3.  This is what turns
+    membership from a search into a gather: the codebook is a lattice
+    INTERSECTED with a norm ball plus 29 arbitrarily chosen padding patterns, so
+    landing on a lattice point proves nothing by itself.
+    """
+    S = source_codebook(torch.float64)                       # [256, 8]
+    levels = (S - 0.5).round().to(torch.int64)
+    powers = _LEVELS ** torch.arange(E8P_DIM, dtype=torch.int64)
+    table = torch.full((_LEVELS ** E8P_DIM,), -1, dtype=torch.int64)
+    table[(levels * powers).sum(dim=1)] = torch.arange(S.shape[0])
+    return table
+
+
+def _nearest_halfinteger_even(y: Tensor) -> Tensor:
+    """Nearest point of D8 + 1/2 -- half-integers with an even coordinate sum.
+
+    Conway and Sloane's D_n decoder.  Round every coordinate to its nearest
+    half-integer; if the sum comes out odd, move the single worst-rounded
+    coordinate to its second choice, which flips the parity at the smallest
+    possible cost.
+    """
+    floor = torch.floor(y)
+    base = floor + 0.5
+    resid = y - floor                                        # [0, 1)
+    # Distance to the chosen half-integer, and which way the runner-up lies.
+    d0 = (resid - 0.5).abs()
+    # Built from `resid` so the dtype follows the input: a Python-float `where`
+    # would silently produce float32 and break the scatter under float64.
+    ones = torch.ones_like(resid)
+    step = torch.where(resid > 0.5, ones, -ones)
+
+    odd = (floor.sum(dim=-1) % 2) != 0                       # sum(h) = sum(floor) + 4
+    worst = d0.argmax(dim=-1, keepdim=True)
+    adjust = torch.zeros_like(base)
+    adjust.scatter_(-1, worst, step.gather(-1, worst))
+    return torch.where(odd.unsqueeze(-1), base + adjust, base)
+
+
+def nearest_e8p(x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Nearest E8P codeword by lattice decoding.  (index, codeword, exact).
+
+    Every codeword is `h + s` with `h` in D8 + 1/2 and `s` either +1/4 or -1/4
+    on every coordinate, so the nearest codeword can be found by decoding twice
+    instead of comparing against 65536 rows.
+
+    `exact` marks the rows where that is PROVEN, and the proof is exactly this:
+    the codebook is contained in the union of the two shifted lattices, so the
+    nearest point of that union is a lower bound on the distance to any
+    codeword.  If that point happens to BE a codeword, it is the nearest one.
+    If it is not -- and the codebook is a lattice truncated to a norm ball plus
+    29 arbitrary padding patterns, so misses are common -- the true answer may
+    be a point this never visited, and the caller has to fall back.
+
+    Requiring both shifts to land on members would also be sound but is far too
+    strict: a codeword decodes to itself under its own shift at distance zero,
+    which settles the row no matter what the other shift does.
+
+    For rows where `exact` is False the returned index and codeword are
+    meaningless placeholders, not a best effort.
+    """
+    if x.shape[-1] != E8P_DIM:
+        raise ValueError(f"last dim must be {E8P_DIM}, got {x.shape[-1]}")
+
+    table = _table_on_device(str(x.device))
+    powers = (_LEVELS ** torch.arange(E8P_DIM, device=x.device)).to(torch.int64)
+
+    best_idx = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+    best_d = torch.full((x.shape[0],), float("inf"), dtype=x.dtype, device=x.device)
+    exact = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+
+    for shift_bit, shift in enumerate((0.25, -0.25)):
+        h = _nearest_halfinteger_even(x - shift)
+        mag = h.abs()
+
+        # Levels outside 0..2 cannot be codewords; clamp so the gather is safe
+        # and let the membership test reject them.
+        level = (mag - 0.5).round().to(torch.int64)
+        in_range = (level >= 0).all(dim=-1) & (level < _LEVELS).all(dim=-1)
+        key = (level.clamp(0, _LEVELS - 1) * powers).sum(dim=-1)
+        src = torch.where(in_range, table[key], torch.full_like(key, -1))
+        member = src >= 0
+
+        sign_bits = (h[:, : E8P_DIM - 1] < 0).to(torch.int64)
+        sign_idx = (sign_bits * (2 ** torch.arange(
+            E8P_DIM - 1, device=x.device))).sum(dim=-1)
+        idx = shift_bit * 32768 + src.clamp_min(0) * 128 + sign_idx
+
+        # Track the nearest point of the UNION, member or not, and carry its
+        # membership along: that is what decides whether the row is settled.
+        d = (x - (h + shift)).square().sum(dim=-1)
+        take = d < best_d
+        best_idx = torch.where(take, idx, best_idx)
+        best_d = torch.where(take, d, best_d)
+        exact = torch.where(take, member, exact)
+
+    return best_idx, _on_device(x.dtype, str(x.device))[best_idx], exact
+
+
 def _nearest(x: Tensor, codebook: Tensor, chunk: int = 4096) -> tuple[Tensor, Tensor]:
     """Nearest codeword for each row of `x` [n, 8].  Returns (index, codeword).
 
     Brute force over 65536 codewords, chunked over `x`.  ||x-c||^2 expands to
     ||c||^2 - 2 x.c (the ||x||^2 term does not affect the argmin).
+
+    For the canonical E8P table this defers to `nearest_e8p`, which decodes the
+    lattice instead of scanning it, and only scans the rows the decoder could
+    not settle.  That search is the pipeline's dominant cost -- 79% of a GPU
+    pass, `experiments/m0_cost_model.py` -- and it is the one part of the
+    dominant cost that is engineering rather than structure.
     """
+    floor_rows = _LATTICE_MIN_ROWS.get(x.device.type, 64)
+    if (x.shape[0] >= floor_rows
+            and codebook is _on_device(x.dtype, str(codebook.device))):
+        idx, code, exact = nearest_e8p(x)
+        if bool(exact.all()):
+            return idx, code
+        miss = (~exact).nonzero(as_tuple=True)[0]
+        m_idx, m_code = _brute_force(x[miss], codebook, chunk)
+        idx = idx.clone()
+        idx[miss] = m_idx
+        code = code.clone()
+        code[miss] = m_code
+        return idx, code
+    return _brute_force(x, codebook, chunk)
+
+
+def _brute_force(x: Tensor, codebook: Tensor, chunk: int = 4096
+                 ) -> tuple[Tensor, Tensor]:
     c_sq = codebook.square().sum(dim=1)
     idx = torch.empty(x.shape[0], dtype=torch.long, device=x.device)
     for lo in range(0, x.shape[0], chunk):
@@ -214,7 +375,7 @@ def quantize_vectors(
     """Quantize rows of `x` [n, 8].  Returns (dequantized, indices, scale)."""
     if x.ndim != 2 or x.shape[1] != E8P_DIM:
         raise ValueError(f"x must be [n, {E8P_DIM}], got {tuple(x.shape)}")
-    cb = e8p_codebook(dtype or x.dtype).to(x.device)
+    cb = _on_device(dtype or x.dtype, str(x.device))
     a = fit_scale(x, cb) if scale is None else float(scale)
     idx, q = _nearest(x / a, cb)
     return a * q, idx, a
@@ -252,7 +413,7 @@ def quantize_blocks(blocks: Tensor, per_tile_scale: bool = True) -> QuantizedBlo
             dim=2,
         )
 
-    cb = e8p_codebook(x.dtype).to(x.device)
+    cb = _on_device(x.dtype, str(x.device))
     out = torch.empty_like(x)
     idx_all, scales = [], []
     for t in range(n_tiles):
@@ -329,7 +490,7 @@ def ldlq_quantize(
     Hinv = torch.cholesky_inverse(torch.linalg.cholesky(Hd))
     U = torch.linalg.cholesky(Hinv, upper=True)
 
-    cb = e8p_codebook(block.dtype).to(block.device)
+    cb = _on_device(block.dtype, str(block.device))
     a = fit_scale(block.reshape(-1, group), cb) if scale is None else float(scale)
 
     W = block.clone()
@@ -394,7 +555,7 @@ def ldlq_quantize_blocks(
             f"hessians must be ({n_tiles}, {k}, {k}), got {tuple(hessians.shape)}"
         )
     if scale == "per_layer":
-        cb = e8p_codebook(blocks.dtype).to(blocks.device)
+        cb = _on_device(blocks.dtype, str(blocks.device))
         tile_scale = fit_scale(blocks.reshape(-1, E8P_DIM), cb,
                                sample=scale_sample)
     elif scale == "per_tile":

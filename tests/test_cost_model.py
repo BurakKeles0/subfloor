@@ -27,10 +27,12 @@ RATES = {
             "cholesky_flops_per_s": 1e12,
             "codebook_flops_per_s_small": 1e10,
             "codebook_flops_per_s_large": 1e11,
-            # (k, lines, seconds).  Two tiles of the same width and different
-            # line counts, so the fit has to separate the k^3 term from the
-            # per-weight one rather than absorbing both.
-            "tile_timings": ((1000, 10, 1e-2), (1000, 100, 1e-1)),
+            # (k, lines, seconds).  Same width, different line counts, and
+            # shaped like the real measurements: per-weight cost FALLS as the
+            # batch grows (2e-6 at ten lines, 1e-6 at a hundred), on top of a
+            # 1.67e-3 s Cholesky.  Numbers chosen so both residuals come out
+            # round and every expectation below is checkable by hand.
+            "tile_timings": ((1000, 10, 2.167e-2), (1000, 100, 1.0167e-1)),
         }
     },
 }
@@ -135,21 +137,47 @@ def test_batching_no_longer_moves_the_clock():
 def test_timing_comes_from_the_measured_tile_fit():
     """One weight costs the fitted constant, times n_out * k per linear.
 
-    The constant is the WORST residual across the fixture's tiles, after the
-    Cholesky is removed at its own rate -- worst, not mean, because this model
-    has twice been wrong in the flattering direction.
+    The constant depends on the tile's LINE COUNT, because per-weight cost falls
+    with batch size and a tile's line count is its tile size.  A single
+    worst-case number would overstate the coarse end of the grid several times
+    over -- the end the granularity question is actually about.
     """
-    chol = CM.CHOL_FLOPS_PER_K3 * 1000 ** 3 / RATES["setups"]["fake"][
-        "cholesky_flops_per_s"]
-    want = max((sec - chol) / (lines * k)
-               for k, lines, sec in RATES["setups"]["fake"]["tile_timings"])
-    per_weight = CM.codebook_seconds_per_vector(RATES, "fake")
-    assert per_weight == pytest.approx(want)
+    fake = RATES["setups"]["fake"]
+    chol = CM.CHOL_FLOPS_PER_K3 * 1000 ** 3 / fake["cholesky_flops_per_s"]
+    residuals = {lines: (sec - chol) / (lines * k)
+                 for k, lines, sec in fake["tile_timings"]}
+
+    # exact line counts pick their own sample
+    for lines, want in residuals.items():
+        assert CM.codebook_seconds_per_vector(RATES, "fake", lines) ==             pytest.approx(want)
+    # no line count given -> the conservative worst
+    assert CM.codebook_seconds_per_vector(RATES, "fake") ==         pytest.approx(max(residuals.values()))
 
     c = CM.model_cost(16, 1.5, RATES, "fake", n_blocks=1,
                       inventory=((4096, 4096, 1),))
     k = CM.layer_cost(4096, 4096, 16, 1.5)["k"]
+    per_weight = CM.codebook_seconds_per_vector(RATES, "fake", 16)
     assert c["codebook_seconds"] == pytest.approx(4096 * k * per_weight)
+
+
+def test_the_per_weight_constant_falls_with_the_line_count():
+    """Bigger tiles amortize the codebook load and the decoder's fixed cost.
+    If this ever inverted, the model would be reading its samples backwards."""
+    fake = RATES["setups"]["fake"]
+    counts = sorted(lines for _, lines, _ in fake["tile_timings"])
+    values = [CM.codebook_seconds_per_vector(RATES, "fake", n) for n in counts]
+    assert values == sorted(values, reverse=True)
+
+
+def test_line_counts_between_samples_snap_to_the_nearest_octave():
+    """The samples are octaves apart, so interpolating between them would
+    invent precision the measurements do not have."""
+    fake = RATES["setups"]["fake"]
+    small = CM.codebook_seconds_per_vector(RATES, "fake", 10)
+    large = CM.codebook_seconds_per_vector(RATES, "fake", 100)
+    assert small == CM.codebook_seconds_per_vector(RATES, "fake", 11)
+    assert large == CM.codebook_seconds_per_vector(RATES, "fake", 90)
+    assert small != large
 
 
 def test_a_setup_without_measured_timings_is_refused():

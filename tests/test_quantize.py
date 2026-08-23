@@ -384,3 +384,106 @@ def test_a_streamed_hessian_of_the_wrong_shape_is_rejected():
     bad = torch.eye(8, dtype=torch.float64)
     with pytest.raises(ValueError, match="tile 1"):
         Q.ldlq_quantize_blocks(blocks, lambda t: good if t == 0 else bad)
+
+
+# --------------------------------------------------------------------------- #
+# Lattice decoding instead of scanning
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("scale", [0.5, 1.0, 1.6, 3.0])
+def test_lattice_decoding_agrees_with_the_scan_exactly(scale):
+    """The only claim that matters: same answer, not a close one.
+
+    The codebook is a lattice INTERSECTED with a norm ball plus 29 arbitrary
+    padding patterns, so decoding to the nearest lattice point is not by itself
+    the nearest codeword.  `nearest_e8p` only commits where it can prove the
+    result and hands the rest back to the scan; if that logic were wrong it
+    would show up here as a slightly-worse codeword, not a crash.
+    """
+    torch.manual_seed(0)
+    cb = Q._on_device(torch.float64, "cpu")
+    x = torch.randn(4000, 8, dtype=torch.float64) * scale
+    fast_i, fast_c = Q._nearest(x, cb)
+    slow_i, slow_c = Q._brute_force(x, cb)
+    assert torch.equal(fast_i, slow_i)
+    assert torch.equal(fast_c, slow_c)
+
+
+def test_the_exactness_flag_is_honest():
+    """Where the decoder claims exactness it must BE exact, and where it does
+    not the caller must fall back -- a flag that over-claims would quietly
+    degrade every quantized weight."""
+    torch.manual_seed(1)
+    cb = Q._on_device(torch.float64, "cpu")
+    x = torch.randn(4000, 8, dtype=torch.float64) * 1.3
+    idx, code, exact = Q.nearest_e8p(x)
+    slow_i, _ = Q._brute_force(x, cb)
+    assert exact.any() and not exact.all(), "need both branches represented"
+    assert torch.equal(idx[exact], slow_i[exact])
+
+
+def test_every_codeword_decodes_to_itself():
+    """A codeword is its own nearest codeword, so the decoder must return it
+    unchanged -- including the 29 padding patterns, which are the ones a
+    norm-ball test would wrongly reject."""
+    cb = Q._on_device(torch.float64, "cpu")
+    idx, code, exact = Q.nearest_e8p(cb)
+    assert bool(exact.all())
+    assert torch.equal(code, cb)
+    assert torch.equal(idx, torch.arange(cb.shape[0]))
+
+
+def test_the_decoder_lands_in_the_lattice():
+    """Half-integers with an even coordinate sum -- D8 + 1/2.  Both properties
+    matter: the parity fix is the only reason the second-nearest coordinate is
+    ever chosen."""
+    torch.manual_seed(2)
+    y = torch.randn(2000, 8, dtype=torch.float64) * 2.0
+    h = Q._nearest_halfinteger_even(y)
+    assert torch.all(((h - 0.5) % 1.0).abs() < 1e-12)
+    assert torch.all((h.sum(dim=-1) % 2).abs() < 1e-12)
+    # and it beats naive rounding, which ignores the parity constraint
+    naive = torch.floor(y) + 0.5
+    bad = (naive.sum(dim=-1) % 2).abs() > 1e-12
+    assert bad.any()
+    assert torch.all((y - h).square().sum(-1) >= (y - naive).square().sum(-1) - 1e-12)
+
+
+def test_the_source_index_table_round_trips_and_rejects_outsiders():
+    table = Q._source_index_table()
+    S = Q.source_codebook(torch.float64)
+    powers = Q._LEVELS ** torch.arange(Q.E8P_DIM, dtype=torch.int64)
+    keys = (((S - 0.5).round().to(torch.int64)) * powers).sum(dim=1)
+    assert torch.equal(table[keys], torch.arange(S.shape[0]))
+    assert int((table >= 0).sum()) == S.shape[0]
+
+
+def test_the_codebook_cache_returns_one_object_per_device():
+    """The dispatch is an identity check, so a fresh `.to()` copy each call
+    would silently disable the fast path -- which is exactly what happened
+    before this cache existed."""
+    a = Q._on_device(torch.float64, "cpu")
+    b = Q._on_device(torch.float64, "cpu")
+    assert a is b
+
+
+def test_small_batches_keep_the_scan_and_still_agree():
+    """Below the crossover the decoder's fixed cost is not worth paying, so the
+    scan runs instead.  Correctness must not depend on which side of the
+    threshold a call lands."""
+    torch.manual_seed(3)
+    cb = Q._on_device(torch.float64, "cpu")
+    tiny = torch.randn(8, 8, dtype=torch.float64)
+    assert tiny.shape[0] < Q._LATTICE_MIN_ROWS["cpu"]
+    assert torch.equal(Q._nearest(tiny, cb)[0], Q._brute_force(tiny, cb)[0])
+
+
+def test_a_foreign_codebook_still_goes_through_the_scan():
+    """`_nearest` is not E8P-only; anything that is not the cached table has to
+    fall through, or a caller with its own codebook would get E8P answers."""
+    torch.manual_seed(4)
+    other = torch.randn(512, 8, dtype=torch.float64)
+    x = torch.randn(200, 8, dtype=torch.float64)
+    idx, code = Q._nearest(x, other)
+    assert idx.max() < other.shape[0]
+    assert torch.equal(code, other[idx])
