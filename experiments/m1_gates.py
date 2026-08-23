@@ -48,6 +48,13 @@ import tiling as Tl               # noqa: E402
 from calibrate import LayerProblem, synthetic_problem   # noqa: E402,F401
 
 E8P_BITS = Qz.E8P_BITS_PER_WEIGHT          # 2.0
+
+#: Width the LDLQ feedback is confined to.  Not a speed compromise -- the block
+#: sweep measured 512 as the BEST arm at every tile size, better than the
+#: unconstrained feedback by 11-23% (`docs/STATUS.md` section 5.9).  It is also
+#: what makes a useful `chunk` affordable, since a confined factor is k*512 per
+#: tile instead of k^2.
+HESSIAN_BLOCK = 512
 DEFAULT_BUDGETS = (1.75, 1.60, 1.50)
 DEFAULT_TILES = (1, 2, 4, 8, 16, 32, Tl.MAX_TILE)
 
@@ -109,7 +116,8 @@ def run_config(
     compensate: bool = True,
     rotate_axis: str | None = "index",
     rotate_block: int | None = None,
-    hessian_block: int | None = None,
+    hessian_block: int | None = HESSIAN_BLOCK,
+    chunk: int | str = "auto",
     quantize: bool = True,
     ldlq: bool = True,
     align: int | None = None,
@@ -130,6 +138,14 @@ def run_config(
     transfer pilot needs: it compares a quantized run against an unquantized one
     at EQUAL DENSITY, and letting the alignment differ between them would move
     the realized density and quietly compare two different sparsity levels.
+
+    `hessian_block` defaults to 512 because the block-width sweep measured that
+    as the best arm at every tile size -- better than the unconstrained feedback,
+    not merely cheaper (`docs/STATUS.md` section 5.9).  `rotate_block` defaults
+    to None for the same reason, from the same measurement: confining the
+    ROTATION costs quality at every width tried.  `chunk="auto"` sweeps as many
+    tiles together as memory and saturation allow, which is bit-identical to one
+    at a time and 5-12x faster.
 
     `rotate_block` and `hessian_block` are the two halves of the block-diagonal
     proposal (`docs/STATUS.md` section 6.3), and they are separate arguments on
@@ -175,12 +191,17 @@ def run_config(
                        if rotate_axis else (cw, None))
         if ldlq:
             # Streamed: at real widths the stacked form is hundreds of GiB.
+            n_chunk = (Qz.auto_chunk(cw.n_tiles, cw.lines_per_tile, cw.k,
+                                     rotated.blocks.element_size(),
+                                     hessian_block)
+                       if chunk == "auto" else int(chunk))
             qb = Qz.ldlq_quantize_blocks(
                 rotated.blocks,
                 tile_hessian_stream(
                     problem, cw, Qm if rotate_axis == "index" else None),
                 scale=scale,
                 hessian_block=hessian_block,
+                chunk=n_chunk,
             )
         else:
             qb = Qz.quantize_blocks(rotated.blocks)
@@ -215,6 +236,7 @@ def run_config(
         "rotate_axis": rotate_axis,
         "rotate_block": rotate_block,
         "hessian_block": hessian_block,
+        "chunk": chunk,
         "quantize": quantize,
         "ldlq": ldlq,
         "scale_policy": scale,

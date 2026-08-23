@@ -445,12 +445,17 @@ def test_compress_time_is_the_three_terms():
 def test_the_codebook_sweep_is_the_wall_not_the_factorization():
     """The finding that reorders everything.
 
-    STATUS 6.3 reads the factorization as the structural wall and the block
-    width as the fix.  Measured, the factorization is a tenth of the pass and
-    the scale-fitting sweep is five sixths of it: confining the feedback saves
-    9% of M1, dropping the per-tile scale fit saves 70%.  A block width is
-    still worth taking -- it is free, and the measurement says it IMPROVES
-    quality -- but it is not the lever that decides whether M1 runs.
+    STATUS 6.3 reads the factorization as the structural wall and a block width
+    as the fix.  Measured, the factorization is a fraction of the pass and the
+    scale-fitting sweep is most of it.  Evaluated at the configuration the
+    pipeline actually runs -- feedback confined to 512, sweep chunked -- the
+    codebook term outweighs the Cholesky and the rotation together by 5x or
+    more at every tile size, and dropping the per-tile scale fit is worth four
+    times what confining the feedback is.
+
+    The block width is still worth taking: it is free, it is what makes the
+    chunked sweep affordable, and the measurement says it IMPROVES quality.  It
+    is simply not the lever that decides whether M1 runs.
     """
     import json
     from pathlib import Path
@@ -461,11 +466,14 @@ def test_the_codebook_sweep_is_the_wall_not_the_factorization():
     if "cuda_f32" not in rates["setups"]:
         pytest.skip("no cuda rates measured on this machine")
 
-    c = CM.model_cost(4, 1.5, rates, "cuda_f32")
-    assert c["codebook_seconds"] > 5 * (c["cholesky_seconds"]
-                                        + c["rotation_seconds"])
+    for tile in (1, 4, 16):
+        c = CM.model_cost(tile, 1.5, rates, "cuda_f32", hessian_block=512)
+        assert c["codebook_seconds"] >= 5 * (c["cholesky_seconds"]
+                                             + c["rotation_seconds"])
+
     base = CM.m1_cost(rates, "cuda_f32")["days"]
     blocked = CM.m1_cost(rates, "cuda_f32", hessian_block=512)["days"]
-    no_fit = CM.m1_cost(rates, "cuda_f32", scale_fit=False)["days"]
-    assert blocked > 0.8 * base          # the block width is a minor saving
-    assert no_fit < 0.4 * base           # the scale fit is the major one
+    no_fit = CM.m1_cost(rates, "cuda_f32", scale_fit=False,
+                        hessian_block=512)["days"]
+    assert blocked > 0.7 * base                  # the block width: a minor saving
+    assert (base - no_fit) > 4 * (base - blocked)   # the scale fit: the major one

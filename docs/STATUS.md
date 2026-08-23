@@ -14,8 +14,8 @@ içinde) ve rotasyonun katman düzeyindeki değeri (**−70%**). M0'ın uçuş-�
 kalemlerinin dördü kapandı (`vq_bits`, Kapı B'nin gücü, transfer pilotu,
 maliyet modeli). **Ama sıkıştırılmış modelin perplexity'si hâlâ hiç ölçülmedi**
 — Kapı A'nın ve Kapı B'nin tek bir gerçek verisi yok. Ve önümüzdeki asıl engel
-bilimsel değil, **hesaplama maliyeti**: M1 bu makinede 94 gün, ve
-baskın terim sanılan yerde değil (§6.4).
+bilimsel değil, **hesaplama maliyeti**: M1 bu makinede **48 gün** (120'den
+düştü), ve kalanın neredeyse tamamı tek bir fonksiyonda: `fit_scale`.
 
 ---
 
@@ -274,22 +274,57 @@ iyimser yönde yanılttı, §6.2).
 
 ### 6.1 Bugünkü tablo (cuda/float32, bir sıkıştırma geçişi)
 
-**Bu tablo 08-23'te düzeltildi ve önceki hâli yanlıştı — detay §6.4.**
+**08-23'te iki kez değişti:** modelin Cholesky eğrisi düzeltildi (§6.4) ve hat
+hızlandırıldı (§6.5). Sıra: 120 → 94 → **48 gün**.
+
+Aşağıdaki tablo hattın **şu an koştuğu** düzen: geri besleme 512'ye daraltılmış,
+süpürme tile'lar arasında toplu.
 
 | T | toplam | codebook | rotasyon | cholesky |
 |---|---|---|---|---|
-| 1 | 12.5 h | 10.0 h | 0.46 h | 1.96 h |
-| 4 | **29.9 h** | 25.0 h | 1.92 h | 2.96 h |
-| 16 | 13.6 h | 12.0 h | 0.72 h | 0.85 h |
-| max | 7.9 h | 7.9 h | 0 | 0 |
+| 1 | 5.3 h | 4.4 h | 0.46 h | 0.34 h |
+| 4 | **13.2 h** | 11.0 h | 1.92 h | 0.21 h |
+| 16 | 9.1 h | 8.3 h | 0.72 h | 0.06 h |
+| max | 7.5 h | 7.4 h | 0 | 0 |
 
-**M1 (3 bütçe × 7 tile × 5 çekiliş): 94 gün.** `τ` süpürmesi: **29 gün**
-(spec 25 *saat* diyordu).
+**M1 (3 bütçe × 7 tile × 5 çekiliş): 48 gün.**
 
-**Baskın terim Cholesky değil, codebook taraması** — ve içindeki `fit_scale`
-süpürmesi. Cholesky pasın %10'u; ölçek uydurmayı düşürmek %70'ini götürüyor.
-`affordable()` bir zaman bütçesine neyin sığdığını hesaplıyor ve `T=1` ile
-`T=max`'ı asla düşürmüyor (onlar kapının tanımı).
+**Baskın terim Cholesky değil, codebook taraması** — ve onun da içinde
+`fit_scale`. Cholesky artık pasın %2'si; kalan neredeyse tamamen ölçek uydurma,
+ve onu düşürmenin tavanı **14 gün**. `affordable()` bir zaman bütçesine neyin
+sığdığını hesaplıyor ve `T=1` ile `T=max`'ı asla düşürmüyor (onlar kapının
+tanımı).
+
+### 6.5 Süpürmeyi tile'lar arasında toplamak (08-23)
+
+Süpürme hesap-bağımlı değildi: grup başına **0.248 ms** duvar saati, **0.0034 ms**
+aritmetik — %99.6 boşta. Sebep, `[lines, 8]`'lik bir tensörün 65,536 kodsözcüğüne
+bakması: GPU'yu dolduramayacak kadar küçük, ve arka arkaya `k/8` tane var.
+
+Tile'lar kendi Hessian'ları verildiğinde bağımsız olduğundan grup döngüsü tile
+döngüsünün dışına alındı: her grupta `C` tile birlikte quantize ediliyor.
+Süpürmedeki kazanç:
+
+| şekil | chunk | hızlanma |
+|---|---|---|
+| k=2944, 16 satır | 64 | 6.95× |
+| k=7912, 16 satır | 16 | 4.55× |
+| **k=2560, 4 satır** (T=4) | 64 | **12.1×** |
+
+En büyük kazanç `lines=4`'te, yani ızgaranın en pahalı sütununda.
+
+**Uçtan uca kazanç çok daha küçük: 2.07× / 1.43× / 1.06×.** Çünkü süpürme artık
+bir tile'ın zamanını harcadığı yer değil — `fit_scale` orada, ve o toplu
+değil. Bu, kaldıracı Faz 2'ye taşıyor.
+
+`hessian_block=512` bunun **önkoşulu**: geri besleme daraltılınca `U` tile başına
+`k×512` tutuluyor, `k²` değil (k=7912'de 250 MB → 16 MB), ve `C=64` ancak böyle
+VRAM'e sığıyor. Dün kalite için alınan karar bugün hızın önkoşulu çıktı.
+
+**Çıktı bit-birebir aynı** — iki cihaz, iki dtype, iki ölçek politikası, chunk
+2'den tile sayısının 4 katına kadar `torch.equal` ile doğrulandı ve teste
+sabitlendi. Hızlanma bir sayıyı değiştirseydi o farklı bir hat olurdu, hızlı bir
+hat değil.
 
 ### 6.2 Kapatılan duvarlar
 

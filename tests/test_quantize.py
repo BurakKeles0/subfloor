@@ -581,3 +581,90 @@ def test_feedback_block_reaches_the_tile_loop():
     assert torch.equal(got.values, ref.values)
     assert not torch.equal(got.values,
                            Q.ldlq_quantize_blocks(blocks, lambda t: H).values)
+
+
+# --------------------------------------------------------------------------- #
+# CHUNKED SWEEP
+# --------------------------------------------------------------------------- #
+# The sweep is not compute-bound: measured on this machine a group costs
+# 0.248 ms of wall time against 0.0034 ms of arithmetic, because a [lines, 8]
+# search against 65536 codewords cannot fill a GPU and there are k/8 of them in
+# a row.  Tiles are independent given their own Hessians, so the group loop can
+# be hoisted out of the tile loop and C tiles quantized at each group together.
+# Measured 5-12x, most at lines=4 -- the grid's most expensive column.
+#
+# Because the arithmetic per tile is untouched, the ONLY acceptable outcome is
+# bit-identical output.  That is what these check; a speedup that changed a
+# number would be a different pipeline, not a faster one.
+
+@pytest.mark.parametrize("hessian_block", [None, 64])
+@pytest.mark.parametrize("chunk", [2, 5, 12, 48])
+def test_chunking_the_sweep_changes_nothing(chunk, hessian_block):
+    torch.manual_seed(0)
+    n_tiles, lines, k = 12, 8, 256
+    blocks = torch.randn((n_tiles, lines, k), dtype=DT) * 0.05
+    hs = torch.stack([_spd(k, seed=t) for t in range(n_tiles)])
+
+    ref = Q.ldlq_quantize_blocks(blocks, lambda t: hs[t], scale=0.05,
+                                 hessian_block=hessian_block, chunk=1)
+    got = Q.ldlq_quantize_blocks(blocks, lambda t: hs[t], scale=0.05,
+                                 hessian_block=hessian_block, chunk=chunk)
+    assert torch.equal(got.values, ref.values)
+    assert torch.equal(got.indices, ref.indices)
+    assert torch.equal(got.scales, ref.scales)
+
+
+def test_chunking_preserves_the_per_tile_scale():
+    """A chunk fits one alpha per member, not one for the chunk.  Getting this
+    wrong would silently turn `per_tile` into something between per-tile and
+    per-layer -- and per-layer was measured 11% worse."""
+    torch.manual_seed(1)
+    n_tiles, lines, k = 6, 8, 128
+    blocks = torch.stack([torch.randn((lines, k), dtype=DT) * (0.01 * (t + 1))
+                          for t in range(n_tiles)])
+    hs = torch.stack([_spd(k, seed=t) for t in range(n_tiles)])
+
+    ref = Q.ldlq_quantize_blocks(blocks, lambda t: hs[t], chunk=1)
+    got = Q.ldlq_quantize_blocks(blocks, lambda t: hs[t], chunk=n_tiles)
+    assert torch.equal(got.scales, ref.scales)
+    assert len(set(ref.scales.tolist())) > 1        # the tiles really do differ
+    assert torch.equal(got.values, ref.values)
+
+
+def test_a_ragged_final_chunk_is_handled():
+    """n_tiles need not divide the chunk, and the tail must not be dropped."""
+    torch.manual_seed(2)
+    n_tiles, lines, k = 7, 4, 64
+    blocks = torch.randn((n_tiles, lines, k), dtype=DT) * 0.05
+    hs = torch.stack([_spd(k, seed=t) for t in range(n_tiles)])
+    got = Q.ldlq_quantize_blocks(blocks, lambda t: hs[t], scale=0.05, chunk=3)
+    ref = Q.ldlq_quantize_blocks(blocks, lambda t: hs[t], scale=0.05, chunk=1)
+    assert got.values.shape == blocks.shape
+    assert got.indices.shape == (n_tiles, lines * k // 8)
+    assert torch.equal(got.values, ref.values)
+
+
+def test_chunk_is_validated():
+    blocks = torch.randn((2, 4, 64), dtype=DT) * 0.05
+    with pytest.raises(ValueError, match="chunk must be positive"):
+        Q.ldlq_quantize_blocks(blocks, lambda t: _spd(64), chunk=0)
+
+
+def test_auto_chunk_is_bounded_by_memory_and_by_saturation():
+    """Two ceilings.  Memory is usually the binding one, and it is why
+    `hessian_block` is what makes a useful chunk affordable at all."""
+    k, lines, item = 7912, 16, 4
+    confined = Q.auto_chunk(1000, lines, k, item, hessian_block=512)
+    full = Q.auto_chunk(1000, lines, k, item, hessian_block=None)
+    assert full == 4                       # k^2 * 4 = 250 MiB, four in a GiB
+    assert confined == 64                  # k*512 * 4 = 16 MiB, so saturation binds
+    assert confined > 8 * full
+
+    # Saturation caps it even when memory would allow more.
+    assert Q.auto_chunk(10_000, 4096, 1024, item, hessian_block=512) == 1
+    assert Q.auto_chunk(10_000, 16, 512, item, hessian_block=512) == 64
+
+    # Never more tiles than exist, never fewer than one.
+    assert Q.auto_chunk(3, 16, 512, item, hessian_block=512) == 3
+    assert Q.auto_chunk(1000, 1, 8192, item, hessian_block=None,
+                        budget_bytes=1) == 1

@@ -60,6 +60,7 @@ __all__ = [
     "quantize_blocks",
     "LDLQResult",
     "ldlq_quantize",
+    "auto_chunk",
     "ldlq_quantize_blocks",
     "quantization_snr",
 ]
@@ -451,31 +452,120 @@ def _upper_inverse_factor(Hd: Tensor) -> Tensor:
         torch.cholesky_inverse(torch.linalg.cholesky(Hd)), upper=True)
 
 
-def _blockdiag_feedback(Hd: Tensor, block: int) -> Tensor:
-    """`_upper_inverse_factor` on the diagonal blocks only, zeros elsewhere.
+def _partition(k: int, block: int | None, group: int) -> list[tuple[int, int]]:
+    """Consecutive chunks of at most `block` coordinates; `None` means one chunk.
 
-    Dropping the off-block couplings of the sub-Hessian is exactly equivalent to
-    running LDLQ independently on each width-`block` chunk: the sweep's
-    `W[:, after] -= err @ U[g, after]` reads zeros past the chunk's end, so no
-    error ever crosses a boundary.  Cost goes from k^3 to (k/block) * block^3.
-
-    This is an approximation of the objective, not of the arithmetic -- the
-    error it forgoes is the feedback that would have crossed a block boundary.
-    The measurement that prices it is `experiments/m0_rotation_value.py`; it is
-    only defensible when the rotation is confined to the same width, because
-    then the couplings being dropped are the ones the rotation never created.
+    Every boundary must fall between E8P groups: eight coordinates quantized as
+    one codeword cannot draw their feedback from two different factorizations.
     """
-    k = Hd.shape[-1]
-    U = torch.zeros_like(Hd)
-    chunks: dict[int, list[int]] = {}
-    for off in range(0, k, block):
-        chunks.setdefault(min(block, k - off), []).append(off)
-    for width, offsets in chunks.items():
-        stacked = torch.stack([Hd[o:o + width, o:o + width] for o in offsets])
-        factors = _upper_inverse_factor(stacked)
-        for i, o in enumerate(offsets):
-            U[o:o + width, o:o + width] = factors[i]
-    return U
+    if block is None or block >= k:
+        return [(0, k)]
+    if block % group:
+        raise ValueError(
+            f"hessian_block must be a multiple of the quantizer group {group} "
+            f"so no block boundary falls inside a codeword, got {block}"
+        )
+    return [(o, min(block, k - o)) for o in range(0, k, block)]
+
+
+def _tile_factors(H: Tensor, percdamp: float, parts) -> list[Tensor]:
+    """chol(inv(H_part + lambda I), upper) for one tile, one entry per part.
+
+    Dropping the couplings that reach past a part is exactly equivalent to
+    running LDLQ independently on each part: the sweep's feedback never reaches
+    outside the part it is in.  Cost goes from k^3 to sum(width^3).
+
+    The damping comes from the WHOLE diagonal whatever the partition, so a
+    blocked run and a full-width run regularize identically and any difference
+    between them is attributable to the dropped couplings alone.
+    """
+    damp = percdamp * torch.diagonal(H).mean()
+    by_width: dict[int, list[tuple[int, int]]] = {}
+    for i, (off, width) in enumerate(parts):
+        by_width.setdefault(width, []).append((i, off))
+
+    out: list[Tensor | None] = [None] * len(parts)
+    for width, items in by_width.items():
+        eye = torch.eye(width, dtype=H.dtype, device=H.device)
+        stacked = torch.stack([H[o:o + width, o:o + width] for _, o in items])
+        factors = _upper_inverse_factor(stacked + damp * eye)
+        for n, (i, _) in enumerate(items):
+            out[i] = factors[n]
+    return out                                                    # type: ignore[return-value]
+
+
+def _ldlq_sweep(W: Tensor, factors: list[Tensor], parts, alpha: Tensor,
+                codebook: Tensor, group: int) -> tuple[Tensor, Tensor]:
+    """The sweep itself, over C tiles at once.  `W` [C, lines, k] is consumed.
+
+    Why C tiles and not one.  Tiles are independent given their own Hessians, so
+    the group loop can be hoisted out of the tile loop: at each group every tile
+    in the chunk is quantized together.  That matters because the sweep is not
+    compute-bound -- measured on this machine, a group costs 0.248 ms of wall
+    time against 0.0034 ms of arithmetic, so 99.6% of it is kernel launch.
+    Batching C tiles hands `_nearest` C*lines rows instead of `lines`, which
+    crosses the threshold where the lattice decoder takes over and the card
+    fills.
+
+    The arithmetic per tile is untouched -- same feedback matrix, same alpha,
+    same sequential group order -- so the output must be identical to running
+    the tiles one at a time, and `tests/test_quantize.py` requires exactly that.
+    """
+    C, lines, _ = W.shape
+    out = torch.empty_like(W)
+    a = alpha.reshape(C, 1, 1)
+    per_group = []
+    for part, (off, width) in enumerate(parts):
+        U = factors[part]                                    # [C, width, width]
+        for jj in range(0, width, group):
+            j = off + jj
+            g = slice(j, j + group)
+            Wg = W[:, :, g]
+            idx, q = _nearest((Wg / a).reshape(-1, group), codebook)
+            Qg = q.reshape(C, lines, group) * a
+            out[:, :, g] = Qg
+            per_group.append(idx.reshape(C, lines))
+
+            # err = (Wg - Qg) inv(U[g, g]), via a triangular solve.
+            Ugg = U[:, jj:jj + group, jj:jj + group]
+            err = torch.linalg.solve_triangular(
+                Ugg.transpose(-1, -2), (Wg - Qg).transpose(-1, -2),
+                upper=False).transpose(-1, -2)               # [C, lines, group]
+            if jj + group < width:
+                W[:, :, j + group:off + width] -= (
+                    err @ U[:, jj:jj + group, jj + group:width])
+    return out, torch.stack(per_group, dim=1).reshape(C, -1)
+
+
+#: Memory the chunked sweep may spend on feedback matrices, in bytes.  One GiB
+#: is a judgement: the card has 8 and the compressed layer, its sub-Hessian and
+#: the activations all want room too.
+CHUNK_BUDGET_BYTES = 1 << 30
+
+#: Rows past which `_nearest` stops getting faster.  Measured on this machine
+#: the sweep gains 12x going from 4 rows to 256 and 3% more from 256 to 1024, so
+#: there is nothing to buy above roughly this and the memory is better left free.
+CHUNK_TARGET_ROWS = 1024
+
+
+def auto_chunk(n_tiles: int, lines_per_tile: int, k: int, itemsize: int,
+               hessian_block: int | None = None,
+               budget_bytes: int = CHUNK_BUDGET_BYTES) -> int:
+    """How many tiles to sweep together, from memory and from saturation.
+
+    Two ceilings, and the binding one is usually memory.  A chunk holds every
+    member's feedback matrix: k*block per tile when the feedback is confined,
+    k^2 when it is not.  At k=7912 that is 16 MiB against 250 MiB, which is why
+    `hessian_block` is what makes a useful chunk affordable at all.
+
+    The other ceiling is that `_nearest` stops improving somewhere above a
+    thousand rows, so a larger chunk past that spends memory for nothing.
+    """
+    parts = _partition(k, hessian_block, E8P_DIM)
+    per_tile = sum(width * width for _, width in parts) * itemsize
+    by_memory = max(1, budget_bytes // max(per_tile, 1))
+    by_saturation = max(1, -(-CHUNK_TARGET_ROWS // max(lines_per_tile, 1)))
+    return int(min(n_tiles, by_memory, by_saturation))
 
 
 def ldlq_quantize(
@@ -512,13 +602,13 @@ def ldlq_quantize(
     with U the upper Cholesky factor of (H + lambda I)^-1.  At group=1 it
     reduces exactly to the per-column rule in `prune.forward_compensate`.
 
-    `hessian_block=b` keeps only the width-`b` diagonal blocks of that factor.
-    It is the one lever that moves the project's largest measured cost: the
-    factorization is per tile because each tile owns a different column set, so
-    it runs `n_out/T` times at `k^3` each, and `b` turns that into `k * b^2`.
-    The damping term is computed from the WHOLE diagonal either way, so the two
-    paths regularize identically and the comparison is attributable to the
-    dropped couplings alone.
+    `hessian_block=b` keeps only the width-b diagonal blocks of that factor,
+    turning the k^3 factorization into sum(b^3).  It is also what makes the
+    batched path affordable: a block-diagonal factor is k*b per tile instead of
+    k^2, so a chunk of tiles fits in memory (`ldlq_quantize_blocks(chunk=...)`).
+
+    One tile is the C=1 case of `_ldlq_sweep`, deliberately -- a second
+    implementation of this arithmetic would be free to drift from the first.
     """
     if block.ndim != 2:
         raise ValueError(f"block must be 2-D, got {tuple(block.shape)}")
@@ -532,38 +622,14 @@ def ldlq_quantize(
     if H.shape != (k, k):
         raise ValueError(f"H must be ({k}, {k}) to match the block, got {tuple(H.shape)}")
 
-    if hessian_block is not None and hessian_block % group:
-        raise ValueError(
-            f"hessian_block must be a multiple of the quantizer group {group} "
-            f"so no block boundary falls inside a codeword, got {hessian_block}"
-        )
-
-    damp = percdamp * torch.diagonal(H).mean()
-    Hd = H + damp * torch.eye(k, dtype=H.dtype, device=H.device)
-    U = (_upper_inverse_factor(Hd) if hessian_block is None or hessian_block >= k
-         else _blockdiag_feedback(Hd, hessian_block))
-
+    parts = _partition(k, hessian_block, group)
     cb = _on_device(block.dtype, str(block.device))
     a = fit_scale(block.reshape(-1, group), cb) if scale is None else float(scale)
-
-    W = block.clone()
-    out = torch.empty_like(W)
-    idxs = []
-    for j in range(0, k, group):
-        g = slice(j, j + group)
-        Wg = W[:, g]
-        i, q = _nearest(Wg.reshape(-1, group) / a, cb)
-        Qg = (a * q).reshape(n_lines, group)
-        out[:, g] = Qg
-        idxs.append(i)
-
-        # err = (Wg - Qg) @ inv(U[g, g]), via a triangular solve.
-        Rt = (Wg - Qg).T
-        err = torch.linalg.solve_triangular(U[g, g].T, Rt, upper=False).T
-        if j + group < k:
-            W[:, j + group:] -= err @ U[g, j + group:]
-
-    return LDLQResult(values=out, indices=torch.cat(idxs), scale=a)
+    factors = [f.unsqueeze(0) for f in _tile_factors(H, percdamp, parts)]
+    alpha = torch.tensor([a], dtype=block.dtype, device=block.device)
+    values, idx = _ldlq_sweep(block.unsqueeze(0).clone(), factors, parts,
+                              alpha, cb, group)
+    return LDLQResult(values=values[0], indices=idx[0], scale=a)
 
 
 def ldlq_quantize_blocks(
@@ -574,6 +640,7 @@ def ldlq_quantize_blocks(
     scale: str | float = "per_tile",
     scale_sample: int = 8192,
     hessian_block: int | None = None,
+    chunk: int = 1,
 ) -> QuantizedBlocks:
     """`ldlq_quantize` over every tile.
 
@@ -600,9 +667,24 @@ def ldlq_quantize_blocks(
     Fitting once over EVERY vector would save nothing at all -- same total work,
     differently arranged -- so the saving is in the sampling, not in the sharing.
 
-    `hessian_block` is passed straight through to `ldlq_quantize`; it is the
-    other half of the same runtime question, and the two levers are independent
-    -- one shrinks the factorization, the other the codebook sweep.
+    `hessian_block` is passed straight through; it is the other half of the same
+    runtime question, and the two levers are independent -- one shrinks the
+    factorization, the other the codebook sweep.
+
+    `chunk` sweeps that many tiles TOGETHER.  The sweep is not compute-bound:
+    measured here, a group costs 0.248 ms of wall time against 0.0034 ms of
+    arithmetic, because a [lines, 8] search against 65536 codewords cannot fill
+    a GPU and there are k/8 of them in a row.  Chunking hands `_nearest`
+    `chunk * lines` rows instead of `lines`.
+
+    It pairs with `hessian_block` rather than standing alone: the chunk has to
+    hold every member's feedback matrix at once, which is k*block per tile when
+    the feedback is confined and k^2 when it is not -- 16 MiB against 250 MiB at
+    k=7912.  Sub-Hessians are still built ONE at a time whatever the chunk, so
+    the streaming callable keeps doing its job.
+
+    `chunk=1` is the default because it is the arrangement every measurement so
+    far was taken under.  Larger values must produce bit-identical output.
     """
     if blocks.ndim != 3:
         raise ValueError(f"blocks must be 3-D, got {tuple(blocks.shape)}")
@@ -624,21 +706,46 @@ def ldlq_quantize_blocks(
         raise ValueError(f"scale must be 'per_tile', 'per_layer' or a number, "
                          f"got {scale!r}")
 
+    if chunk < 1:
+        raise ValueError(f"chunk must be positive, got {chunk}")
+    if k % E8P_DIM:
+        raise ValueError(
+            f"LDLQ needs the index axis to be a multiple of {E8P_DIM}, got k={k}"
+        )
+
+    cb = _on_device(blocks.dtype, str(blocks.device))
+    parts = _partition(k, hessian_block, E8P_DIM)
     out = torch.empty_like(blocks)
     idxs, scales = [], []
-    for t in range(n_tiles):
-        h = hessians(t) if streaming else hessians[t]
-        if h.shape != (k, k):
-            raise ValueError(
-                f"tile {t}: hessian must be ({k}, {k}), got {tuple(h.shape)}"
-            )
-        r = ldlq_quantize(blocks[t], h, percdamp=percdamp, scale=tile_scale,
-                          hessian_block=hessian_block)
-        out[t] = r.values
-        idxs.append(r.indices)
-        scales.append(r.scale)
+
+    for start in range(0, n_tiles, chunk):
+        members = range(start, min(start + chunk, n_tiles))
+        # One sub-Hessian resident at a time; only its factors are kept, and
+        # those are k*block rather than k^2 once the feedback is confined.
+        per_tile = []
+        for t in members:
+            h = hessians(t) if streaming else hessians[t]
+            if h.shape != (k, k):
+                raise ValueError(
+                    f"tile {t}: hessian must be ({k}, {k}), got {tuple(h.shape)}"
+                )
+            per_tile.append(_tile_factors(h, percdamp, parts))
+            del h
+        factors = [torch.stack([f[i] for f in per_tile])
+                   for i in range(len(parts))]
+
+        alphas = [fit_scale(blocks[t].reshape(-1, E8P_DIM), cb)
+                  if tile_scale is None else tile_scale for t in members]
+        alpha = torch.tensor(alphas, dtype=blocks.dtype, device=blocks.device)
+        sl = slice(start, start + len(alphas))
+        values, index = _ldlq_sweep(blocks[sl].clone(), factors, parts,
+                                    alpha, cb, E8P_DIM)
+        out[sl] = values
+        idxs.append(index)
+        scales.extend(alphas)
+
     return QuantizedBlocks(
-        values=out, indices=torch.stack(idxs),
+        values=out, indices=torch.cat(idxs),
         scales=torch.tensor(scales, dtype=blocks.dtype), padding=0,
     )
 

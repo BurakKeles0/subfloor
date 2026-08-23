@@ -15,10 +15,15 @@ figures.  Three terms are charged, each from its own measured curve:
 They are listed in that order because that is their size, and it took four
 corrections to find out.  The factorization LOOKS like it should dominate --
 it is the only cubic term -- and for a while the model said it did.  It does
-not: at B=1.5, T=4 the pass is 25.0 hours of codebook against 2.96 of Cholesky
-and 1.92 of rotation.  Confining the factorization to blocks
-(`quantize.ldlq_quantize(hessian_block=...)`) is worth 9% of M1; dropping the
-per-tile scale fit is worth 70%.
+not: at B=1.5, T=4 the pass is 11.0 hours of codebook against 1.92 of rotation
+and 0.21 of Cholesky.
+
+The model describes the pipeline as it now runs: feedback confined to width-512
+blocks and the sweep chunked across tiles, both bit-identical to what they
+replace.  Together they took M1 from 94 days to 48.  What is left is almost
+entirely `fit_scale` -- dropping the per-tile scale fit would take it to 14 --
+which is why the codebook line above is first and why the next measurement is
+its quality cost, not another kernel.
 
 The corrections, in order, because each one is a way this file was wrong:
 
@@ -33,7 +38,7 @@ The corrections, in order, because each one is a way this file was wrong:
   4. it charged every width the Cholesky rate measured at k=2048, from a
      benchmark that warmed `cholesky` but not `cholesky_inverse`.  9.4x too HIGH
      at real widths, and this one mattered most: it is the number that says
-     whether M1 can be run, and it read 120 days when the answer is 94.
+     whether M1 can be run, and it read 120 days when the answer was 94.
 
 The through-line is that composing a cost from kernel microbenchmarks does not
 work here.  Where a curve is measured, it is measured at the sizes the code will
@@ -116,9 +121,24 @@ SCALE_FIT_MULTIPLIER = 6.0
 #: scan where it pays.  The scan numbers it supersedes, for the record:
 #:   cpu_f64  (2560,4,4.49) (2944,16,29.26) (3072,128,266.04)
 #:   cuda_f32 (2560,4,0.28) (2944,16, 0.83) (3072,128,  5.93)
+#: `cuda_f32` re-measured 2026-08-23 with the chunked sweep and
+#: `hessian_block=512`, which is what the pipeline now does.  Per tile it is
+#: 2.07x / 1.43x / 1.06x faster than the one-tile-at-a-time arrangement it
+#: replaces -- far less than the 5-12x the SWEEP gained, because the sweep is no
+#: longer what a tile spends its time on.  `fit_scale` is, and it is not
+#: chunked: it fits one scalar per tile by scanning that tile's vectors 24
+#: times.  The gain also shrinks with the line count (2.07x at four lines,
+#: 1.06x at 128) for the same reason the chunking helped in the first place --
+#: a 128-line tile already filled the card.
+#:
+#: `cpu_f64` still describes the ONE-TILE arrangement; it has not been
+#: re-measured because the pipeline runs on cuda/float32 (decision 2026-08-23)
+#: and the CPU row exists only for comparison.  Do not read the two rows as a
+#: like-for-like device comparison any more.
+#:   superseded cuda_f32, chunk=1: (2560,4,0.247) (2944,16,0.454) (3072,128,2.309)
 TILE_TIMINGS = {
     "cpu_f64": ((2560, 4, 1.741), (2944, 16, 8.721), (3072, 128, 95.83)),
-    "cuda_f32": ((2560, 4, 0.247), (2944, 16, 0.454), (3072, 128, 2.309)),
+    "cuda_f32": ((2560, 4, 0.1194), (2944, 16, 0.3177), (3072, 128, 2.1827)),
 }
 
 #: Seconds for ONE `quantize._upper_inverse_factor` call, measured on this
