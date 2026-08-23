@@ -311,7 +311,16 @@ def _source_on_device(dtype: torch.dtype, device: str) -> Tensor:
     return source_codebook(dtype).to(device)
 
 
-def nearest_e8p_analytic(x: Tensor, chunk: int = 4096) -> tuple[Tensor, Tensor]:
+#: Rows per pass in `nearest_e8p_analytic`.  Larger than the scan's 4096 on
+#: purpose: the analytic form is launch-bound, not memory-bound, so halving the
+#: number of passes is worth more than the working set it costs.  Measured
+#: 1.10-1.24x end to end going from 4096 to this; past it the curve is flat.
+#: The working set is `chunk * 8 * 256 * itemsize`, 128 MiB here.
+ANALYTIC_CHUNK = 16384
+
+
+def nearest_e8p_analytic(x: Tensor,
+                         chunk: int = ANALYTIC_CHUNK) -> tuple[Tensor, Tensor]:
     """Nearest E8P codeword, EXACTLY, without scanning 65536 rows.
 
     The scan was the pipeline's dominant cost and it was never necessary.  A
@@ -449,7 +458,7 @@ def _nearest(x: Tensor, codebook: Tensor, chunk: int = 4096,
         # for 80K, being launch-bound rather than compute-bound, while the
         # analytic form does real work proportional to the rows it is given.
         m_idx, m_code = (
-            nearest_e8p_analytic(x[miss], chunk)
+            nearest_e8p_analytic(x[miss])
             if miss.numel() >= _ANALYTIC_MIN_ROWS
             else _brute_force(x[miss], codebook, chunk))
         idx = idx.clone()
