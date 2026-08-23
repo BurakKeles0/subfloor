@@ -178,6 +178,46 @@ problem verilirse eski davranışa düşüyor ama çıktıyı `draw_axis` ile et
 
 ---
 
+## 5.5 ⏸️ Yarım kalan iş — buradan devam et
+
+**Rotasyonun gerçek katmanda değeri ölçülüyordu; koşu durduruldu (2026-08-23).**
+Kurulum tarafı çalışıyor ve doğrulandı:
+
+```bash
+HF_HUB_DISABLE_XET=1 python experiments/m0_rotation_value.py --tiles 4 16 max --seqs 16 --rows 512
+```
+
+Model yükleniyor, 32,768 gerçek kalibrasyon token'ı alınıyor, blok 0 girdileri
+yakalanıyor, `o_proj`'un Hessian'ı birikiyor (4 s). Kalan altı LDLQ kolu
+(T=4/16/max × rotasyonlu/düz) **~2.5–3.5 saat** sürüyor. Hiç `rel.err` satırı
+alınamadı — **sonuç yok.**
+
+**Neden önemli:** rotasyonun ölçülmüş bütün faydası (`−29.5%` … `−31.0%`)
+**sentetik**. Maliyeti ise gerçek: tile başına rotasyon → tile başına baz →
+tile başına Cholesky → M1 76 gün. Sentetik bir kazanç için yapısal bir bedel
+ödüyoruz ve bu deney tam olarak o boşluğu kapatacaktı.
+
+**Ölçülen tile maliyetleri** (tam çekirdek, `o_proj`, 512 satır):
+
+| kol | tile başına | tile | kol süresi |
+|---|---|---|---|
+| T=4 | 7.85 s | 128 | ~17 dk |
+| T=16 | 54.26 s | 32 | ~29 dk |
+| T=max | ~30 dk *(ekstrapole, alt sınır)* | 1 | ~30 dk |
+
+İş 4.6 katına çıkarken süre 6.9 katına çıkıyor — birim maliyet büyük tile'larda
+artıyor, çünkü codebook araması bellek-bağlı.
+
+**Üç ucuzlatma seçeneği var, hiçbiri seçilmedi:**
+
+| seçenek | süre | bedeli |
+|---|---|---|
+| `T=max`'ı at | ~1.5 sa | Rotasyonun çıkarımda bedava olduğu uç gözlemsiz kalır |
+| `--rows 256` | ~1.2 sa | Tile başına problem aynı, istatistik zayıflar |
+| Ölçeği katman başına oturt | ~25 dk | Hattı değiştirmek olur; iki kolu eşit etkilediği için karşılaştırmayı bozmaz ama açıkça kaydedilmeli |
+
+---
+
 ## 6. Sırada ne var
 
 ### Hemen yapılabilir (model yerelde, hat çalışıyor)
@@ -234,6 +274,14 @@ Maliyet modeli (bu makinede ölçülen sabitlerle) üç ayrı duvar buluyor:
 | **Bellek** | `T=2`'de **462 GiB** tek tensör | `tile_hessians` `[n_tiles, k, k]`'yı bir kerede ayırıyor | **Kolay** — tile'ları akıtmak 231 MiB'a düşürüyor |
 | **Cholesky** | Model başına 10¹⁶ flop; `T=16`'da 15 saat, `T=1`'de 10 saat | Her tile kendi sütun kümesine sahip → tile başına `k³` faktorizasyon | **Yapısal** |
 | **Codebook araması** | `T`'den bağımsız 12 saat (CPU f64) | 2¹⁶ kodsözcüğü üzerinde kaba kuvvet en yakın komşu | **Orta** — E8 kafesine doğrudan yuvarlama bunu ~0'a indirir |
+| **`fit_scale`** | Yukarıdakinin **6 katı** | LDLQ her tile için 24 aday ölçeği tarıyor, her taramada tüm tile'ı arıyor — ölçüldü, LDLQ'nun **%83'ü** | **En kolay** — QuIP# ölçeği katman başına oturtuyor |
+
+> ⚠️ **Maliyet modelinin ilk sürümü `fit_scale`'i hiç saymıyordu ve altı kat
+> yanılıyordu.** Doğrusu `SCALE_FIT_MULTIPLIER = 6.0` olarak modelde, anahtarlı
+> ve varsayılanı açık — çünkü kodun bugün yaptığı bu. M1 tahmini **61 → 76 gün**.
+>
+> ✅ **Bellek duvarı kapatıldı:** `tile_hessian_stream` ile 119 GiB → 239 MiB,
+> ve yığılmış yolla **bit-birebir** aynı sonucu verdiği testle sabit.
 
 Cholesky duvarı **kaba kuvvet değil, tasarımdan geliyor**: her tile'ın kendi
 sütun kümesi + kendi rotasyonu var, dolayısıyla kendi alt-Hessian'ını
@@ -305,6 +353,7 @@ işler için dar.
 | `experiments/m0_gate_b_power.py` | Kapı B'nin gücü + boru hattının gürültüsü |
 | `experiments/m0_transfer_pilot.py` | `Δ = Q + τ` transfer sapması → tolerans |
 | `experiments/m0_cost_model.py` | ölçülen sabitlerle gerçek koşu maliyeti |
+| `experiments/m0_rotation_value.py` | rotasyon gerçek katmanda kazandırıyor mu (**yarım**, §5.5) |
 
 **Belgeler:** `spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı**) · `audit.md` (v6 denetimi, tarihsel kayıt) ·
@@ -341,7 +390,8 @@ python experiments/m0_vq_bits.py --all       # ~100 KB ağ trafiği, saniyeler
 | `a1626c6` | VQ maliyeti checkpoint'ten ölçüldü; SU/SV ayrışması bulundu |
 | `3d8658f` | Kapı B'nin gücü ölçüldü; `T*` küme oldu; çekiliş ekseni düzeldi |
 | `7d1ee48` | Transfer pilotu: tolerans kuralı, ve modelin büyük `T` önyargısı |
-| *(bu tur)* | Maliyet modeli — ve hattın gerçek boyutta koşamadığının tespiti |
+| `797aa2e` | Maliyet modeli — ve hattın gerçek boyutta koşamadığının tespiti |
+| `baa38a7` | Bellek duvarı kapandı, iki yükleyici hatası düzeldi, `fit_scale` modele girdi |
 
 ---
 
