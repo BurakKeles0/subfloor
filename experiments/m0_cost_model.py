@@ -77,6 +77,20 @@ E8P_DIM = Qz.E8P_DIM
 #: `--no-scale-fit` to price the alternative.
 SCALE_FIT_MULTIPLIER = 6.0
 
+#: END-TO-END per-tile wall times measured on this machine: (k, lines, seconds).
+#: One `ldlq_quantize` call each, at o_proj-shaped widths.
+#:
+#: These exist because composing the cost from kernel microbenchmarks was wrong
+#: twice, both times optimistically.  First it omitted `fit_scale` entirely.
+#: Then, with `fit_scale` in, it priced the codebook search at the rate measured
+#: for SIXTEEN rows in a tight loop -- where the codebook stays in cache across
+#: repetitions -- when the real calls interleave with Hessian updates that evict
+#: it.  A microbenchmark measures a kernel; this measures the pipeline.
+TILE_TIMINGS = {
+    "cpu_f64": ((2560, 4, 4.49), (2944, 16, 29.26), (3072, 128, 266.04)),
+    "cuda_f32": ((2560, 4, 0.28), (2944, 16, 0.83), (3072, 128, 5.93)),
+}
+
 #: Measured, `experiments/m0_dense_ppl.py`: one streamed WikiText-2 pass at
 #: seqlen 4096 on this 8 GB card.
 EVAL_SECONDS = 238.0
@@ -205,33 +219,77 @@ def layer_cost(n_out: int, n_in: int, tile_size, budget: float, *,
     }
 
 
+def codebook_seconds_per_vector(rates: dict, setup: str) -> float:
+    """Seconds per quantized 8-vector, fitted from the measured tile times.
+
+    The Cholesky is subtracted first at its microbenchmarked rate -- that one
+    IS a clean LAPACK measurement -- and what is left is charged to the codebook
+    work, which includes the scale-fitting sweep.
+
+    The residuals span about 1.6x across the three tiles, so the linear form is
+    an approximation.  The WORST residual is returned, not the mean: this model
+    has been wrong twice already and both times in the flattering direction.
+    """
+    samples = (rates["setups"][setup].get("tile_timings")
+               or TILE_TIMINGS.get(setup))
+    if not samples:
+        raise ValueError(
+            f"no measured tile timings for setup {setup!r}; add them to "
+            "TILE_TIMINGS or carry them on the rates entry"
+        )
+    chol_rate = rates["setups"][setup]["cholesky_flops_per_s"]
+
+    worst = 0.0
+    for k, lines, seconds in samples:
+        residual = seconds - CHOL_FLOPS_PER_K3 * k ** 3 / chol_rate
+        if residual <= 0:
+            continue
+        worst = max(worst, residual / (lines * k))
+    if worst == 0.0:
+        raise ValueError(f"tile timings for {setup!r} leave nothing to fit")
+    return worst
+
+
 def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
                batched: bool = False, scale_fit: bool = True,
                inventory=LLAMA2_7B, n_blocks: int = N_BLOCKS) -> dict:
-    """One full compression pass over Llama-2-7B at one tile size."""
+    """One full compression pass over Llama-2-7B at one tile size.
+
+    Timing comes from the measured per-tile fit, not from flops over kernel
+    rates.  `batched` is kept for the flop accounting only -- the measured times
+    already contain whatever batching the code does.
+    """
     r = rates["setups"][setup]
-    cb_rate = r["codebook_flops_per_s_large" if batched else
-               "codebook_flops_per_s_small"]
+    per_vector = codebook_seconds_per_vector(rates, setup)
 
     chol = cb = peak = peak_streamed = 0.0
+    chol_seconds = cb_seconds = 0.0
     for n_out, n_in, count in inventory:
         c = layer_cost(n_out, n_in, tile_size, budget, scale_fit=scale_fit)
         if c is None:
             return {"tile_size": tile_size, "skipped": "budget unreachable"}
         chol += count * c["cholesky_flops"]
         cb += count * c["codebook_flops"]
+        chol_seconds += count * c["cholesky_flops"] / r["cholesky_flops_per_s"]
+        # n_tiles * lines * k == n_out * k, and the tile fit is per vector
+        vectors = n_out * c["k"] / E8P_DIM
+        cb_seconds += count * vectors * E8P_DIM * per_vector * (
+            1.0 if scale_fit else 1.0 / SCALE_FIT_MULTIPLIER)
         peak = max(peak, c["hessian_bytes"])
         peak_streamed = max(peak_streamed, c["hessian_bytes_streamed"])
 
     chol *= n_blocks
     cb *= n_blocks
-    seconds = chol / r["cholesky_flops_per_s"] + cb / cb_rate
+    chol_seconds *= n_blocks
+    cb_seconds *= n_blocks
+    seconds = chol_seconds + cb_seconds
     return {
         "tile_size": tile_size, "setup": setup, "batched": batched,
         "scale_fit": scale_fit,
         "cholesky_flops": chol, "codebook_flops": cb,
-        "cholesky_seconds": chol / r["cholesky_flops_per_s"],
-        "codebook_seconds": cb / cb_rate,
+        "cholesky_seconds": chol_seconds,
+        "codebook_seconds": cb_seconds,
+        "codebook_seconds_per_vector": per_vector,
         "compress_seconds": seconds,
         "eval_seconds": EVAL_SECONDS,
         "point_seconds": seconds + EVAL_SECONDS,
@@ -320,16 +378,19 @@ def sweep_cost(rates: dict, setup: str, *, budget: float = 1.5,
 
 
 def m1_cost(rates: dict, setup: str, *, budgets=(1.75, 1.60, 1.50),
-            n_draws: int = 5, tiles=TILES, batched: bool = False) -> dict:
+            n_draws: int = 5, tiles=TILES, batched: bool = False,
+            scale_fit: bool = True) -> dict:
     """M1's own grid, for scale: budgets x tiles x draws."""
     total = 0.0
     for b in budgets:
         for t in tiles:
-            c = model_cost(t, b, rates, setup, batched=batched)
+            c = model_cost(t, b, rates, setup, batched=batched,
+                           scale_fit=scale_fit)
             if "skipped" not in c:
                 total += n_draws * c["point_seconds"]
-    return {"setup": setup, "batched": batched, "n_draws": n_draws,
-            "seconds": total, "hours": total / 3600, "days": total / 86400}
+    return {"setup": setup, "batched": batched, "scale_fit": scale_fit,
+            "n_draws": n_draws, "seconds": total, "hours": total / 3600,
+            "days": total / 86400}
 
 
 # --------------------------------------------------------------------------- #

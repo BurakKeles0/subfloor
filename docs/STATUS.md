@@ -178,45 +178,32 @@ problem verilirse eski davranışa düşüyor ama çıktıyı `draw_axis` ile et
 
 ---
 
-## 5.5 ⏸️ Yarım kalan iş — buradan devam et
+## 5.5 ✅ Rotasyon gerçek katmanda ölçüldü (2026-08-23)
 
-**Rotasyonun gerçek katmanda değeri ölçülüyordu; koşu durduruldu (2026-08-23).**
-Kurulum tarafı çalışıyor ve doğrulandı:
+`layers.0.self_attn.o_proj` (512 çıktı satırı), gerçek Llama-2-7B ağırlıkları,
+32,768 gerçek kalibrasyon token'ı, `B=1.5`, cuda/float32:
 
-```bash
-HF_HUB_DISABLE_XET=1 python experiments/m0_rotation_value.py --tiles 4 16 max --seqs 16 --rows 512
-```
+| T | d | düz | rotasyonlu | **değişim** | sentetik |
+|---|---|---|---|---|---|
+| 4 | 0.6250 | 0.47422 | 0.09649 | **−79.7%** | −29.5% |
+| 16 | 0.7188 | 0.54423 | 0.19530 | **−64.1%** | −31.0% |
+| max | 0.7500 | 0.55738 | 0.18655 | **−66.5%** | — |
 
-Model yükleniyor, 32,768 gerçek kalibrasyon token'ı alınıyor, blok 0 girdileri
-yakalanıyor, `o_proj`'un Hessian'ı birikiyor (4 s). Kalan altı LDLQ kolu
-(T=4/16/max × rotasyonlu/düz) **~2.5–3.5 saat** sürüyor. Hiç `rel.err` satırı
-alınamadı — **sonuç yok.**
+Ortalama: gerçek **−70.1%**, sentetik −30.2%. SNR farkı her hücrede ~3.3 dB
+(rotasyonlu 6.69–6.77 dB, düz 3.33–3.76 dB).
 
-**Neden önemli:** rotasyonun ölçülmüş bütün faydası (`−29.5%` … `−31.0%`)
-**sentetik**. Maliyeti ise gerçek: tile başına rotasyon → tile başına baz →
-tile başına Cholesky → M1 76 gün. Sentetik bir kazanç için yapısal bir bedel
-ödüyoruz ve bu deney tam olarak o boşluğu kapatacaktı.
+> **Bu, projeye dair en önemli tek ölçüm sonuçlarından biri ve bir çerçeveyi
+> çürüttü.** "Sentetik bir kazanç için yapısal bir bedel ödüyoruz" diyordum.
+> Kazanç sentetik değil — **sentetik olan, kazancı iki-üç kat eksik ölçmüş.**
+> Fixture'ın kalın kuyruğu gerçek Llama ağırlıklarınınki kadar ağır değil, ve
+> rotasyon tam olarak o kuyruğu yaymak için var.
 
-**Ölçülen tile maliyetleri** (tam çekirdek, `o_proj`, 512 satır):
+**Sonuç: "rotasyonu bırak" seçeneği kapandı.** Bırakmak katman hatasını üçe
+katlıyor. Geriye ikisi kalıyor: rotasyonu 8'lik gruplara blok-köşegen kısıtlayıp
+paylaşılan Hessian'ı kurtarmak (**ölçülmedi**, ucuz sınanır), ya da bedeli ödemek.
 
-| kol | tile başına | tile | kol süresi |
-|---|---|---|---|
-| T=4 | 7.85 s | 128 | ~17 dk |
-| T=16 | 54.26 s | 32 | ~29 dk |
-| T=max | ~30 dk *(ekstrapole, alt sınır)* | 1 | ~30 dk |
-
-İş 4.6 katına çıkarken süre 6.9 katına çıkıyor — birim maliyet büyük tile'larda
-artıyor, çünkü codebook araması bellek-bağlı.
-
-**Üç ucuzlatma seçeneği var, hiçbiri seçilmedi:**
-
-| seçenek | süre | bedeli |
-|---|---|---|
-| `T=max`'ı at | ~1.5 sa | Rotasyonun çıkarımda bedava olduğu uç gözlemsiz kalır |
-| `--rows 256` | ~1.2 sa | Tile başına problem aynı, istatistik zayıflar |
-| Ölçeği katman başına oturt | ~25 dk | Hattı değiştirmek olur; iki kolu eşit etkilediği için karşılaştırmayı bozmaz ama açıkça kaydedilmeli |
-
----
+**Kapsam:** tek katman, tek çekiliş, katman-çıkışı hatası — perplexity değil.
+Mekanizmaya dair yeter, manşete dair yetmez.
 
 ## 6. Sırada ne var
 
@@ -271,10 +258,18 @@ Maliyet modeli (bu makinede ölçülen sabitlerle) üç ayrı duvar buluyor:
 
 | Duvar | Büyüklük | Sebep | Zorluk |
 |---|---|---|---|
-| **Bellek** | `T=2`'de **462 GiB** tek tensör | `tile_hessians` `[n_tiles, k, k]`'yı bir kerede ayırıyor | **Kolay** — tile'ları akıtmak 231 MiB'a düşürüyor |
+| **Bellek** | `T=2`'de **462 GiB** tek tensör | `tile_hessians` `[n_tiles, k, k]`'yı bir kerede ayırıyor | ✅ **Kapatıldı** — `tile_hessian_stream`, 239 MiB |
+| **Yanlış cihaz** | Hat CPU/float64'te koşuyordu | — | ✅ **Kapatıldı** — cuda/float32 uçtan uca **16–45×**, ağırlık farkı 5e-08 |
 | **Cholesky** | Model başına 10¹⁶ flop; `T=16`'da 15 saat, `T=1`'de 10 saat | Her tile kendi sütun kümesine sahip → tile başına `k³` faktorizasyon | **Yapısal** |
 | **Codebook araması** | `T`'den bağımsız 12 saat (CPU f64) | 2¹⁶ kodsözcüğü üzerinde kaba kuvvet en yakın komşu | **Orta** — E8 kafesine doğrudan yuvarlama bunu ~0'a indirir |
-| **`fit_scale`** | Yukarıdakinin **6 katı** | LDLQ her tile için 24 aday ölçeği tarıyor, her taramada tüm tile'ı arıyor — ölçüldü, LDLQ'nun **%83'ü** | **En kolay** — QuIP# ölçeği katman başına oturtuyor |
+| **`fit_scale`** | Yukarıdakinin **6 katı** | LDLQ her tile için 24 aday ölçeği tarıyor, her taramada tüm tile'ı arıyor — ölçüldü, LDLQ'nun **%83'ü** | **En kolay** — ama katman-başı ölçek %11 kalite kaybettiriyor (ölçüldü); doğrusu tile-başı ölçeği **örneklemek** |
+
+> ⚠️ **Baskın terim Cholesky değilmiş.** Maliyet modeli artık uçtan uca ölçülen
+> tile sürelerine oturuyor (kernel mikro-benchmark'larına değil, çünkü onlar iki
+> kez iyimser yönde yanılttı). GPU'da tek geçişin **%79'u codebook araması**,
+> %21'i Cholesky. Bu iyi haber: Cholesky yapısal, codebook araması mühendislik —
+> 2¹⁶ kodsözcüğünde kaba kuvvet yerine E8 kafesine doğrudan yuvarlama onu
+> neredeyse sıfırlar.
 
 > ⚠️ **Maliyet modelinin ilk sürümü `fit_scale`'i hiç saymıyordu ve altı kat
 > yanılıyordu.** Doğrusu `SCALE_FIT_MULTIPLIER = 6.0` olarak modelde, anahtarlı
@@ -353,7 +348,7 @@ işler için dar.
 | `experiments/m0_gate_b_power.py` | Kapı B'nin gücü + boru hattının gürültüsü |
 | `experiments/m0_transfer_pilot.py` | `Δ = Q + τ` transfer sapması → tolerans |
 | `experiments/m0_cost_model.py` | ölçülen sabitlerle gerçek koşu maliyeti |
-| `experiments/m0_rotation_value.py` | rotasyon gerçek katmanda kazandırıyor mu (**yarım**, §5.5) |
+| `experiments/m0_rotation_value.py` | rotasyon gerçek katmanda kazandırıyor mu — **−70%** (§5.5) |
 
 **Belgeler:** `spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı**) · `audit.md` (v6 denetimi, tarihsel kayıt) ·
@@ -392,6 +387,7 @@ python experiments/m0_vq_bits.py --all       # ~100 KB ağ trafiği, saniyeler
 | `7d1ee48` | Transfer pilotu: tolerans kuralı, ve modelin büyük `T` önyargısı |
 | `797aa2e` | Maliyet modeli — ve hattın gerçek boyutta koşamadığının tespiti |
 | `baa38a7` | Bellek duvarı kapandı, iki yükleyici hatası düzeldi, `fit_scale` modele girdi |
+| *(bu tur)* | **Rotasyon gerçek katmanda −70%**; hat GPU'ya taşındı; maliyet modeli ölçüme oturdu |
 
 ---
 

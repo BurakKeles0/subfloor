@@ -27,6 +27,10 @@ RATES = {
             "cholesky_flops_per_s": 1e12,
             "codebook_flops_per_s_small": 1e10,
             "codebook_flops_per_s_large": 1e11,
+            # (k, lines, seconds).  Two tiles of the same width and different
+            # line counts, so the fit has to separate the k^3 term from the
+            # per-weight one rather than absorbing both.
+            "tile_timings": ((1000, 10, 1e-2), (1000, 100, 1e-1)),
         }
     },
 }
@@ -114,12 +118,45 @@ def test_point_cost_includes_the_measured_evaluation():
     assert c["eval_seconds"] == CM.EVAL_SECONDS
 
 
-def test_batching_only_changes_the_codebook_term():
+def test_batching_no_longer_moves_the_clock():
+    """`batched` used to pick between two microbenchmarked rates.  Timing now
+    comes from END-TO-END per-tile measurements, which already contain whatever
+    batching the code does, so the flag is flop bookkeeping and nothing else.
+
+    Kept as a test rather than deleted: silently having a flag that once changed
+    the answer and no longer does is how a stale number gets quoted.
+    """
     a = CM.model_cost(16, 1.5, RATES, "fake", batched=False)
     b = CM.model_cost(16, 1.5, RATES, "fake", batched=True)
-    assert a["cholesky_seconds"] == pytest.approx(b["cholesky_seconds"])
-    # the fake large rate is 10x the small one
-    assert a["codebook_seconds"] == pytest.approx(10 * b["codebook_seconds"])
+    assert a["compress_seconds"] == pytest.approx(b["compress_seconds"])
+    assert a["codebook_flops"] == pytest.approx(b["codebook_flops"])
+
+
+def test_timing_comes_from_the_measured_tile_fit():
+    """One weight costs the fitted constant, times n_out * k per linear.
+
+    The constant is the WORST residual across the fixture's tiles, after the
+    Cholesky is removed at its own rate -- worst, not mean, because this model
+    has twice been wrong in the flattering direction.
+    """
+    chol = CM.CHOL_FLOPS_PER_K3 * 1000 ** 3 / RATES["setups"]["fake"][
+        "cholesky_flops_per_s"]
+    want = max((sec - chol) / (lines * k)
+               for k, lines, sec in RATES["setups"]["fake"]["tile_timings"])
+    per_weight = CM.codebook_seconds_per_vector(RATES, "fake")
+    assert per_weight == pytest.approx(want)
+
+    c = CM.model_cost(16, 1.5, RATES, "fake", n_blocks=1,
+                      inventory=((4096, 4096, 1),))
+    k = CM.layer_cost(4096, 4096, 16, 1.5)["k"]
+    assert c["codebook_seconds"] == pytest.approx(4096 * k * per_weight)
+
+
+def test_a_setup_without_measured_timings_is_refused():
+    """Better to stop than to invent a rate for a device nobody timed."""
+    bare = {"setups": {"unmeasured": {"cholesky_flops_per_s": 1e12}}}
+    with pytest.raises(ValueError, match="no measured tile timings"):
+        CM.codebook_seconds_per_vector(bare, "unmeasured")
 
 
 def test_peak_memory_is_the_worst_layer_not_the_sum():

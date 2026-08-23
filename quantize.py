@@ -172,13 +172,26 @@ def _nearest(x: Tensor, codebook: Tensor, chunk: int = 4096) -> tuple[Tensor, Te
 
 
 def fit_scale(
-    x: Tensor, codebook: Tensor, n_steps: int = 24, lo: float = 0.4, hi: float = 2.0
+    x: Tensor, codebook: Tensor, n_steps: int = 24, lo: float = 0.4, hi: float = 2.0,
+    sample: int | None = None, seed_rng: int = 0,
 ) -> float:
     """Scale alpha minimizing ||x - alpha * Q(x/alpha)||^2.
 
     Seeded by matching RMS to the codebook's, then refined by a coarse sweep --
     the objective is not convex in alpha, so a search beats a closed form.
+
+    That sweep is the single most expensive thing in the pipeline: `n_steps`
+    passes of nearest-codeword search over every vector, measured at 83% of
+    `ldlq_quantize`'s time on a real layer.  `sample` caps how many vectors the
+    sweep looks at.  Alpha is one scalar; estimating it from thousands of
+    8-dimensional vectors is already far past the point of diminishing returns,
+    and the vectors not sampled are still quantized with the result.
     """
+    if sample is not None and sample < x.shape[0]:
+        g = torch.Generator(device="cpu").manual_seed(seed_rng)
+        idx = torch.randperm(x.shape[0], generator=g)[:sample].to(x.device)
+        x = x[idx]
+
     rms_x = float(x.square().mean().sqrt())
     rms_c = float(codebook.square().mean().sqrt())
     if rms_x == 0.0:
@@ -344,6 +357,8 @@ def ldlq_quantize_blocks(
     hessians: Tensor | Callable[[int], Tensor],
     *,
     percdamp: float = 0.01,
+    scale: str | float = "per_tile",
+    scale_sample: int = 8192,
 ) -> QuantizedBlocks:
     """`ldlq_quantize` over every tile.
 
@@ -356,6 +371,19 @@ def ldlq_quantize_blocks(
     no benefit, and `n_tiles` is in the hundreds: a Llama-2-7B `down_proj` at
     T=16 wants 119 GiB as a single tensor and 239 MiB one tile at a time.  See
     `experiments/m0_cost_model.py`.
+
+    `scale` decides where alpha comes from:
+
+      "per_tile"   fit it inside every tile -- what the pipeline has always
+                   done, and 83% of its runtime
+      "per_layer"  fit it once from a sample of `scale_sample` vectors drawn
+                   across all tiles, then use it everywhere.  This is what
+                   QuIP# does, and it is the cheapest large saving available:
+                   the sweep stops scaling with the layer.
+      a float      use exactly this, fit nothing
+
+    Fitting once over EVERY vector would save nothing at all -- same total work,
+    differently arranged -- so the saving is in the sampling, not in the sharing.
     """
     if blocks.ndim != 3:
         raise ValueError(f"blocks must be 3-D, got {tuple(blocks.shape)}")
@@ -365,6 +393,18 @@ def ldlq_quantize_blocks(
         raise ValueError(
             f"hessians must be ({n_tiles}, {k}, {k}), got {tuple(hessians.shape)}"
         )
+    if scale == "per_layer":
+        cb = e8p_codebook(blocks.dtype).to(blocks.device)
+        tile_scale = fit_scale(blocks.reshape(-1, E8P_DIM), cb,
+                               sample=scale_sample)
+    elif scale == "per_tile":
+        tile_scale = None
+    elif isinstance(scale, (int, float)):
+        tile_scale = float(scale)
+    else:
+        raise ValueError(f"scale must be 'per_tile', 'per_layer' or a number, "
+                         f"got {scale!r}")
+
     out = torch.empty_like(blocks)
     idxs, scales = [], []
     for t in range(n_tiles):
@@ -373,7 +413,7 @@ def ldlq_quantize_blocks(
             raise ValueError(
                 f"tile {t}: hessian must be ({k}, {k}), got {tuple(h.shape)}"
             )
-        r = ldlq_quantize(blocks[t], h, percdamp=percdamp)
+        r = ldlq_quantize(blocks[t], h, percdamp=percdamp, scale=tile_scale)
         out[t] = r.values
         idxs.append(r.indices)
         scales.append(r.scale)

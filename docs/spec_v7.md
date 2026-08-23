@@ -200,6 +200,19 @@ olmamasından. Ölçüldü (16×64 blok, korelasyonlu Hessian):
 | Gaussian | +17.5% (zarar) | +4.8% (zarar) |
 | kalın kuyruklu | **−61.7%** | **−39.0%** |
 
+**GERÇEK KATMANDA ÖLÇÜLDÜ (2026-08-23).** `layers.0.self_attn.o_proj`, gerçek
+ağırlıklar ve 32,768 gerçek kalibrasyon token'ı, `B=1.5`:
+
+| T | düz | rotasyonlu | değişim | sentetik hattın dediği |
+|---|---|---|---|---|
+| 4 | 0.47422 | 0.09649 | **−79.7%** | −29.5% |
+| 16 | 0.54423 | 0.19530 | **−64.1%** | −31.0% |
+| max | 0.55738 | 0.18655 | **−66.5%** | — |
+
+Sentetik fixture rotasyonun değerini **iki-üç kat eksik ölçmüş**. Mekanizma
+bunu öngörüyordu: fixture'ın kuyruğu gerçek ağırlıklarınki kadar ağır değil.
+`experiments/m0_rotation_value.py`.
+
 Survivor'lar tanım gereği dağılımın kalın kuyruğudur. Rotasyon bu hatta yerini
 bu yüzden hak ediyor — ve maliyeti `log₂(k)/T` olduğu için **ancak büyük `T`'de
 karşılanabilir.** Granülerlik ekseninin ikinci kuvveti budur.

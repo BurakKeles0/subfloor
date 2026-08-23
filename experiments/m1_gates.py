@@ -111,6 +111,7 @@ def run_config(
     quantize: bool = True,
     ldlq: bool = True,
     align: int | None = None,
+    scale: str | float = "per_tile",
     seed: int = 0,
     vq_bits: float = E8P_BITS,
 ) -> dict:
@@ -127,6 +128,11 @@ def run_config(
     transfer pilot needs: it compares a quantized run against an unquantized one
     at EQUAL DENSITY, and letting the alignment differ between them would move
     the realized density and quietly compare two different sparsity levels.
+
+    `scale="per_layer"` fits the quantizer's scale once from a sample instead of
+    once inside every tile.  That sweep is 83% of the pipeline's runtime, so the
+    switch is worth several-fold; it is not the default because the default has
+    to describe what has been measured so far.
     """
     if ldlq and quantize and axis != "B":
         raise NotImplementedError(
@@ -162,6 +168,7 @@ def run_config(
                 rotated.blocks,
                 tile_hessian_stream(
                     problem, cw, Qm if rotate_axis == "index" else None),
+                scale=scale,
             )
         else:
             qb = Qz.quantize_blocks(rotated.blocks)
@@ -196,6 +203,7 @@ def run_config(
         "rotate_axis": rotate_axis,
         "quantize": quantize,
         "ldlq": ldlq,
+        "scale_policy": scale,
         "align": (Qz.E8P_DIM if (quantize and ldlq) else 1) if align is None else align,
         "survivors_per_tile": int(pruned.mask.survivors_per_tile().max()),
         "seed": seed,

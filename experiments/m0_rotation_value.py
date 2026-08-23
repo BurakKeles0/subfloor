@@ -50,7 +50,8 @@ DEFAULT_TILES = (4, 16, Tl.MAX_TILE)
 def build_problem(model_name: str = DEFAULT_MODEL, *, layer: str = DEFAULT_LAYER,
                   n_seqs: int = 16, seqlen: int = 2048, batch: int = 4,
                   dataset: str = "wikitext2", rows: int | None = None,
-                  device: str | None = None,
+                  device: str | None = None, solve_device: str = "cpu",
+                  solve_dtype: torch.dtype = torch.float64,
                   progress=print) -> M.LayerProblem:
     """One real layer, with the Hessian its own calibration data produces.
 
@@ -97,8 +98,17 @@ def build_problem(model_name: str = DEFAULT_MODEL, *, layer: str = DEFAULT_LAYER
         # than over all of them; the run records `rows` so that is never
         # implicit.
         W = W[:rows].contiguous()
+    H = accs[layer].H
+    if solve_device != "cpu" or solve_dtype is not torch.float64:
+        # The pipeline follows its tensors, so moving these two moves everything.
+        # float32 on the GPU is 16-45x faster than float64 on the CPU here and
+        # the quantized weights agree to 5e-08 -- float32's own epsilon.  The
+        # speedup grows with tile size because the codebook search is a big
+        # batched product, which is where a CPU is worst and a GPU best.
+        W = W.to(solve_device, solve_dtype)
+        H = H.to(solve_device, solve_dtype)
     problem = M.LayerProblem.from_statistics(
-        W, accs[layer].H, name=f"{model_name}:layers.0.{layer}",
+        W, H, name=f"{model_name}:layers.0.{layer}",
         n_tokens=accs[layer].n_tokens)
 
     # The model is 13.5 GB and nothing below needs it.
@@ -156,11 +166,13 @@ SYNTHETIC = {4: -0.295, 8: -0.232, 16: -0.310, 32: -0.270}
 def run(model_name: str = DEFAULT_MODEL, *, layer: str = DEFAULT_LAYER,
         budget: float = 1.5, tiles=DEFAULT_TILES, n_seqs: int = 16,
         seqlen: int = 2048, dataset: str = "wikitext2",
-        rows: int | None = None, progress=print) -> dict:
+        rows: int | None = None, solve_device: str = "cpu",
+        solve_dtype: torch.dtype = torch.float64, progress=print) -> dict:
     problem = build_problem(model_name, layer=layer, n_seqs=n_seqs,
                             seqlen=seqlen, dataset=dataset, rows=rows,
+                            solve_device=solve_device, solve_dtype=solve_dtype,
                             progress=progress)
-    rows = compare(problem, budget=budget, tiles=tiles, progress=progress)
+    measured = compare(problem, budget=budget, tiles=tiles, progress=progress)
     return {
         "meta": {
             "utc": datetime.now(timezone.utc).isoformat(),
@@ -169,12 +181,13 @@ def run(model_name: str = DEFAULT_MODEL, *, layer: str = DEFAULT_LAYER,
             "calibration": dataset,
             "n_out": problem.n_out, "n_in": problem.n_in,
             "output_rows_used": rows,
+            "solve_device": solve_device, "solve_dtype": str(solve_dtype),
             "n_tokens": problem.n_tokens,
             "budget": budget,
             "scope": ("layer output error, not perplexity -- speaks to the "
                       "mechanism, not to the headline"),
         },
-        "rows": rows,
+        "rows": measured,
         "synthetic_reference": {str(k): v for k, v in SYNTHETIC.items()},
     }
 
@@ -186,6 +199,8 @@ def _verdict(out: dict) -> None:
               else f" (first {m['output_rows_used']} output rows)")
     print(f"  {m['layer']}  {m['n_out']}x{m['n_in']}{sliced}  "
           f"{m['n_tokens']:,} calibration tokens  B={m['budget']}")
+    print(f"  solved on {m.get('solve_device', 'cpu')} in "
+          f"{m.get('solve_dtype', 'torch.float64').replace('torch.', '')}")
     print(f"    {'T':>5} {'d':>7} {'k':>6} {'plain':>9} {'rotated':>9}"
           f" {'change':>9} {'synthetic':>10}")
     for r in rows:
@@ -231,6 +246,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dataset", default="wikitext2", choices=["wikitext2", "c4"])
     ap.add_argument("--rows", type=int, default=None,
                     help="use only this many output rows (cost is linear in it)")
+    ap.add_argument("--solve-device", default="cpu", choices=["cpu", "cuda"])
+    ap.add_argument("--solve-dtype", default="float64",
+                    choices=["float64", "float32"])
     ap.add_argument("--out", type=Path,
                     default=Path("results/m0_rotation_value.json"))
     args = ap.parse_args(argv)
@@ -238,7 +256,8 @@ def main(argv: list[str] | None = None) -> int:
     tiles = [Tl.MAX_TILE if t == Tl.MAX_TILE else int(t) for t in args.tiles]
     out = run(args.model, layer=args.layer, budget=args.budget, tiles=tiles,
               n_seqs=args.seqs, seqlen=args.seqlen, dataset=args.dataset,
-              rows=args.rows,
+              rows=args.rows, solve_device=args.solve_device,
+              solve_dtype=getattr(torch, args.solve_dtype),
               progress=lambda s: print(s, flush=True))
     _verdict(out)
     args.out.parent.mkdir(parents=True, exist_ok=True)
