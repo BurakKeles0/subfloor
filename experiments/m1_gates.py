@@ -108,6 +108,8 @@ def run_config(
     metric: str = "wanda",
     compensate: bool = True,
     rotate_axis: str | None = "index",
+    rotate_block: int | None = None,
+    hessian_block: int | None = None,
     quantize: bool = True,
     ldlq: bool = True,
     align: int | None = None,
@@ -128,6 +130,14 @@ def run_config(
     transfer pilot needs: it compares a quantized run against an unquantized one
     at EQUAL DENSITY, and letting the alignment differ between them would move
     the realized density and quietly compare two different sparsity levels.
+
+    `rotate_block` and `hessian_block` are the two halves of the block-diagonal
+    proposal (`docs/STATUS.md` section 6.3), and they are separate arguments on
+    purpose.  `rotate_block` confines the rotation; `hessian_block` drops the
+    sub-Hessian couplings that reach past the same width.  Only the second one
+    saves the factorization -- the first is what makes dropping them defensible
+    -- so an experiment that moved them together could not say which of the two
+    cost the quality.
 
     `scale="per_layer"` fits the quantizer's scale once from a sample instead of
     once inside every tile.  That sweep is 83% of the pipeline's runtime, so the
@@ -160,7 +170,8 @@ def run_config(
     W_hat = pruned.W
     if quantize:
         cw = C.compact(pruned.W, pruned.mask)
-        rotated, Qm = (R.rotate(cw, axis=rotate_axis, seed=seed)
+        rotated, Qm = (R.rotate(cw, axis=rotate_axis, seed=seed,
+                                block=rotate_block)
                        if rotate_axis else (cw, None))
         if ldlq:
             # Streamed: at real widths the stacked form is hundreds of GiB.
@@ -169,6 +180,7 @@ def run_config(
                 tile_hessian_stream(
                     problem, cw, Qm if rotate_axis == "index" else None),
                 scale=scale,
+                hessian_block=hessian_block,
             )
         else:
             qb = Qz.quantize_blocks(rotated.blocks)
@@ -201,6 +213,8 @@ def run_config(
         "metric": metric,
         "compensate": compensate,
         "rotate_axis": rotate_axis,
+        "rotate_block": rotate_block,
+        "hessian_block": hessian_block,
         "quantize": quantize,
         "ldlq": ldlq,
         "scale_policy": scale,

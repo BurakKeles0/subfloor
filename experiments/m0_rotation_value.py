@@ -1,25 +1,52 @@
 """M0 -- is the rotation worth what it costs, on a REAL layer?
 
-Everything we know about the rotation's benefit was measured on synthetic
-fixtures: the pipeline numbers (-29.5% at T=4, -31.0% at T=16, plan section I3)
-and the isolated block numbers behind them (-61.7% on a heavy-tailed block,
-+17.5% on a Gaussian one).  Meanwhile the cost is now measured on the real
-thing, and it is the largest single number in the project: rotating per tile
-gives every tile its own basis, every basis its own sub-Hessian factorization,
-and that is what puts M1 at sixty-one days.
+Round one asked whether the rotation earns its place at all, because everything
+we knew about its benefit came from synthetic fixtures while its cost was
+measured on the real thing.  It does, by more than the fixture said: -70.1% mean
+layer output error on `o_proj`, against the fixture's -30.2%.
 
-Paying a structural cost for a synthetic benefit is not a position to run an
-experiment from.  This closes the gap: one real Llama-2-7B layer, real
-calibration activations, the same pipeline, rotation on and off.
+Round two asks what it takes to make the rotation AFFORDABLE, and it has to
+start by correcting the premise `docs/STATUS.md` section 6.3 was written on.
+That section says confining the rotation to blocks would rescue a shared Hessian
+factorization.  It would not.  `rotation.rotate` already shares ONE rotation
+across every tile (`share_across_tiles=True`), so the rotation is not why LDLQ
+factorizes per tile -- the per-tile COLUMN SET is, and no rotation width touches
+that.  Dropping the rotation entirely would leave the k^3 term exactly where it
+is.
+
+What does move it is `quantize.ldlq_quantize(hessian_block=b)`: keep only the
+width-b diagonal blocks of the sub-Hessian and the factorization goes from k^3
+to k*b^2.  Priced on this machine's measured rates, M1 falls from 120 days to
+64, and to 11 with the scale fit sampled as well.  That is an approximation of
+the OBJECTIVE, not of the arithmetic, so it has to be paid for in quality, and
+this is where the bill is read.
+
+The block width belongs on the rotation as well as on the feedback, because the
+couplings the feedback drops are then the ones the rotation never created.  So
+there are three families, kept separate on purpose:
+
+    R{b}    rotation confined to width b, feedback unconstrained
+            -- saves nothing offline; it is the diagnostic that attributes any
+               quality loss to the rotation rather than to the feedback
+    H{b}    rotation full, feedback confined
+            -- the cheapest possible change to the pipeline as it stands
+    RH{b}   both confined
+            -- the coherent proposal
+
+The width sweep is deliberately WIDE rather than eight.  The cost curve flattens
+long before that: b=512 already collects 56 of the 57 days that b=8 would, so
+section 6.3's suggestion would have spent the most quality for the least extra
+saving.  A rotation cannot change the norm of the coordinates it spans, only
+their direction, so at b=8 the spread of eight-group norms is left exactly as it
+was found -- and that spread is what a single E8P scale has to cover.
 
 What it can and cannot settle.  It measures layer output error, not perplexity,
 so it speaks to the mechanism rather than to the headline.  That is enough for
-the decision in front of us -- whether the rotation earns its place at all --
-and not enough to quote anywhere else.
+the decision in front of us -- whether the grid can be run at all -- and not
+enough to quote anywhere else.
 
 Cheap by construction: only block 0 is touched, only the named linear is
-calibrated, and the sub-Hessians are streamed.  `self_attn.o_proj` at T=16 is
-about three minutes per arm on this machine.
+calibrated, and the sub-Hessians are streamed.
 """
 
 from __future__ import annotations
@@ -29,6 +56,7 @@ import gc
 import json
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -119,64 +147,140 @@ def build_problem(model_name: str = DEFAULT_MODEL, *, layer: str = DEFAULT_LAYER
     return problem
 
 
-def compare(problem, *, budget: float = 1.5, tiles=DEFAULT_TILES,
-            seed: int = 0, progress=print) -> list:
-    """Both arms at each tile size, on the same layer and the same Hessian.
-
-    The only difference between the arms is `rotate_axis`; the mask, the
-    density, the compensation and the LDLQ sweep are identical, so the
-    difference is attributable.
-    """
-    rows = []
-    for t in tiles:
-        arms = {}
-        for name, axis in (("rotated", "index"), ("plain", None)):
-            t0 = time.time()
-            r = M.run_config(problem, budget_bits=budget, tile_size=t,
-                             rotate_axis=axis, seed=seed)
-            if "skipped" in r:
-                break
-            arms[name] = r
-            progress(f"  T={t} {name}: rel.err {r['rel_output_error']:.5f}  "
-                     f"snr {r['snr_db']:.2f} dB  ({time.time() - t0:.0f}s)")
-        if len(arms) != 2:
-            continue
-        rot, pln = arms["rotated"], arms["plain"]
-        rows.append({
-            "tile_size": t,
-            "density": rot["density_realized"],
-            "k": rot["survivors_per_tile"],
-            "bits_realized": rot["bits_realized"],
-            "rotated": rot["rel_output_error"],
-            "plain": pln["rel_output_error"],
-            "relative_change": (rot["rel_output_error"] - pln["rel_output_error"])
-            / pln["rel_output_error"],
-            "snr_rotated": rot["snr_db"],
-            "snr_plain": pln["snr_db"],
-        })
-    return rows
-
+#: Widths to sweep.  Chosen off the cost curve rather than off round numbers:
+#: the Cholesky saving is essentially complete by 512, so anything narrower buys
+#: nothing and risks more.  8 is included only because section 6.3 proposed it,
+#: and a suggestion is better refuted with a measurement than with an argument.
+DEFAULT_BLOCKS = (2048, 1024, 512, 128, 8)
 
 #: What the synthetic pipeline measured, for the same budget and tile sizes
 #: (plan section I3).  Recorded here so the comparison is against a number
 #: written down before this run, not one recalled after it.
 SYNTHETIC = {4: -0.295, 8: -0.232, 16: -0.310, 32: -0.270}
 
+#: Round one's measured `full` arm, at `--rows 512 --seqs 16` on cuda/float32.
+#: The `full` arm below is the same computation -- `block=None` degenerates to
+#: `structured_orthogonal` -- so reproducing these is a regression check that
+#: comes free with the sweep, and `_verdict` flags it if it drifts.
+ROUND_ONE = {"4": 0.09648948907852173, "16": 0.1953037828207016,
+             "max": 0.18654577434062958}
+
+
+@dataclass(frozen=True)
+class Arm:
+    """One pipeline configuration.  `None` means unconstrained."""
+    name: str
+    rotate_axis: str | None = "index"
+    rotate_block: int | None = None
+    hessian_block: int | None = None
+
+
+def arms_for(blocks=DEFAULT_BLOCKS, families=("R", "H", "RH")) -> list[Arm]:
+    """The two reference arms, then one arm per family per width.
+
+    `plain` and `full` bracket everything: `plain` is where we would be with no
+    rotation at all, `full` is round one's -70%.  Every constrained arm is read
+    against both, because "does it still beat no rotation" and "how much of the
+    -70% survived" are different questions and one reference cannot answer both.
+    """
+    out = [Arm("plain", rotate_axis=None), Arm("full")]
+    for b in blocks:
+        if "R" in families:
+            out.append(Arm(f"R{b}", rotate_block=b))
+        if "H" in families:
+            out.append(Arm(f"H{b}", hessian_block=b))
+        if "RH" in families:
+            out.append(Arm(f"RH{b}", rotate_block=b, hessian_block=b))
+    return out
+
+
+def cholesky_ratio(k: int, block: int | None) -> float:
+    """Factorization work relative to the unconstrained arm, at this k.
+
+    Reported beside the quality so the trade reads off one row instead of two
+    documents.  It is arithmetic on the kernel LDLQ calls, not a wall-clock
+    measurement of this script: this script forms the full rotated sub-Hessian
+    in every arm, which a production path with a block-diagonal rotation would
+    not need to do.
+    """
+    if block is None or block >= k:
+        return 1.0
+    return sum(min(block, k - o) ** 3 for o in range(0, k, block)) / k ** 3
+
+
+def compare(problem, *, budget: float = 1.5, tiles=DEFAULT_TILES,
+            arms=None, seed: int = 0, progress=print) -> list:
+    """Every arm at each tile size, on the same layer and the same Hessian.
+
+    Nothing varies across arms but `rotate_block` and `hessian_block`: the mask,
+    the density, the compensation and the scale policy are identical, so any
+    difference is attributable to the constraint.
+    """
+    arms = list(arms or arms_for())
+    rows = []
+    for t in tiles:
+        measured = {}
+        for arm in arms:
+            t0 = time.time()
+            r = M.run_config(problem, budget_bits=budget, tile_size=t,
+                             rotate_axis=arm.rotate_axis,
+                             rotate_block=arm.rotate_block,
+                             hessian_block=arm.hessian_block, seed=seed)
+            if "skipped" in r:
+                measured = {}
+                break
+            measured[arm.name] = r
+            progress(f"  T={t} {arm.name:>7}: rel.err {r['rel_output_error']:.5f}"
+                     f"  snr {r['snr_db']:.2f} dB  ({time.time() - t0:.0f}s)")
+        if len(measured) != len(arms):
+            continue
+        plain = measured["plain"]["rel_output_error"]
+        full = measured["full"]["rel_output_error"]
+        k = measured["full"]["survivors_per_tile"]
+        for arm in arms:
+            r = measured[arm.name]
+            err = r["rel_output_error"]
+            rows.append({
+                "tile_size": t,
+                "arm": arm.name,
+                "rotate_block": arm.rotate_block,
+                "hessian_block": arm.hessian_block,
+                "density": r["density_realized"],
+                "k": k,
+                "bits_realized": r["bits_realized"],
+                "rel_output_error": err,
+                "snr_db": r["snr_db"],
+                # Two references, because they answer different questions.
+                "vs_plain": (err - plain) / plain,
+                "vs_full": (err - full) / full,
+                "cholesky_ratio": cholesky_ratio(k, arm.hessian_block),
+            })
+    return rows
+
 
 def run(model_name: str = DEFAULT_MODEL, *, layer: str = DEFAULT_LAYER,
-        budget: float = 1.5, tiles=DEFAULT_TILES, n_seqs: int = 16,
+        budget: float = 1.5, tiles=DEFAULT_TILES, arms=None, n_seqs: int = 16,
         seqlen: int = 2048, dataset: str = "wikitext2",
         rows: int | None = None, solve_device: str = "cpu",
         solve_dtype: torch.dtype = torch.float64, progress=print) -> dict:
+    arms = list(arms or arms_for())
     problem = build_problem(model_name, layer=layer, n_seqs=n_seqs,
                             seqlen=seqlen, dataset=dataset, rows=rows,
                             solve_device=solve_device, solve_dtype=solve_dtype,
                             progress=progress)
-    measured = compare(problem, budget=budget, tiles=tiles, progress=progress)
+    measured = compare(problem, budget=budget, tiles=tiles, arms=arms,
+                       progress=progress)
     return {
         "meta": {
             "utc": datetime.now(timezone.utc).isoformat(),
-            "question": "does the rotation help on a real layer, not a fixture",
+            "question": ("how much of the rotation's -70% survives when the "
+                         "rotation and the LDLQ feedback are confined to "
+                         "width-b blocks -- the only lever that moves the k^3 "
+                         "factorization"),
+            "correction": ("STATUS 6.3 attributes the per-tile factorization "
+                           "to the rotation; the rotation is already shared "
+                           "across tiles, and the per-tile column set is what "
+                           "forces it"),
             "model": model_name, "layer": f"layers.0.{layer}",
             "calibration": dataset,
             "n_out": problem.n_out, "n_in": problem.n_in,
@@ -184,55 +288,82 @@ def run(model_name: str = DEFAULT_MODEL, *, layer: str = DEFAULT_LAYER,
             "solve_device": solve_device, "solve_dtype": str(solve_dtype),
             "n_tokens": problem.n_tokens,
             "budget": budget,
+            "arms": [a.name for a in arms],
             "scope": ("layer output error, not perplexity -- speaks to the "
                       "mechanism, not to the headline"),
         },
         "rows": measured,
         "synthetic_reference": {str(k): v for k, v in SYNTHETIC.items()},
+        "round_one_reference": ROUND_ONE,
     }
 
 
 def _verdict(out: dict) -> None:
     m, rows = out["meta"], out["rows"]
-    print("\n" + "=" * 74)
+    print("\n" + "=" * 78)
     sliced = ("" if m.get("output_rows_used") is None
               else f" (first {m['output_rows_used']} output rows)")
     print(f"  {m['layer']}  {m['n_out']}x{m['n_in']}{sliced}  "
           f"{m['n_tokens']:,} calibration tokens  B={m['budget']}")
     print(f"  solved on {m.get('solve_device', 'cpu')} in "
           f"{m.get('solve_dtype', 'torch.float64').replace('torch.', '')}")
-    print(f"    {'T':>5} {'d':>7} {'k':>6} {'plain':>9} {'rotated':>9}"
-          f" {'change':>9} {'synthetic':>10}")
-    for r in rows:
-        ref = out["synthetic_reference"].get(str(r["tile_size"]))
-        ref_s = "-" if ref is None else f"{ref * 100:+.1f}%"
-        print(f"    {str(r['tile_size']):>5} {r['density']:7.4f} {r['k']:6d}"
-              f" {r['plain']:9.5f} {r['rotated']:9.5f}"
-              f" {r['relative_change'] * 100:+8.1f}% {ref_s:>10}")
 
-    helped = [r for r in rows if r["relative_change"] < 0]
-    print()
-    if not rows:
-        print("  no comparable rows -- nothing to conclude")
-    elif not helped:
-        print("  THE ROTATION DOES NOT HELP HERE.  On this layer it costs error")
-        print("  as well as compute, and the synthetic result did not transfer.")
-    elif len(helped) == len(rows):
-        best = min(rows, key=lambda r: r["relative_change"])
-        print(f"  The rotation helps at every tile size, best {best['relative_change'] * 100:+.1f}%"
-              f" at T={best['tile_size']}.")
-    else:
-        print("  Mixed: the rotation helps at some tile sizes and not others,")
-        print("  so its value is not a property of the layer alone.")
+    tiles = list(dict.fromkeys(r["tile_size"] for r in rows))
+    for t in tiles:
+        here = [r for r in rows if r["tile_size"] == t]
+        print(f"\n  T={t}   k={here[0]['k']}   d={here[0]['density']:.4f}")
+        print(f"    {'arm':>8} {'rel.err':>9} {'vs plain':>9} {'vs full':>9}"
+              f" {'chol':>9}")
+        for r in here:
+            ratio = r["cholesky_ratio"]
+            chol = "1x" if ratio == 1.0 else f"1/{1 / ratio:.0f}"
+            print(f"    {r['arm']:>8} {r['rel_output_error']:9.5f}"
+                  f" {r['vs_plain'] * 100:+8.1f}% {r['vs_full'] * 100:+8.1f}%"
+                  f" {chol:>9}")
 
-    if rows:
-        real = sum(r["relative_change"] for r in rows) / len(rows)
-        refs = [out["synthetic_reference"][str(r["tile_size"])] for r in rows
-                if str(r["tile_size"]) in out["synthetic_reference"]]
-        if refs:
-            print(f"  mean change: real {real * 100:+.1f}% against synthetic "
-                  f"{sum(refs) / len(refs) * 100:+.1f}% at the same tile sizes")
-    print("=" * 74)
+    # Round one IS the `full` arm.  If it moved, something unrelated moved too
+    # and nothing below is safe to read.
+    drift = [(r["tile_size"], abs(r["rel_output_error"] - ref))
+             for r in rows if r["arm"] == "full"
+             for ref in [out["round_one_reference"].get(str(r["tile_size"]))]
+             if ref is not None]
+    if drift:
+        worst = max(drift, key=lambda d: d[1])
+        flag = "" if worst[1] < 1e-6 else "   <-- CHECK, this should be ~0"
+        print(f"\n  round-one reproduction (full arm): worst drift "
+              f"{worst[1]:.2e} at T={worst[0]}{flag}")
+
+    print("\n" + "-" * 78)
+    for fam, label in (("H", "feedback confined, rotation full"),
+                       ("RH", "both confined")):
+        cand = [r for r in rows if r["arm"][:len(fam)] == fam
+                and r["arm"][len(fam):].isdigit()]
+        if not cand:
+            continue
+        print(f"  {fam:>3}  {label}")
+        # Widest width that stays inside 10% of the full rotation at EVERY tile
+        # size and still beats no rotation.  Widest, not best: the cost curve is
+        # flat below ~512, so a narrower width scoring marginally better is
+        # buying nothing.
+        widths = sorted({r["hessian_block"] for r in cand}, reverse=True)
+        held = None
+        for w in widths:
+            at_w = [r for r in cand if r["hessian_block"] == w]
+            if all(r["vs_full"] <= 0.10 and r["vs_plain"] < 0.0 for r in at_w):
+                held = (w, max(r["vs_full"] for r in at_w),
+                        max(r["vs_plain"] for r in at_w))
+                break
+        if held is None:
+            best = min(cand, key=lambda r: r["vs_full"])
+            print(f"       nothing holds within 10% of the full rotation at "
+                  f"every tile size;")
+            print(f"       best single cell is {best['arm']} at T="
+                  f"{best['tile_size']}, {best['vs_full'] * 100:+.1f}%")
+        else:
+            w, vf, vp = held
+            print(f"       holds at b={w}: worst {vf * 100:+.1f}% against full, "
+                  f"{vp * 100:+.1f}% against plain")
+    print("=" * 78)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -241,6 +372,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--layer", default=DEFAULT_LAYER)
     ap.add_argument("--budget", type=float, default=1.5)
     ap.add_argument("--tiles", nargs="*", default=[str(t) for t in DEFAULT_TILES])
+    ap.add_argument("--blocks", nargs="*", type=int, default=list(DEFAULT_BLOCKS),
+                    help="rotation / feedback widths to sweep")
+    ap.add_argument("--families", nargs="*", default=["R", "H", "RH"],
+                    choices=["R", "H", "RH"])
     ap.add_argument("--seqs", type=int, default=16)
     ap.add_argument("--seqlen", type=int, default=2048)
     ap.add_argument("--dataset", default="wikitext2", choices=["wikitext2", "c4"])
@@ -250,11 +385,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--solve-dtype", default="float64",
                     choices=["float64", "float32"])
     ap.add_argument("--out", type=Path,
-                    default=Path("results/m0_rotation_value.json"))
+                    default=Path("results/m0_rotation_blocks.json"))
     args = ap.parse_args(argv)
 
     tiles = [Tl.MAX_TILE if t == Tl.MAX_TILE else int(t) for t in args.tiles]
     out = run(args.model, layer=args.layer, budget=args.budget, tiles=tiles,
+              arms=arms_for(tuple(args.blocks), tuple(args.families)),
               n_seqs=args.seqs, seqlen=args.seqlen, dataset=args.dataset,
               rows=args.rows, solve_device=args.solve_device,
               solve_dtype=getattr(torch, args.solve_dtype),

@@ -262,3 +262,102 @@ def test_index_overhead_falls_as_tile_grows():
     d, n_idx = 0.5, 11008
     ratios = [R.index_axis_overhead_ratio(t, d, n_idx) for t in (1, 2, 4, 8, 16, 32)]
     assert all(a > b for a, b in zip(ratios, ratios[1:]))
+
+
+# --------------------------------------------------------------------------- #
+# BLOCK-DIAGONAL ROTATION  (docs/STATUS.md section 6.3)
+# --------------------------------------------------------------------------- #
+# The proposal there is stated as "constrain the rotation to groups of eight so
+# a shared Hessian factorization survives".  Half of that is a misreading of our
+# own code: `rotate` already shares ONE rotation across every tile
+# (`share_across_tiles=True`), so the rotation is not why LDLQ factorizes per
+# tile -- the per-tile column set is, and no rotation width changes that.
+#
+# What a block width does buy is that dropping the sub-Hessian's off-block
+# couplings becomes defensible, because they are the couplings the rotation
+# never created.  These tests pin the rotation half; the factorization half is
+# in `test_quantize.py`.
+
+BLOCK_WIDTHS = [8, 16, 32, 64]
+
+
+@pytest.mark.parametrize("block", BLOCK_WIDTHS)
+def test_block_diagonal_rotation_is_orthogonal_and_confined(block):
+    Q = R.block_diagonal_orthogonal(64, block, seed=1, dtype=DT)
+    assert torch.allclose(Q @ Q.T, torch.eye(64, dtype=DT), atol=1e-12)
+    for off, width in R.block_partition(64, block):
+        outside = torch.ones(64, dtype=torch.bool)
+        outside[off:off + width] = False
+        assert not Q[off:off + width][:, outside].any()
+
+
+def test_block_partition_covers_every_coordinate_exactly_once():
+    """A ragged tail is left short rather than padded.  Survivor counts are
+    multiples of eight and so is every width we use, so the tail is a multiple
+    of eight too -- which is what keeps a block boundary out of a codeword."""
+    for n, block in [(64, 8), (64, 64), (20, 8), (2944, 512), (2560, 128)]:
+        parts = R.block_partition(n, block)
+        assert sum(w for _, w in parts) == n
+        assert [o for o, _ in parts] == [0] + [
+            sum(w for _, w in parts[:i]) for i in range(1, len(parts))
+        ]
+        assert max(w for _, w in parts) <= block
+
+
+def test_block_diagonal_rotation_degenerates_to_the_full_one():
+    """`block >= n` is the unconstrained arm, so a sweep over widths can include
+    it without a special case -- and the sweep's endpoint is then provably the
+    same rotation the -70% measurement used."""
+    assert torch.equal(R.block_diagonal_orthogonal(32, 32, seed=2, dtype=DT),
+                       R.structured_orthogonal(32, 2, dtype=DT))
+    assert torch.equal(R.block_diagonal_orthogonal(32, 99, seed=2, dtype=DT),
+                       R.structured_orthogonal(32, 2, dtype=DT))
+
+
+@pytest.mark.parametrize("block", BLOCK_WIDTHS)
+@pytest.mark.parametrize("tile_size", [2, 8, T.MAX_TILE])
+def test_block_rotation_still_preserves_the_frozen_mask(block, tile_size):
+    """H1 does not weaken under the constraint: a block-diagonal rotation is a
+    special case of an orthogonal one, and the block still spans exactly the
+    tile's index set."""
+    W = torch.randn((N_OUT, N_IN), dtype=DT)
+    m = _mask("B", tile_size)
+    cw = C.compact(W, m)
+    rot, _ = R.rotate(cw, axis="index", seed=5, block=block)
+    assert torch.equal(C.scatter(rot) != 0, m.expand())
+
+
+@pytest.mark.parametrize("block", BLOCK_WIDTHS)
+def test_block_rotate_unrotate_is_identity(block):
+    W = torch.randn((N_OUT, N_IN), dtype=DT)
+    cw = C.compact(W, _mask("B", 8))
+    rot, Q = R.rotate(cw, axis="index", seed=3, block=block)
+    back = R.unrotate(rot, Q, axis="index")
+    assert torch.allclose(back.blocks, cw.blocks, atol=1e-12)
+
+
+def test_narrower_rotation_mixes_less():
+    """The thing the constraint actually gives up.  A rotation cannot change the
+    norm of the coordinates it spans, only their direction, so a width-8
+    rotation leaves the spread of eight-group norms exactly as it found it --
+    and that spread is what one E8P scale has to cover."""
+    torch.manual_seed(0)
+    x = torch.randn(4, 512, dtype=DT)
+    x[:, ::64] *= 30.0                                # a few heavy coordinates
+    groups = lambda v: v.reshape(-1, 8).square().sum(dim=1)
+    spread = lambda v: float(groups(v).std() / groups(v).mean())
+
+    before = spread(x)
+    narrow = spread(x @ R.block_diagonal_orthogonal(512, 8, 0, DT).T)
+    wide = spread(x @ R.block_diagonal_orthogonal(512, 512, 0, DT).T)
+    assert narrow == pytest.approx(before, rel=1e-12)   # invariant, exactly
+    assert wide < 0.5 * before
+
+
+@pytest.mark.parametrize("block", [8, 64, 512])
+def test_inference_overhead_follows_the_block_width(block):
+    """log2(b)/T rather than log2(k)/T.  Real, but small -- log2 of anything is.
+    The block width earns its keep offline, not here."""
+    got = R.index_axis_overhead_ratio(16, 0.7188, 4096, block=block)
+    assert got == pytest.approx(math.log2(block) / 16, rel=1e-12)
+    assert got < R.index_axis_overhead_ratio(16, 0.7188, 4096)

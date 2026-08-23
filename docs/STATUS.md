@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-23. Testler: **452 geçiyor, 5 atlanıyor.**
+> Son güncelleme: 2026-08-23. Testler: **502 geçiyor, 5 atlanıyor.**
 
 ---
 
@@ -14,7 +14,8 @@ içinde) ve rotasyonun katman düzeyindeki değeri (**−70%**). M0'ın uçuş-�
 kalemlerinin dördü kapandı (`vq_bits`, Kapı B'nin gücü, transfer pilotu,
 maliyet modeli). **Ama sıkıştırılmış modelin perplexity'si hâlâ hiç ölçülmedi**
 — Kapı A'nın ve Kapı B'nin tek bir gerçek verisi yok. Ve önümüzdeki asıl engel
-bilimsel değil, **hesaplama maliyeti**: M1 bu makinede 120 gün.
+bilimsel değil, **hesaplama maliyeti**: M1 bu makinede 94 gün, ve
+baskın terim sanılan yerde değil (§6.4).
 
 ---
 
@@ -72,6 +73,9 @@ düşerken B ayakta kalabilir, ve o durumda çerçeve daralır, proje durmaz.
 | **Rotasyonun değeri (gerçek katman)** | `o_proj`, gerçek ağırlıklar + 32,768 gerçek token: **−70.1% ortalama** (§5) |
 | **Kafes çözücünün taramaya denkliği** | `nearest_e8p` ile kaba kuvvet, dört ölçekte **birebir aynı indeks** |
 | **Akıtılan alt-Hessian'ın yığılmışa denkliği** | Bit-birebir aynı çıktı |
+| **Blok genişliğinin kaliteye etkisi** | `o_proj`, 51 kol, 5 genişlik × 3 aile × 3 tile. Geri besleme 512'de daraltılınca kalite **iyileşiyor**, rotasyon daraltılınca bozuluyor (§5.9) |
+| **`hessian_block=b`'nin ne yaptığı** | Hessian'ın blok-köşegen parçasına karşı LDLQ'ya **tam denk**; hiçbir hata blok sınırını geçmiyor (testle sabitlendi) |
+| **Maliyet modelinin Cholesky eğrisi** | k'ye bağlı, ölçülmüş, iki kernel de ısıtılarak. Model bir tile'ın gerçek süresini artık hiç uydurulmadığı bir genişlikte (k=7912) %14 içinde tahmin ediyor |
 
 ### Varsayım — doğrulanmadı
 
@@ -118,6 +122,8 @@ geçiyor — **ama veriyi biz ürettik, bu tez lehine kanıt değil.**
 | Hat **cuda/float32**'ye taşındı | 08-23 | Uçtan uca **16–45×**, ağırlık farkı 5e-08 — float32'nin kendi epsilon'u düzeyinde |
 | **Katman-başı ölçek reddedildi** | 08-23 | Ölçüldü: **%11 kalite kaybı** ve bu ölçekte hız kazancı yok. %70'lik bir etkiyi ölçerken hatta %11 bozulma sokmak ölçümü kirletirdi. Politika kodda duruyor (`scale=`), M1 için bir kaldıraç, bu deney için yanlış araç |
 | **E8 kafes çözücü** kaba kuvvetin yerine | 08-23 | Baskın terim buydu. CPU 3.51×, GPU 1.87×, çıktı birebir aynı |
+| **`hessian_block=512`**, rotasyon tam genişlikte | 08-23 | Ölçüldü: geri beslemeyi 512'ye daraltmak her tile boyutunda kaliteyi **iyileştiriyor** (−11 / −23 / −16%), rotasyonu daraltmak bozuyor (+43 / +38 / +44%). Bedava alınan kalite; hız katkısı ikincil (§5.9) |
+| Maliyet modelinin Cholesky eğrisi **ölçülerek düzeltildi** | 08-23 | Isınmayan benchmark + k'ye bağımlılık, birlikte 9.4× fazla yazıyordu. M1 120 → 94 gün. Bu sayı M1'in koşulup koşulmayacağını söyleyen sayı (§6.4) |
 
 ---
 
@@ -203,6 +209,48 @@ argmin değil, argmin'den ayrılamayanların kümesi. Duman testinde Kapı B
 "interior" derken küme `{2, 4, 8, 16}` — dürüst manşet "T=16 optimal" değil,
 "optimum içeride, yeri 2–16 arasında".
 
+### 5.9 Daraltılabilen şey geri besleme, rotasyon değil
+
+§6.3'ün "rotasyonu 8'lik gruplara blok-köşegen kısıtla" önerisi iki yönden
+yanlış çıktı ve ölçüm ikisini de düzeltti.
+
+**Önce öncül.** `rotate` zaten `share_across_tiles=True` ile **tek bir
+rotasyonu bütün katmana** uyguluyor. Yani rotasyon, LDLQ'nun tile başına
+faktorize etmesinin sebebi değil — sebep tile başına farklı sütun kümesi, ve
+onu hiçbir rotasyon genişliği değiştirmiyor. Rotasyonu tamamen atsak `k³`
+terimi yerinde durur.
+
+**Sonra genişlik.** Maliyet eğrisi 512'de düzleşiyor; 512'den 8'e inmek toplam
+tasarrufun %1.9'unu ekliyor ama atılan Hessian bağlantısını 64 katına çıkarıyor.
+8, en az kazanç için en çok kaliteyi harcayan noktaydı.
+
+Ölçüm (`o_proj`, 512 satır, 32,768 token, B=1.5), `full`'e karşı:
+
+| genişlik | R (rotasyon daraltıldı) | H (geri besleme daraltıldı) |
+|---|---|---|
+| 2048 | +12.8 / +12.8 / +22.3% | −8.6 / −9.2 / −2.0% |
+| 1024 | +25.3 / +13.4 / +23.5% | −7.1 / −16.7 / −6.8% |
+| **512** | +43.0 / +38.1 / +44.3% | **−11.1 / −23.4 / −15.8%** |
+| 128 | +117 / +69 / +95% | +13.4 / −20.6 / −11.7% |
+| 8 | +375 / +169 / +192% | +147 / +49 / +57% |
+
+*(üç sayı = T=4 / T=16 / T=max)*
+
+**`H512` her tile boyutunda bütün ızgaranın en iyi kolu** — hem tam rotasyondan
+hem düz yuvarlamadan iyi, ve Cholesky'nin 1/25–1/36'sı. `R8` neredeyse
+rotasyonsuza eşit (−3.3%): rotasyonu daraltmak mekanizmayı yok ediyor.
+
+Mekanizma iki tarafta da tutarlı. Rotasyonun işi §5.3'te kurulduğu gibi kalın
+kuyruğu **olabildiğince geniş** yaymak; 8 koordinat içinde döndürmek o
+koordinatların normunu değiştiremez, yalnızca yönünü — ve tek E8P ölçeğinin
+kapsaması gereken şey tam da gruplar arası norm yayılımı. Geri besleme tarafında
+ise 2560×2560'lık alt-Hessian 32,768 token'dan kestiriliyor; uzun menzilli
+bağlantılar gürültülü, onları atmak düzenlileştirme gibi davranıyor.
+
+**Sonuç: rotasyon tam genişlikte kalır, geri besleme 512'ye daraltılır.** Ama
+kazanç hız değil kalite — §6.4'ün düzeltmesinden sonra Cholesky zaten pasın
+%10'u, yani bu M1'in 94 gününden 8 gün götürüyor.
+
 ### 5.7 VENOM'un `V`'si bizim `T`'miz
 
 V:N:M formülü VENOM'dan dolduruldu ve yapısal bir şey çıktı: VENOM `V` satırın
@@ -226,18 +274,20 @@ iyimser yönde yanılttı, §6.2).
 
 ### 6.1 Bugünkü tablo (cuda/float32, bir sıkıştırma geçişi)
 
-| T | toplam | codebook | cholesky |
-|---|---|---|---|
-| 1 | 12.6 h | 7.7 h | 4.8 h |
-| 4 | **38.0 h** | 19.3 h | 18.7 h |
-| 16 | 16.6 h | 9.5 h | 7.1 h |
-| max | 7.6 h | 7.5 h | ~0 |
+**Bu tablo 08-23'te düzeltildi ve önceki hâli yanlıştı — detay §6.4.**
 
-**M1 (3 bütçe × 7 tile × 5 çekiliş): 120 gün.** Örneklenmiş ölçekle 68 gün.
-`τ` süpürmesi: **33 gün** (spec 25 *saat* diyordu).
+| T | toplam | codebook | rotasyon | cholesky |
+|---|---|---|---|---|
+| 1 | 12.5 h | 10.0 h | 0.46 h | 1.96 h |
+| 4 | **29.9 h** | 25.0 h | 1.92 h | 2.96 h |
+| 16 | 13.6 h | 12.0 h | 0.72 h | 0.85 h |
+| max | 7.9 h | 7.9 h | 0 | 0 |
 
-Cholesky `(n_out/T)·k³` olduğu için **ızgaranın ince ucunda yoğunlaşıyor** —
-yani granülerlik tezinin en çok veriye ihtiyaç duyduğu bölge, en pahalı bölge.
+**M1 (3 bütçe × 7 tile × 5 çekiliş): 94 gün.** `τ` süpürmesi: **29 gün**
+(spec 25 *saat* diyordu).
+
+**Baskın terim Cholesky değil, codebook taraması** — ve içindeki `fit_scale`
+süpürmesi. Cholesky pasın %10'u; ölçek uydurmayı düşürmek %70'ini götürüyor.
 `affordable()` bir zaman bütçesine neyin sığdığını hesaplıyor ve `T=1` ile
 `T=max`'ı asla düşürmüyor (onlar kapının tanımı).
 
@@ -264,21 +314,45 @@ taramaları hızlı yolda, LDLQ'nun grup-başı çağrıları taramada.
 
 ### 6.3 Kalan duvar ve seçenekler
 
-**Cholesky yapısal.** Her tile'ın kendi sütun kümesi + kendi rotasyonu var,
-dolayısıyla kendi alt-Hessian'ını faktorize etmesi gerekiyor. `T=1`'de bu
-**satır başına** bir faktorizasyon — SparseGPT'nin var oluş sebebi olan
-"row Hessian challenge"ı birebir yeniden üretiyoruz.
+**Duvar ölçek uydurma, Cholesky değil.** Bir tile'ın `ldlq_quantize` çağrısı
+önce `fit_scale`'i koşuyor, o da 24 aday ölçeği tile'ın **bütün** vektörleri
+üzerinde tarıyor — pasın %84'ü. Faktorizasyon %10.
 
-Rotasyon artık vazgeçilemez olduğuna göre (§5.1) geriye iki seçenek kalıyor:
-
-| seçenek | beklenen | durum |
+| seçenek | ölçülen | durum |
 |---|---|---|
-| Rotasyonu **8'lik gruplara blok-köşegen** kısıtla → paylaşılan Hessian faktorizasyonu kurtulur | Cholesky terimi çöker | **ÖLÇÜLMEDİ.** Incoherence processing'in ne kadarının hayatta kaldığı açık. Ucuz sınanır: `m0_rotation_value.py`'ye üçüncü bir kol |
-| Donanım kirala | A100/H100 fp32 lineer cebirde ~10–20× | Birkaç yüz dolar |
+| `hessian_block=512` — geri beslemeyi blok-köşegen yap | M1 94 → **86 gün**, ve kalite **iyileşiyor** (§5.9) | **ÖLÇÜLDÜ, alınmalı.** Bedava; tek gerekçesi artık hız değil kalite |
+| Tile-başı `fit_scale`'i küçük örnekle | Tavan: M1 94 → **28 gün** | **KALİTE ETKİSİ ÖLÇÜLMEDİ** — bir sonraki iş |
+| Donanım kirala | A100/H100 fp32'de ~10–20× | Birkaç yüz dolar |
 
-**`fit_scale`'i örneklemek** ayrı bir kaldıraç (6×) ama ölçülmüş bir kalite
-bedeli var: katman-başı ölçek %11 kötü. Doğrusu tile-başı ölçeği *örneklemek* —
-`fit_scale(sample=N)` kodda var, **kalite etkisi ölçülmedi**.
+**Ölçek örneklemesi hakkında bir düzeltme.** Bu belge daha önce "68 gün =
+örneklenmiş ölçek" diyordu; öyle değil. `scale_fit=False` ölçeği **tamamen**
+kaldırmayı fiyatlıyor, bir **tavan**. `fit_scale(sample=N)` bir tile'ın sahip
+olduğundan fazla vektöre bakamaz ve B=1.5'te tile başına vektör sayısı T=1'de
+128, T=4'te 1,280, T=16'da 5,888 — varsayılan 8,192 sınırının **altında**. Yani
+varsayılan örnekleme, maliyetin yaşadığı her tile boyutunda **tam olarak
+etkisiz**; yalnızca zaten en ucuz sütun olan T=max'te ısırıyor. Isıracak
+sınırlar (≈256) yeterince küçük ki kalite bedeli varsayılamaz, ölçülmeli.
+Kontrol koda girdi: `m0_cost_model.scale_sample_bites`.
+
+### 6.4 Maliyet modelinin dördüncü hatası — ve ilk kez kötümser olanı
+
+08-23'te ölçüldü: modelin Cholesky terimi gerçek genişliklerde **9.4×** fazla
+yazıyordu. İki bağımsız sebep birleşiyordu:
+
+- `cholesky_rate()` yalnız `torch.linalg.cholesky`'yi ısıtıyor, `cholesky_inverse`'ü
+  ısıtmıyordu; ilk ölçülen tekrar cuSOLVER handle kurulumunu ödüyordu → **1.6×**
+- Tek bir flop/s sayısı bu çekirdeği tanımlamıyor. k=1024'te kart dolmuyor,
+  k=8192'de neredeyse doluyor; etkin hız 5.7e11 → 3.8e12, yani **6.8×** değişiyor.
+  k=2048'de ölçülen hızı her genişliğe uygulamak en geniş katmanları **2.6×**
+  fazla yazıyordu — ve `down_proj` T=16'da k=7912
+
+İkisi de düzeltildi (`CHOL_TIMINGS`, k'ye bağlı ölçülen eğri). Ayrıca Cholesky
+küçülünce **rotasyonun kendisi ondan büyük hâle geldi** (k=7912'de 0.25s'e karşı
+0.22s), o yüzden `q @ H_t @ q.T` de artık ayrı bir kalem (`ROT_TIMINGS`).
+
+Bu, modelin dördüncü hatası ve **ilk kez iyimser değil kötümser** olanı. Önemi:
+bu sayı M1'in koşulup koşulmayacağını söyleyen sayı. 120 gün diyordu, doğrusu
+94.
 
 ---
 
@@ -286,14 +360,21 @@ bedeli var: katman-başı ölçek %11 kötü. Doğrusu tile-başı ölçeği *ö
 
 ### Bir sonraki oturumun ilk işi
 
-**Blok-köşegen rotasyonu sına.** §6.3'ün tek ölçülmemiş seçeneği, ve tutarsa
-hem maliyeti hem donanım bağımlılığını birlikte çözüyor. `m0_rotation_value.py`
-zaten iki kol koşuyor; üçüncü kol eklemek küçük iş, GPU'da ~3 dakika.
+**Tile-başı `fit_scale` örneklemesinin kalite bedelini ölç.** Maliyetin %84'ü
+orada ve tavanı M1'i 94 günden 28'e indiriyor — kalan tek büyük kaldıraç bu.
+Kurulum hazır: `m0_rotation_value.py`'nin kol yapısı aynen kullanılabilir,
+`sample ∈ {2048, 512, 256, 128}` süpürülür. Dikkat: örnekleme ancak tile'ın
+vektör sayısından küçük sınırlarda ısırıyor (§6.3), o yüzden süpürme küçük
+sayılarda olmalı. Bir de `fit_scale`'in `n_steps=24`'ü var — 24 aday ölçek,
+hiç sorgulanmadı; 8 aday muhtemelen aynı α'yı buluyor ve 3× getiriyor.
+
+`ldlq_quantize(..., scale_sample=N)` için tile-başı yolda **tesisat henüz yok**
+— `scale_sample` şu an yalnız `per_layer` dalında kullanılıyor. Küçük iş.
 
 ### Ön-kaydı dondurmak için kalan iki kutu
 
 İkisi de `tau_sweep.py`'ye bağlı: **`Δ(T)` tahmin eğrisi** ve **`T*_tahmin`**.
-Süpürme 33 gün olduğu için ikisi de bloke. Maliyet düşmeden ön-kayıt donmaz,
+Süpürme 29 gün olduğu için ikisi de bloke. Maliyet düşmeden ön-kayıt donmaz,
 ön-kayıt donmadan M1 başlamaz.
 
 ### Sonra
@@ -311,7 +392,9 @@ Süpürme 33 gün olduğu için ikisi de bloke. Maliyet düşmeden ön-kayıt do
   quantization/maske hatası ayrımı, hizalama
 - **Attention koordinasyonu formülü** — `v_proj`↔`o_proj`, GQA, RoPE çiftleri;
   `T=max` için sert kısıt, hâlâ yalnızca ima edilmiş
-- **`fit_scale` örneklemesinin kalite etkisi** — kod var, ölçüm yok
+- **`fit_scale` örneklemesinin kalite etkisi** — §7'nin ilk işi; tile-başı yol
+  için tesisat da yazılacak (`scale_sample` şu an yalnız `per_layer`'da)
+- **`fit_scale(n_steps=24)`** — aday ölçek sayısı hiç sorgulanmadı
 
 ---
 
@@ -329,9 +412,13 @@ altı" motivasyonu zayıflar.
 büyük çıkar ve *hangi* granülerlik sorusu cevapsız kalır. Başarısızlık değil
 ama manşeti zayıflatır.
 
-**Maliyet.** 120 gün bir dizüstünde koşulamaz. §6.3 çözülmezse proje ya donanım
-kiralamaya ya da ızgarayı daraltmaya mecbur — ve daraltmak tam da kanıtın
-olduğu yeri budar.
+**Maliyet.** 94 gün bir dizüstünde koşulamaz. Ölçek kaldıracı tutarsa 28 güne
+iner ve kiralık bir A100'de günlere; tutmazsa proje ya donanım kiralamaya ya da
+ızgarayı daraltmaya mecbur — ve daraltmak tam da kanıtın olduğu yeri budar.
+
+**Maliyet modeli dört kez yanıldı.** Üçü iyimser, sonuncusu kötümser yöndeydi
+(§6.4). Bu belgedeki her gün rakamı ölçülmüş bir eğriye dayanıyor ama eğriler
+bu makineye ait; başka donanımda yeniden ölçülmeli.
 
 **Sentetik σ.** Kapı B'nin gücü ve transfer toleransı sentetik katmandan
 ölçüldü. Gerçeği ilk M1 bütçesinden gelecek; ön-kayıt §7.4'ün uyarlanabilir
@@ -380,14 +467,14 @@ kontrolü bunun için var.
 | `experiments/m0_gate_b_power.py` | Kapı B'nin gücü + hattın gürültüsü |
 | `experiments/m0_transfer_pilot.py` | `Δ = Q + τ` transfer sapması → tolerans |
 | `experiments/m0_cost_model.py` | ölçülen tile sürelerinden gerçek koşu maliyeti |
-| `experiments/m0_rotation_value.py` | rotasyon gerçek katmanda kazandırıyor mu |
+| `experiments/m0_rotation_value.py` | rotasyon gerçek katmanda kazandırıyor mu; blok genişliği süpürmesi |
 
 **Belgeler:** `spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı** — iki kutu kaldı) · `audit.md` (v6 denetimi, tarihsel kayıt) ·
 `gate_a_dry_run.md` (literatür provası) · bu belge.
 
 ```bash
-python -m pytest tests/ -q                         # 452 test, ~75 s
+python -m pytest tests/ -q                         # 502 test, ~85 s
 HF_HUB_DISABLE_XET=1 python experiments/m0_dense_ppl.py --seqlens 2048 4096 --device cuda
 HF_HUB_DISABLE_XET=1 python -u experiments/m0_rotation_value.py \
     --tiles 4 16 max --seqs 16 --rows 512 --solve-device cuda --solve-dtype float32
@@ -422,6 +509,8 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `baa38a7` | Bellek duvarı kapandı, iki yükleyici hatası düzeldi, `fit_scale` modele girdi |
 | `31f9761` | **Rotasyon gerçek katmanda −70%**; hat GPU'ya taşındı |
 | `0201f93` | E8 kafes çözücü: CPU 3.5×, GPU 1.9×, çıktı birebir aynı |
+| `f425880` | Bu belge, bilinenin etrafında yeniden yazıldı |
+| *(bu oturum)* | Blok genişliği süpürmesi: **geri besleme daraltılır, rotasyon daraltılmaz**; maliyet modelinin Cholesky eğrisi düzeltildi (120 → 94 gün) |
 
 ---
 

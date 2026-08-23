@@ -6,27 +6,42 @@ anything is committed.  This checks it -- and the answer is not the one the
 question expected, because the sweep is not the first thing that stops working.
 
 Everything here rests on constants measured ON THIS MACHINE, not on peak
-figures.  Two kernels dominate and both are benchmarked at the sizes they will
-actually be called at:
+figures.  Three terms are charged, each from its own measured curve:
 
+  codebook   the nearest-codeword search and the scale sweep in front of it
+  rotation   `q @ H_t @ q.T`, once per tile
   cholesky   the per-tile sub-Hessian factorization LDLQ needs, O(k^3) per tile
-  codebook   the nearest-codeword search, a [rows, 8] x [8, 65536] product per
-             group of eight coordinates
 
-The profile at a small synthetic size says LDLQ is 99.7% of the pipeline and the
-codebook search is nearly all of that -- but `k` is small there, and the
-factorization grows as `k^3` while the search grows as `k`.  At real widths they
-end up the same order, which is why both are modelled rather than one.
+They are listed in that order because that is their size, and it took four
+corrections to find out.  The factorization LOOKS like it should dominate --
+it is the only cubic term -- and for a while the model said it did.  It does
+not: at B=1.5, T=4 the pass is 25.0 hours of codebook against 2.96 of Cholesky
+and 1.92 of rotation.  Confining the factorization to blocks
+(`quantize.ldlq_quantize(hessian_block=...)`) is worth 9% of M1; dropping the
+per-tile scale fit is worth 70%.
 
-The first version of this file modelled one codebook search per group and was
-wrong by six times: `ldlq_quantize` runs `fit_scale` first, and that sweeps 24
-candidate scales searching the whole tile at each.  Measured directly on an
-o_proj-shaped tile it is 83% of the tile's time.  It is in the model now, and
-switchable, because it is also the cheapest thing in the pipeline to remove --
-QuIP# fits one scale per layer, not one per tile.
+The corrections, in order, because each one is a way this file was wrong:
 
-The third quantity is memory, and it is the one that bites first: `tile_hessians`
-materializes [n_tiles, k, k] in one tensor.
+  1. it omitted `fit_scale` entirely -- 6x too low.  `ldlq_quantize` sweeps 24
+     candidate scales over the whole tile before it quantizes anything.
+  2. it priced the codebook search at a rate measured for SIXTEEN rows in a
+     tight loop, where the codebook stays in cache.  Real calls interleave with
+     Hessian updates that evict it.  Fixed by measuring END-TO-END tile times.
+  3. it charged one per-weight constant for every tile size, when the constant
+     falls threefold with the line count -- overstating the coarse end, which is
+     the end the granularity question is about.
+  4. it charged every width the Cholesky rate measured at k=2048, from a
+     benchmark that warmed `cholesky` but not `cholesky_inverse`.  9.4x too HIGH
+     at real widths, and this one mattered most: it is the number that says
+     whether M1 can be run, and it read 120 days when the answer is 94.
+
+The through-line is that composing a cost from kernel microbenchmarks does not
+work here.  Where a curve is measured, it is measured at the sizes the code will
+call it at, and the residual is fitted against a pipeline timing rather than
+assumed.
+
+The remaining quantity is memory, and it is the one that bites first:
+`tile_hessians` materializes [n_tiles, k, k] in one tensor.
 
 The model is deliberately made of separable pieces so the levers are visible:
 device and dtype move the rates, streaming the sub-Hessians moves the memory,
@@ -76,17 +91,27 @@ E8P_DIM = Qz.E8P_DIM
 #: LAYER, and a per-tile scale buys little while costing this.  Left in the
 #: model as a measured multiplier rather than quietly assumed away, with
 #: `--no-scale-fit` to price the alternative.
+#:
+#: READ `scale_fit=False` AS A CEILING, NOT AS A PLAN.  It prices removing the
+#: per-tile fit altogether -- a fixed scale, or `scale="per_layer"`.  It does
+#: NOT price `fit_scale(sample=N)`, which is the option `docs/STATUS.md` names,
+#: and the two are not close: the sweep only looks at the vectors a tile HAS, so
+#: capping it at N does nothing to a tile with fewer than N.  At B=1.5 a tile
+#: holds 128 vectors at T=1, 1,280 at T=4 and 5,888 at T=16, against a default
+#: cap of 8,192 -- so per-tile sampling at that cap is a no-op at exactly the
+#: tile sizes where the cost lives, and only bites at T=max, already the
+#: cheapest column.  `scale_sample_bites` is the check; the caps that would
+#: bite are small enough that their quality cost has to be measured rather than
+#: assumed.
 SCALE_FIT_MULTIPLIER = 6.0
 
 #: END-TO-END per-tile wall times measured on this machine: (k, lines, seconds).
 #: One `ldlq_quantize` call each, at o_proj-shaped widths.
 #:
-#: These exist because composing the cost from kernel microbenchmarks was wrong
-#: twice, both times optimistically.  First it omitted `fit_scale` entirely.
-#: Then, with `fit_scale` in, it priced the codebook search at the rate measured
-#: for SIXTEEN rows in a tight loop -- where the codebook stays in cache across
-#: repetitions -- when the real calls interleave with Hessian updates that evict
-#: it.  A microbenchmark measures a kernel; this measures the pipeline.
+#: A microbenchmark measures a kernel; this measures the pipeline.  Corrections
+#: 1-3 in the module docstring are all here.  Note what these DO NOT include:
+#: `ldlq_quantize` alone, so the sub-Hessian rotation is charged separately
+#: (`ROT_TIMINGS`) and is not double counted in the fitted constant.
 #: Re-measured 2026-08-23 after `quantize.nearest_e8p` replaced the brute-force
 #: scan where it pays.  The scan numbers it supersedes, for the record:
 #:   cpu_f64  (2560,4,4.49) (2944,16,29.26) (3072,128,266.04)
@@ -94,6 +119,40 @@ SCALE_FIT_MULTIPLIER = 6.0
 TILE_TIMINGS = {
     "cpu_f64": ((2560, 4, 1.741), (2944, 16, 8.721), (3072, 128, 95.83)),
     "cuda_f32": ((2560, 4, 0.247), (2944, 16, 0.454), (3072, 128, 2.309)),
+}
+
+#: Seconds for ONE `quantize._upper_inverse_factor` call, measured on this
+#: machine with both kernels warmed: (k, seconds).
+#:
+#: A single flop/s number does not describe this kernel.  A Cholesky at k=1024
+#: cannot fill the card; at k=8192 it nearly does, and the effective rate runs
+#: 5.7e11 to 3.8e12 across that range -- a factor of 6.8.  Charging every width
+#: the rate measured at k=2048 overstated the widest layers by 2.6x, on top of
+#: the 1.6x the missing warmup cost, and `down_proj` at T=16 has k=7912.
+#:
+#: This is the fourth time this model has been wrong and the first time it was
+#: wrong PESSIMISTICALLY -- which is worse than it sounds, because this is the
+#: number that decides whether M1 gets run at all.
+CHOL_TIMINGS = {
+    "cuda_f32": ((1024, 0.003143), (2048, 0.010045),
+                 (4096, 0.045681), (8192, 0.238243)),
+    "cpu_f64": ((1024, 0.008980), (2048, 0.069634),
+                (4096, 0.418345), (8192, 3.196408)),
+}
+
+#: Seconds for ONE `q @ H_t @ q.T` -- rotating a tile's sub-Hessian into the
+#: block's basis, which `m1_gates.tile_hessian_stream` does once per tile.
+#:
+#: It was never modelled because the Cholesky dwarfed it.  It no longer does:
+#: at k=7912 the rotation is 0.25s against the Cholesky's 0.22s, so once the
+#: factorization is confined to blocks THIS becomes the larger of the two.
+#: Leaving out a term bigger than one we itemize is exactly how this model went
+#: wrong the first three times.
+ROT_TIMINGS = {
+    "cuda_f32": ((1024, 0.000478), (2048, 0.003390),
+                 (4096, 0.025949), (8192, 0.250471)),
+    "cpu_f64": ((1024, 0.016567), (2048, 0.102614),
+                (4096, 0.693413), (8192, 5.558341)),
 }
 
 #: Measured, `experiments/m0_dense_ppl.py`: one streamed WikiText-2 pass at
@@ -113,10 +172,19 @@ def _spd(k: int, dtype, device):
     return (a @ a.T / k + torch.eye(k, dtype=torch.float64)).to(dtype).to(device)
 
 
-def cholesky_rate(k: int, dtype, device, reps: int = 3) -> float:
-    """Effective flop/s for the triple LDLQ performs."""
+def cholesky_rate(k: int, dtype, device, reps: int = 5) -> float:
+    """Effective flop/s for the triple LDLQ performs.
+
+    The warmup runs the WHOLE triple, not just the first `cholesky`.  It used to
+    run only the first, so the opening timed rep paid cuSOLVER's handle setup
+    for `cholesky_inverse`; over three reps that was most of the measurement and
+    it understated the rate 1.6x.  Combined with the rate's k-dependence
+    (`CHOL_TIMINGS`), the model was charging real widths 9.4x too much.
+    """
     h = _spd(k, dtype, device)
-    torch.linalg.cholesky(h)
+    for _ in range(3):
+        torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(h)),
+                              upper=True)
     if device == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -191,11 +259,18 @@ def _scheme(t):
 
 def layer_cost(n_out: int, n_in: int, tile_size, budget: float, *,
                vq_bits: float = 2.0, dtype_bytes: int = 8,
-               scale_fit: bool = True) -> dict | None:
+               scale_fit: bool = True,
+               hessian_block: int | None = None) -> dict | None:
     """Flops and bytes for one linear at one tile size.
 
     `k` is the aligned survivor count, so it is what the code will really
     factorize -- not the requested density times n_in.
+
+    `hessian_block=b` prices `quantize.ldlq_quantize(hessian_block=b)`: the
+    factorization becomes (k/b) blocks of b^3 rather than one of k^3, so the
+    term falls by (k/b)^2 -- three orders of magnitude at the widths this grid
+    actually uses.  It is the only lever here that changes an exponent, and it
+    is charged against a measured quality cost, not assumed free.
     """
     d = A.density_for_budget(_scheme(tile_size), budget, None, n_in,
                              tile_size=tile_size, vq_bits=vq_bits)
@@ -210,8 +285,14 @@ def layer_cost(n_out: int, n_in: int, tile_size, budget: float, *,
         "n_out": n_out, "n_in": n_in, "tile_size": tile_size,
         "density": d, "k": k, "n_tiles": n_tiles,
         "lines_per_tile": lines_per_tile,
-        # one factorization per tile
-        "cholesky_flops": n_tiles * CHOL_FLOPS_PER_K3 * k ** 3,
+        "hessian_block": hessian_block,
+        # One factorization per tile -- per TILE, because each tile owns a
+        # different column set.  The rotation is already shared across tiles
+        # (`rotation.rotate(share_across_tiles=True)`), so it is not what makes
+        # this per-tile and no rotation width can make it shared.
+        "cholesky_flops": n_tiles * CHOL_FLOPS_PER_K3 * (
+            k ** 3 if hessian_block is None or hessian_block >= k
+            else _blockdiag_chol_k3(k, hessian_block)),
         # one search per tile per group of eight, over that tile's lines --
         # times the scale-fitting sweep that precedes every tile
         "codebook_flops": (n_out * (k / E8P_DIM) * 2 * E8P_DIM * CODEBOOK_SIZE
@@ -222,6 +303,64 @@ def layer_cost(n_out: int, n_in: int, tile_size, budget: float, *,
         # what it would allocate if the tiles were streamed instead
         "hessian_bytes_streamed": k * k * dtype_bytes,
     }
+
+
+def cholesky_seconds(k: int, rates: dict, setup: str,
+                     block: int | None = None) -> float:
+    """Seconds for one tile's factorization at width `k`.
+
+    Uses the measured `CHOL_TIMINGS` curve when the setup has one, taking the
+    rate from the nearest measured k in log space -- the samples are octaves
+    apart, so interpolating between them would invent precision the data lacks.
+    Falls back to a flat `cholesky_flops_per_s` for setups that carry no curve.
+
+    `block` prices the block-diagonal form as (k/block) separate factorizations
+    at the block's own rate.  That OVERSTATES it, because the real code issues
+    them as one batched call, and overstating is the correct direction for the
+    lever we are arguing in favour of.
+    """
+    if block is not None and block < k:
+        return sum(cholesky_seconds(min(block, k - o), rates, setup)
+                   for o in range(0, k, block))
+    entry = rates["setups"][setup]
+    samples = entry.get("cholesky_timings") or CHOL_TIMINGS.get(setup)
+    if not samples:
+        return CHOL_FLOPS_PER_K3 * k ** 3 / entry["cholesky_flops_per_s"]
+    ref_k, ref_s = min(samples, key=lambda s: abs(math.log(s[0] / max(k, 1))))
+    rate = CHOL_FLOPS_PER_K3 * ref_k ** 3 / ref_s
+    return CHOL_FLOPS_PER_K3 * k ** 3 / rate
+
+
+def rotation_seconds(k: int, rates: dict, setup: str) -> float:
+    """Seconds to rotate one tile's sub-Hessian, `2*k^3` at matmul rates.
+
+    Charged whenever the pipeline rotates -- which, after the block-width sweep,
+    is always: narrowing the rotation costs quality at every width measured
+    (`experiments/m0_rotation_value.py`), so the rotation stays full even when
+    the feedback does not.  Returns 0 for setups with no measured curve, so the
+    fixtures keep testing the shapes they were written for.
+    """
+    samples = (rates["setups"][setup].get("rotation_timings")
+               or ROT_TIMINGS.get(setup))
+    if not samples:
+        return 0.0
+    ref_k, ref_s = min(samples, key=lambda s: abs(math.log(s[0] / max(k, 1))))
+    return ref_s * (k / ref_k) ** 3
+
+
+def scale_sample_bites(lines_per_tile: int, k: int, sample: int) -> bool:
+    """Does capping `fit_scale` at `sample` vectors change anything for this tile?
+
+    A tile holds `lines_per_tile * k / E8P_DIM` vectors and the sweep visits each
+    one.  If that is already below the cap, the cap is inert -- and reporting a
+    saving for it would be the fourth time this model was optimistic.
+    """
+    return lines_per_tile * k // E8P_DIM > sample
+
+
+def _blockdiag_chol_k3(k: int, block: int) -> float:
+    """Cubed work for a block-diagonal factorization, ragged tail included."""
+    return float(sum(min(block, k - o) ** 3 for o in range(0, k, block)))
 
 
 def codebook_seconds_per_vector(rates: dict, setup: str,
@@ -249,11 +388,9 @@ def codebook_seconds_per_vector(rates: dict, setup: str,
             f"no measured tile timings for setup {setup!r}; add them to "
             "TILE_TIMINGS or carry them on the rates entry"
         )
-    chol_rate = rates["setups"][setup]["cholesky_flops_per_s"]
-
     fitted = []
     for k, sample_lines, seconds in samples:
-        residual = seconds - CHOL_FLOPS_PER_K3 * k ** 3 / chol_rate
+        residual = seconds - cholesky_seconds(k, rates, setup)
         if residual > 0:
             fitted.append((sample_lines, residual / (sample_lines * k)))
     if not fitted:
@@ -267,6 +404,7 @@ def codebook_seconds_per_vector(rates: dict, setup: str,
 
 def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
                batched: bool = False, scale_fit: bool = True,
+               hessian_block: int | None = None,
                inventory=LLAMA2_7B, n_blocks: int = N_BLOCKS) -> dict:
     """One full compression pass over Llama-2-7B at one tile size.
 
@@ -277,14 +415,18 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
     r = rates["setups"][setup]
 
     chol = cb = peak = peak_streamed = 0.0
-    chol_seconds = cb_seconds = 0.0
+    chol_seconds = cb_seconds = rot_seconds = 0.0
     for n_out, n_in, count in inventory:
-        c = layer_cost(n_out, n_in, tile_size, budget, scale_fit=scale_fit)
+        c = layer_cost(n_out, n_in, tile_size, budget, scale_fit=scale_fit,
+                       hessian_block=hessian_block)
         if c is None:
             return {"tile_size": tile_size, "skipped": "budget unreachable"}
         chol += count * c["cholesky_flops"]
         cb += count * c["codebook_flops"]
-        chol_seconds += count * c["cholesky_flops"] / r["cholesky_flops_per_s"]
+        chol_seconds += count * c["n_tiles"] * cholesky_seconds(
+            c["k"], rates, setup, block=hessian_block)
+        rot_seconds += count * c["n_tiles"] * rotation_seconds(
+            c["k"], rates, setup)
         # n_tiles * lines * k == n_out * k, and the tile fit is per vector
         per_vector = codebook_seconds_per_vector(rates, setup,
                                                  c["lines_per_tile"])
@@ -297,13 +439,18 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
     chol *= n_blocks
     cb *= n_blocks
     chol_seconds *= n_blocks
+    rot_seconds *= n_blocks
     cb_seconds *= n_blocks
-    seconds = chol_seconds + cb_seconds
+    # `TILE_TIMINGS` measures `ldlq_quantize` alone, so the rotation is a
+    # genuinely separate term rather than a double count of one already inside
+    # the fitted codebook constant.
+    seconds = chol_seconds + rot_seconds + cb_seconds
     return {
         "tile_size": tile_size, "setup": setup, "batched": batched,
         "scale_fit": scale_fit,
         "cholesky_flops": chol, "codebook_flops": cb,
         "cholesky_seconds": chol_seconds,
+        "rotation_seconds": rot_seconds,
         "codebook_seconds": cb_seconds,
         "codebook_seconds_per_vector": per_vector,   # last layer's
         "compress_seconds": seconds,
@@ -395,25 +542,39 @@ def sweep_cost(rates: dict, setup: str, *, budget: float = 1.5,
 
 def m1_cost(rates: dict, setup: str, *, budgets=(1.75, 1.60, 1.50),
             n_draws: int = 5, tiles=TILES, batched: bool = False,
-            scale_fit: bool = True) -> dict:
+            scale_fit: bool = True, hessian_block: int | None = None) -> dict:
     """M1's own grid, for scale: budgets x tiles x draws."""
     total = 0.0
     for b in budgets:
         for t in tiles:
             c = model_cost(t, b, rates, setup, batched=batched,
-                           scale_fit=scale_fit)
+                           scale_fit=scale_fit, hessian_block=hessian_block)
             if "skipped" not in c:
                 total += n_draws * c["point_seconds"]
     return {"setup": setup, "batched": batched, "scale_fit": scale_fit,
+            "hessian_block": hessian_block,
             "n_draws": n_draws, "seconds": total, "hours": total / 3600,
             "days": total / 86400}
 
 
 # --------------------------------------------------------------------------- #
 
+def modellable_setups(rates: dict) -> list[str]:
+    """Setups we hold END-TO-END tile timings for.
+
+    `measure_rates` benchmarks every dtype/device combination the machine has,
+    but the model's clock comes from measured tile times and those exist only
+    for the two configurations the pipeline is actually run in.  Reporting a
+    cost for `cpu_f32` would mean inventing its constant, so it is dropped
+    rather than guessed.
+    """
+    return [s for s in rates["setups"]
+            if rates["setups"][s].get("tile_timings") or s in TILE_TIMINGS]
+
+
 def run(*, budget: float = 1.5, cache: Path | None = None) -> dict:
     rates = measure_rates(cache=cache)
-    setups = list(rates["setups"])
+    setups = modellable_setups(rates)
     return {
         "meta": {
             "utc": datetime.now(timezone.utc).isoformat(),

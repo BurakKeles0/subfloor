@@ -291,3 +291,181 @@ def test_scale_fit_is_on_by_default_because_that_is_what_the_code_does():
     like it -- an optimistic default is how a cost model stops being one."""
     assert CM.layer_cost(4096, 4096, 16, 1.5)["scale_fit"] is True
     assert CM.model_cost(16, 1.5, RATES, "fake")["scale_fit"] is True
+
+
+# --------------------------------------------------------------------------- #
+# BLOCK-DIAGONAL FEEDBACK  (docs/STATUS.md section 6.3, corrected)
+# --------------------------------------------------------------------------- #
+
+def test_the_factorization_is_per_tile_because_of_the_column_set():
+    """The correction that motivated the block-width sweep.
+
+    STATUS 6.3 reads the k^3 term as "each tile has its own column set AND its
+    own rotation".  Only the first clause is true: `rotation.rotate` defaults to
+    `share_across_tiles=True`, so one rotation serves the whole layer and no
+    rotation width can make the factorization shared.  What the model charges
+    is n_tiles factorizations, and n_tiles comes from the tiling alone.
+    """
+    c = CM.layer_cost(4096, 11008, 16, 1.5)
+    assert c["n_tiles"] == 4096 // 16
+    assert c["cholesky_flops"] == pytest.approx(
+        c["n_tiles"] * CM.CHOL_FLOPS_PER_K3 * c["k"] ** 3)
+
+
+@pytest.mark.parametrize("block", [2048, 512, 128])
+def test_block_diagonal_feedback_turns_k_cubed_into_k_times_b_squared(block):
+    full = CM.layer_cost(4096, 11008, 16, 1.5)
+    blocked = CM.layer_cost(4096, 11008, 16, 1.5, hessian_block=block)
+    k = full["k"]
+    assert blocked["k"] == k
+    # Exact, ragged tail included -- not k*b^2, which would round the tail away.
+    expected = sum(min(block, k - o) ** 3 for o in range(0, k, block))
+    assert blocked["cholesky_flops"] == pytest.approx(
+        full["n_tiles"] * CM.CHOL_FLOPS_PER_K3 * expected)
+    assert blocked["cholesky_flops"] < full["cholesky_flops"] / 10
+    # The lever touches the factorization and nothing else.
+    assert blocked["codebook_flops"] == full["codebook_flops"]
+
+
+def test_block_width_wider_than_k_is_the_unconstrained_cost():
+    full = CM.layer_cost(4096, 4096, Tl.MAX_TILE, 1.5)
+    assert CM.layer_cost(4096, 4096, Tl.MAX_TILE, 1.5,
+                         hessian_block=10 ** 6)["cholesky_flops"] == pytest.approx(
+        full["cholesky_flops"])
+
+
+def test_the_cost_curve_flattens_long_before_width_eight():
+    """Why the sweep is run at 512 and not at 8.
+
+    Section 6.3 proposed groups of eight.  Going from 512 down to 8 buys under
+    2% more of M1's runtime while multiplying the dropped Hessian couplings by
+    sixty-four -- the worst available trade.  The sweep spans the knee so the
+    measurement can be read against it.
+    """
+    days = {b: CM.m1_cost(RATES, "fake", scale_fit=False, hessian_block=b)["days"]
+            for b in (None, 2048, 512, 8)}
+    total, extra = days[None] - days[8], days[512] - days[8]
+    assert days[2048] < 0.6 * days[None]
+    assert extra < 0.05 * total             # 512 already collects the saving
+
+    # Machine-independent, because it is arithmetic rather than a rate: at the
+    # widest k in the grid, a width of 512 has already dropped 99.6% of the
+    # factorization, and everything narrower is fighting over the last 0.4%.
+    k = CM.layer_cost(4096, 11008, 16, 1.5)["k"]
+    kept = lambda b: sum(min(b, k - o) ** 3 for o in range(0, k, b)) / k ** 3
+    assert kept(512) < 0.005
+    assert kept(512) - kept(8) < 0.005
+
+
+def test_m1_records_the_block_width_it_priced():
+    """A cost claim that does not carry its assumptions is how the model was
+    wrong three times already."""
+    assert CM.m1_cost(RATES, "fake")["hessian_block"] is None
+    assert CM.m1_cost(RATES, "fake", hessian_block=512)["hessian_block"] == 512
+
+
+def test_sampling_the_per_tile_scale_is_inert_where_the_cost_lives():
+    """`docs/STATUS.md` reads the 68-day figure as "with the scale fit sampled".
+    It is not that: `scale_fit=False` prices removing the fit entirely.
+
+    The sweep only visits the vectors a tile actually has, so a cap of 8192 is
+    inert at every tile size below T=max -- which is to say, at every tile size
+    that costs anything.  The lever is real but it is not this lever, and the
+    caps that would bite are small enough to need a measured quality cost.
+    """
+    for tile, expected in ((1, False), (4, False), (16, False),
+                           (Tl.MAX_TILE, True)):
+        c = CM.layer_cost(4096, 4096, tile, 1.5)
+        assert CM.scale_sample_bites(c["lines_per_tile"], c["k"], 8192) is expected
+
+    # It does bite once the cap is small -- that is where the measurement goes.
+    c = CM.layer_cost(4096, 4096, 4, 1.5)
+    assert CM.scale_sample_bites(c["lines_per_tile"], c["k"], 256) is True
+
+
+# --------------------------------------------------------------------------- #
+# THE CHOLESKY CORRECTION  (2026-08-23)
+# --------------------------------------------------------------------------- #
+# The model charged every width the flop/s measured at k=2048, from a benchmark
+# that warmed `cholesky` but not `cholesky_inverse`.  Both were wrong in the
+# same direction: 1.6x from the missing warmup, 2.6x more from the rate's
+# k-dependence, 9.4x together at the widths that matter.  The 120-day M1 figure
+# came out of that, and it is 94 once measured.
+
+REAL = {"setups": {"cuda_f32": {"cholesky_flops_per_s": 1e9,   # deliberately absurd
+                                "codebook_flops_per_s_small": 1e10,
+                                "codebook_flops_per_s_large": 1e11}}}
+
+
+def test_the_measured_curve_beats_the_flat_rate_when_one_exists():
+    """A setup with a measured curve must ignore `cholesky_flops_per_s`
+    entirely -- otherwise a stale rate in a results file silently wins."""
+    got = CM.cholesky_seconds(4096, REAL, "cuda_f32")
+    assert got == pytest.approx(CM.CHOL_TIMINGS["cuda_f32"][2][1], rel=1e-9)
+    # ... and a setup without one still works, so fixtures keep functioning.
+    assert CM.cholesky_seconds(1000, RATES, "fake") == pytest.approx(
+        CM.CHOL_FLOPS_PER_K3 * 1000 ** 3 / 1e12)
+
+
+def test_the_cholesky_rate_is_not_one_number():
+    """Small factorizations cannot fill the card.  If this ever flattened, the
+    curve would have stopped describing the kernel."""
+    rate = lambda k, s: CM.CHOL_FLOPS_PER_K3 * k ** 3 / s
+    rates = [rate(k, s) for k, s in CM.CHOL_TIMINGS["cuda_f32"]]
+    assert rates == sorted(rates)                 # monotone in k
+    assert rates[-1] > 5 * rates[0]
+
+
+def test_block_diagonal_seconds_are_the_sum_over_blocks():
+    k, b = 4096, 512
+    got = CM.cholesky_seconds(k, REAL, "cuda_f32", block=b)
+    want = sum(CM.cholesky_seconds(min(b, k - o), REAL, "cuda_f32")
+               for o in range(0, k, b))
+    assert got == pytest.approx(want)
+    assert got < CM.cholesky_seconds(k, REAL, "cuda_f32") / 10
+
+
+def test_the_rotation_apply_is_charged_now_that_it_outweighs_the_cholesky():
+    """`tile_hessian_stream` rotates every tile's sub-Hessian, 2*k^3 at matmul
+    rates.  It went unmodelled while the Cholesky dwarfed it; at k=7912 it is
+    the larger of the two, and with the feedback blocked it is larger still."""
+    assert CM.rotation_seconds(8192, REAL, "cuda_f32") > CM.cholesky_seconds(
+        8192, REAL, "cuda_f32")
+    assert CM.rotation_seconds(4096, REAL, "cuda_f32") == pytest.approx(
+        CM.ROT_TIMINGS["cuda_f32"][2][1], rel=1e-9)
+    assert CM.rotation_seconds(4096, RATES, "fake") == 0.0     # no curve, no charge
+
+
+def test_compress_time_is_the_three_terms():
+    c = CM.model_cost(16, 1.5, RATES, "fake")
+    assert c["compress_seconds"] == pytest.approx(
+        c["cholesky_seconds"] + c["rotation_seconds"] + c["codebook_seconds"])
+
+
+def test_the_codebook_sweep_is_the_wall_not_the_factorization():
+    """The finding that reorders everything.
+
+    STATUS 6.3 reads the factorization as the structural wall and the block
+    width as the fix.  Measured, the factorization is a tenth of the pass and
+    the scale-fitting sweep is five sixths of it: confining the feedback saves
+    9% of M1, dropping the per-tile scale fit saves 70%.  A block width is
+    still worth taking -- it is free, and the measurement says it IMPROVES
+    quality -- but it is not the lever that decides whether M1 runs.
+    """
+    import json
+    from pathlib import Path
+    rates_file = Path(__file__).resolve().parent.parent / "results" / "m0_rates.json"
+    if not rates_file.exists():
+        pytest.skip("no measured rates on this machine")
+    rates = json.loads(rates_file.read_text(encoding="utf-8"))
+    if "cuda_f32" not in rates["setups"]:
+        pytest.skip("no cuda rates measured on this machine")
+
+    c = CM.model_cost(4, 1.5, rates, "cuda_f32")
+    assert c["codebook_seconds"] > 5 * (c["cholesky_seconds"]
+                                        + c["rotation_seconds"])
+    base = CM.m1_cost(rates, "cuda_f32")["days"]
+    blocked = CM.m1_cost(rates, "cuda_f32", hessian_block=512)["days"]
+    no_fit = CM.m1_cost(rates, "cuda_f32", scale_fit=False)["days"]
+    assert blocked > 0.8 * base          # the block width is a minor saving
+    assert no_fit < 0.4 * base           # the scale fit is the major one

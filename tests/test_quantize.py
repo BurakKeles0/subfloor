@@ -487,3 +487,97 @@ def test_a_foreign_codebook_still_goes_through_the_scan():
     idx, code = Q._nearest(x, other)
     assert idx.max() < other.shape[0]
     assert torch.equal(code, other[idx])
+
+
+# --------------------------------------------------------------------------- #
+# BLOCK-DIAGONAL FEEDBACK  (docs/STATUS.md section 6.3)
+# --------------------------------------------------------------------------- #
+# The project's largest measured cost is the LDLQ factorization: it runs once
+# per tile because each tile owns a different column set, at k^3 each, and at
+# T=4 that is 2.6e16 flops per pass over Llama-2-7B.  `hessian_block=b` is the
+# only lever that changes the exponent, taking it to k*b^2.
+#
+# It buys that by dropping the sub-Hessian couplings that reach past width b,
+# which is an approximation of the OBJECTIVE, not of the arithmetic.  These
+# tests pin exactly what is dropped, so the price is measurable rather than
+# hopeful; `experiments/m0_rotation_value.py` measures it.
+
+def _spd(k: int, seed: int = 0) -> torch.Tensor:
+    torch.manual_seed(seed)
+    A = torch.randn((k, k), dtype=DT) / math.sqrt(k)
+    X = torch.randn((8 * k, k), dtype=DT) @ A
+    return X.T @ X / X.shape[0] + torch.eye(k, dtype=DT)
+
+
+def _blockdiag_part(H: torch.Tensor, block: int) -> torch.Tensor:
+    out = torch.zeros_like(H)
+    for off, width in R.block_partition(H.shape[-1], block):
+        out[off:off + width, off:off + width] = H[off:off + width,
+                                                  off:off + width]
+    return out
+
+
+@pytest.mark.parametrize("block", [64, 128])
+def test_full_width_feedback_is_the_unconstrained_sweep(block):
+    """`hessian_block >= k` must be bit-identical to `None`, so the widest arm
+    of a sweep is provably the same computation the -70% result used."""
+    k = 64
+    H, W = _spd(k), torch.randn((16, k), dtype=DT) * 0.05
+    ref = Q.ldlq_quantize(W, H)
+    got = Q.ldlq_quantize(W, H, hessian_block=block)
+    assert torch.equal(got.values, ref.values)
+    assert torch.equal(got.indices, ref.indices)
+
+
+@pytest.mark.parametrize("block", [8, 16, 32])
+def test_feedback_block_is_exactly_ldlq_against_the_block_diagonal_hessian(block):
+    """The claim, stated so it can fail.
+
+    Zeroing H's off-block entries leaves its DIAGONAL untouched, so the damping
+    term -- percdamp times the mean of the whole diagonal -- is identical in
+    both runs.  The two therefore differ in nothing but the dropped couplings,
+    and must agree exactly."""
+    k = 64
+    H, W = _spd(k), torch.randn((16, k), dtype=DT) * 0.05
+    got = Q.ldlq_quantize(W, H, hessian_block=block)
+    ref = Q.ldlq_quantize(W, _blockdiag_part(H, block))
+    assert torch.equal(got.values, ref.values)
+
+
+@pytest.mark.parametrize("block", [8, 16, 32])
+def test_no_error_crosses_a_block_boundary(block):
+    """Operational proof of independence: perturb only the couplings that reach
+    across a boundary and the output must not move at all.  Without the
+    constraint the same perturbation does move it -- otherwise the test would
+    pass for a quantizer that ignores H entirely."""
+    k = 64
+    H, W = _spd(k), torch.randn((16, k), dtype=DT) * 0.05
+    noise = _spd(k, seed=7) - _blockdiag_part(_spd(k, seed=7), block)
+    perturbed = H + 0.5 * (noise + noise.T) / 2
+
+    assert torch.equal(Q.ldlq_quantize(W, H, hessian_block=block).values,
+                       Q.ldlq_quantize(W, perturbed, hessian_block=block).values)
+    assert not torch.equal(Q.ldlq_quantize(W, H).values,
+                           Q.ldlq_quantize(W, perturbed).values)
+
+
+def test_feedback_block_must_not_split_a_codeword():
+    """A boundary inside an E8P group would mean eight coordinates quantized as
+    one vector while their feedback came from two different factorizations."""
+    k = 64
+    H, W = _spd(k), torch.randn((16, k), dtype=DT) * 0.05
+    with pytest.raises(ValueError, match="multiple of the quantizer group"):
+        Q.ldlq_quantize(W, H, hessian_block=12)
+
+
+def test_feedback_block_reaches_the_tile_loop():
+    """`ldlq_quantize_blocks` must pass it through -- the streaming path is the
+    only one a real layer ever takes."""
+    n_tiles, lpt, k, block = 3, 4, 32, 8
+    blocks = torch.randn((n_tiles, lpt, k), dtype=DT) * 0.05
+    H = _spd(k)
+    got = Q.ldlq_quantize_blocks(blocks, lambda t: H, hessian_block=block)
+    ref = Q.ldlq_quantize_blocks(blocks, lambda t: _blockdiag_part(H, block))
+    assert torch.equal(got.values, ref.values)
+    assert not torch.equal(got.values,
+                           Q.ldlq_quantize_blocks(blocks, lambda t: H).values)

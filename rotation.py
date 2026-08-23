@@ -38,6 +38,8 @@ __all__ = [
     "randomized_hadamard",
     "random_orthogonal",
     "structured_orthogonal",
+    "block_diagonal_orthogonal",
+    "block_partition",
     "rotate",
     "unrotate",
     "line_axis_overhead_ratio",
@@ -124,18 +126,70 @@ def structured_orthogonal(
     )
 
 
+def block_partition(n: int, block: int) -> list[tuple[int, int]]:
+    """Split `n` coordinates into consecutive chunks of at most `block`.
+
+    The tail is short rather than padded.  Survivor counts are aligned to eight
+    (`tiling.uniform_survivor_count(align=8)`) and every block width we use is a
+    multiple of eight, so the tail is a multiple of eight too -- which is what
+    keeps a block boundary from ever falling inside an E8P group.
+    """
+    if block < 1:
+        raise ValueError(f"block must be positive, got {block}")
+    return [(o, min(block, n - o)) for o in range(0, n, block)]
+
+
+def block_diagonal_orthogonal(
+    n: int,
+    block: int,
+    seed: int = 0,
+    dtype: torch.dtype = torch.float64,
+    device: torch.device | str = "cpu",
+) -> Tensor:
+    """Orthogonal, but confined to consecutive groups of `block` coordinates.
+
+    Why confine it at all.  A full rotation costs `log2(k)/T` at inference and,
+    more expensively, it is the reason LDLQ factorizes in the rotated basis --
+    though not the reason it factorizes per tile, which is the column set.  What
+    a width-`block` rotation buys is that the rotated sub-Hessian's off-block
+    couplings can be dropped consistently: rotation and error feedback then
+    share one block structure, and `quantize.ldlq_quantize(hessian_block=...)`
+    turns `k^3` into `k * block^2`.
+
+    What it costs is mixing range.  A rotation cannot change the norm of the
+    coordinates it spans, only their direction, so a width-8 rotation leaves the
+    variation in norm BETWEEN groups of eight exactly as it found it -- and that
+    between-group spread is what a single E8P scale has to cover.  The width at
+    which this stops mattering is an empirical question, which is what
+    `experiments/m0_rotation_value.py` measures.
+
+    `block >= n` degenerates to the full rotation, deliberately: it lets the
+    sweep include the unconstrained arm without a special case.
+    """
+    device = torch.device(device)
+    if block >= n:
+        return structured_orthogonal(n, seed, dtype, device)
+    out = torch.zeros((n, n), dtype=dtype, device=device)
+    for j, (off, width) in enumerate(block_partition(n, block)):
+        out[off:off + width, off:off + width] = structured_orthogonal(
+            width, seed + 7919 * j, dtype, device)
+    return out
+
+
 def _rotations(
-    cw: CompactWeights, axis: str, seed: int, share_across_tiles: bool
+    cw: CompactWeights, axis: str, seed: int, share_across_tiles: bool,
+    block: int | None = None,
 ) -> Tensor:
     n = cw.lines_per_tile if axis == "line" else cw.k
     dtype, device = cw.blocks.dtype, cw.blocks.device
+    width = n if block is None else block
+
+    def one(s: int) -> Tensor:
+        return block_diagonal_orthogonal(n, width, s, dtype, device)
+
     if share_across_tiles:
-        Q = structured_orthogonal(n, seed, dtype, device)
-        return Q.unsqueeze(0).expand(cw.n_tiles, n, n)
-    return torch.stack([
-        structured_orthogonal(n, seed + 7919 * t, dtype, device)
-        for t in range(cw.n_tiles)
-    ])
+        return one(seed).unsqueeze(0).expand(cw.n_tiles, n, n)
+    return torch.stack([one(seed + 104729 * t) for t in range(cw.n_tiles)])
 
 
 def rotate(
@@ -143,6 +197,7 @@ def rotate(
     axis: str = "index",
     seed: int = 0,
     share_across_tiles: bool = True,
+    block: int | None = None,
 ) -> tuple[CompactWeights, Tensor]:
     """Rotate every tile's block.  Returns (rotated weights, the rotations).
 
@@ -151,11 +206,16 @@ def rotate(
 
     Sharing one rotation across tiles is statistically fine -- each tile applies
     it to a different index set -- and it does not change the inference cost,
-    which is per-tile either way.
+    which is per-tile either way.  Note what that sharing means for the compute
+    wall: the rotation is ALREADY one matrix for the whole layer, so it is not
+    what makes LDLQ factorize once per tile.  The per-tile column set is.
+
+    `block=b` confines the rotation to consecutive groups of `b` coordinates
+    (`block_diagonal_orthogonal`).  `None` is the full-width rotation.
     """
     if axis not in ("line", "index"):
         raise ValueError(f"axis must be 'line' or 'index', got {axis!r}")
-    Q = _rotations(cw, axis, seed, share_across_tiles)
+    Q = _rotations(cw, axis, seed, share_across_tiles, block)
     if axis == "line":
         blocks = Q @ cw.blocks
     else:
@@ -177,19 +237,30 @@ def unrotate(cw: CompactWeights, Q: Tensor, axis: str = "index") -> CompactWeigh
 # Ours cannot be: every tile owns a different index set, so the transform must
 # run after the gather.  The cost is real, and it is what pushes T up.
 
-def index_axis_overhead_ratio(tile_size: int | str, density: float, n_idx: int) -> float:
+def index_axis_overhead_ratio(tile_size: int | str, density: float, n_idx: int,
+                              block: int | None = None) -> float:
     """Per-tile index-axis rotation, relative to the GEMV it sits on.
 
         (n_lines/T) * k * log2(k)  /  (n_lines * k)  =  log2(k) / T,  k = d*n_idx
 
     T=1 is hopeless (~11x), T=16 is expensive but possible, T=max is free.
+
+    `block=b` confines the rotation to width-`b` groups, so each coordinate is
+    mixed through log2(b) butterfly stages instead of log2(k) and the ratio
+    falls to log2(b)/T.  The saving here is real but modest -- log2 of anything
+    is a small number.  The block width earns its keep on the OFFLINE side, in
+    `quantize.ldlq_quantize(hessian_block=...)`, where it turns a k^3
+    factorization into k*b^2.
     """
     if tile_size == "max":
         return 0.0
     k = density * n_idx
     if k <= 1:
         return 0.0
-    return math.log2(k) / tile_size
+    width = k if block is None else min(block, k)
+    if width <= 1:
+        return 0.0
+    return math.log2(width) / tile_size
 
 
 def line_axis_overhead_ratio(tile_size: int | str, density: float, n_idx: int) -> float:

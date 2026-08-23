@@ -440,6 +440,44 @@ class LDLQResult:
     scale: float
 
 
+def _upper_inverse_factor(Hd: Tensor) -> Tensor:
+    """chol(inv(Hd), upper) -- the feedback matrix LDLQ sweeps against.
+
+    Batched: `Hd` may be [k, k] or [m, k, k], and the [m, ...] form is what
+    makes a block-diagonal Hessian cheap, since m small factorizations issue as
+    one kernel instead of m.
+    """
+    return torch.linalg.cholesky(
+        torch.cholesky_inverse(torch.linalg.cholesky(Hd)), upper=True)
+
+
+def _blockdiag_feedback(Hd: Tensor, block: int) -> Tensor:
+    """`_upper_inverse_factor` on the diagonal blocks only, zeros elsewhere.
+
+    Dropping the off-block couplings of the sub-Hessian is exactly equivalent to
+    running LDLQ independently on each width-`block` chunk: the sweep's
+    `W[:, after] -= err @ U[g, after]` reads zeros past the chunk's end, so no
+    error ever crosses a boundary.  Cost goes from k^3 to (k/block) * block^3.
+
+    This is an approximation of the objective, not of the arithmetic -- the
+    error it forgoes is the feedback that would have crossed a block boundary.
+    The measurement that prices it is `experiments/m0_rotation_value.py`; it is
+    only defensible when the rotation is confined to the same width, because
+    then the couplings being dropped are the ones the rotation never created.
+    """
+    k = Hd.shape[-1]
+    U = torch.zeros_like(Hd)
+    chunks: dict[int, list[int]] = {}
+    for off in range(0, k, block):
+        chunks.setdefault(min(block, k - off), []).append(off)
+    for width, offsets in chunks.items():
+        stacked = torch.stack([Hd[o:o + width, o:o + width] for o in offsets])
+        factors = _upper_inverse_factor(stacked)
+        for i, o in enumerate(offsets):
+            U[o:o + width, o:o + width] = factors[i]
+    return U
+
+
 def ldlq_quantize(
     block: Tensor,
     H: Tensor,
@@ -447,6 +485,7 @@ def ldlq_quantize(
     percdamp: float = 0.01,
     scale: float | None = None,
     group: int = E8P_DIM,
+    hessian_block: int | None = None,
 ) -> LDLQResult:
     """Hessian-aware rounding: LDLQ / block-GPTQ with a vector quantizer.
 
@@ -472,6 +511,14 @@ def ldlq_quantize(
 
     with U the upper Cholesky factor of (H + lambda I)^-1.  At group=1 it
     reduces exactly to the per-column rule in `prune.forward_compensate`.
+
+    `hessian_block=b` keeps only the width-`b` diagonal blocks of that factor.
+    It is the one lever that moves the project's largest measured cost: the
+    factorization is per tile because each tile owns a different column set, so
+    it runs `n_out/T` times at `k^3` each, and `b` turns that into `k * b^2`.
+    The damping term is computed from the WHOLE diagonal either way, so the two
+    paths regularize identically and the comparison is attributable to the
+    dropped couplings alone.
     """
     if block.ndim != 2:
         raise ValueError(f"block must be 2-D, got {tuple(block.shape)}")
@@ -485,10 +532,16 @@ def ldlq_quantize(
     if H.shape != (k, k):
         raise ValueError(f"H must be ({k}, {k}) to match the block, got {tuple(H.shape)}")
 
+    if hessian_block is not None and hessian_block % group:
+        raise ValueError(
+            f"hessian_block must be a multiple of the quantizer group {group} "
+            f"so no block boundary falls inside a codeword, got {hessian_block}"
+        )
+
     damp = percdamp * torch.diagonal(H).mean()
     Hd = H + damp * torch.eye(k, dtype=H.dtype, device=H.device)
-    Hinv = torch.cholesky_inverse(torch.linalg.cholesky(Hd))
-    U = torch.linalg.cholesky(Hinv, upper=True)
+    U = (_upper_inverse_factor(Hd) if hessian_block is None or hessian_block >= k
+         else _blockdiag_feedback(Hd, hessian_block))
 
     cb = _on_device(block.dtype, str(block.device))
     a = fit_scale(block.reshape(-1, group), cb) if scale is None else float(scale)
@@ -520,6 +573,7 @@ def ldlq_quantize_blocks(
     percdamp: float = 0.01,
     scale: str | float = "per_tile",
     scale_sample: int = 8192,
+    hessian_block: int | None = None,
 ) -> QuantizedBlocks:
     """`ldlq_quantize` over every tile.
 
@@ -545,6 +599,10 @@ def ldlq_quantize_blocks(
 
     Fitting once over EVERY vector would save nothing at all -- same total work,
     differently arranged -- so the saving is in the sampling, not in the sharing.
+
+    `hessian_block` is passed straight through to `ldlq_quantize`; it is the
+    other half of the same runtime question, and the two levers are independent
+    -- one shrinks the factorization, the other the codebook sweep.
     """
     if blocks.ndim != 3:
         raise ValueError(f"blocks must be 3-D, got {tuple(blocks.shape)}")
@@ -574,7 +632,8 @@ def ldlq_quantize_blocks(
             raise ValueError(
                 f"tile {t}: hessian must be ({k}, {k}), got {tuple(h.shape)}"
             )
-        r = ldlq_quantize(blocks[t], h, percdamp=percdamp, scale=tile_scale)
+        r = ldlq_quantize(blocks[t], h, percdamp=percdamp, scale=tile_scale,
+                          hessian_block=hessian_block)
         out[t] = r.values
         idxs.append(r.indices)
         scales.append(r.scale)
