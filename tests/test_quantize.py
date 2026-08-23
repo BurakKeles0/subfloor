@@ -770,3 +770,34 @@ def test_float32_disagreements_are_ties_not_errors():
         gap = ((x - c_an).square().sum(1) - (x - c_scan).square().sum(1))[differ]
         assert float(gap.abs().max()) < 1e-4, "a disagreement with a real gap"
         assert float(differ.float().mean()) < 1e-4, "ties should be rare"
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_compiled_and_eager_kernels_agree_bit_for_bit(device):
+    """The compile must be a speed change and nothing else.
+
+    `_shift_kernel` falls back to eager wherever the toolchain is missing --
+    CUDA compiles through Triton here, CPU asks for `cl` and does not find it --
+    so the same code produces quantized models on machines with and without a
+    backend.  If the two ever disagreed, which machine ran the job would change
+    the result, and no test above would notice.
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("no cuda")
+    dev = torch.device(device)
+    dtype = torch.float32
+    kernel = Q._shift_kernel(dev, dtype)
+    if kernel is Q._analytic_shift:
+        pytest.skip("no compiled backend on this device")
+
+    S = Q._source_on_device(dtype, str(dev))
+    St, s_norm2 = S.T.contiguous(), S.square().sum(dim=1)
+    pow2 = (2 ** torch.arange(7, device=dev)).to(torch.int64)
+    torch.manual_seed(0)
+    for scale in (0.01, 0.6, 20.0):
+        for n in (7, 1000, 4096):           # ragged, mid, aligned
+            z = torch.randn((n, 8), dtype=dtype, device=dev) * scale
+            eager = Q._analytic_shift(z, St, s_norm2, pow2)
+            fused = kernel(z, St, s_norm2, pow2)
+            assert torch.equal(fused[1], eager[1])
+            assert torch.equal(fused[0], eager[0])

@@ -14,8 +14,8 @@ içinde) ve rotasyonun katman düzeyindeki değeri (**−70%**). M0'ın uçuş-�
 kalemlerinin dördü kapandı (`vq_bits`, Kapı B'nin gücü, transfer pilotu,
 maliyet modeli). **Ama sıkıştırılmış modelin perplexity'si hâlâ hiç ölçülmedi**
 — Kapı A'nın ve Kapı B'nin tek bir gerçek verisi yok. Ve önümüzdeki asıl engel
-bilimsel değil, **hesaplama maliyeti**: M1 bu makinede **29 gün**, 120'den
-düştü.
+bilimsel değil, **hesaplama maliyeti**: M1 bu makinede **17 gün**, 120'den
+düştü — ve ilk gerçek U eğrisi artık **23 saat**.
 
 ---
 
@@ -331,21 +331,25 @@ iyimser yönde yanılttı, §6.2).
 
 ### 6.1 Bugünkü tablo (cuda/float32, bir sıkıştırma geçişi)
 
-**08-23'te üç kez değişti:** modelin Cholesky eğrisi düzeltildi (§6.4), süpürme
-toplandı (§6.5), tarama kaldırıldı (§6.7). Sıra: 120 → 94 → 48 → **29 gün**.
+**Dört kez değişti:** modelin Cholesky eğrisi düzeltildi (§6.4), süpürme
+toplandı (§6.5), tarama kaldırıldı (§6.7), elementwise zincirler füzyonlandı
+(§6.9). Sıra: 120 → 94 → 48 → 29 → **17 gün**.
 
 | T | toplam | codebook | rotasyon | cholesky |
 |---|---|---|---|---|
-| 1 | 3.9 h | 3.0 h | 0.46 h | 0.34 h |
-| 4 | **9.8 h** | 7.6 h | 1.92 h | 0.21 h |
-| 16 | 3.7 h | 2.8 h | 0.72 h | 0.06 h |
-| max | 1.3 h | 1.3 h | 0 | 0 |
+| 1 | 2.4 h | 1.48 h | 0.46 h | 0.34 h |
+| 4 | **5.9 h** | 3.71 h | 1.92 h | 0.21 h |
+| 16 | 2.1 h | 1.27 h | 0.72 h | 0.06 h |
+| max | 0.6 h | 0.57 h | 0 | 0 |
 
-**M1 (3 bütçe × 7 tile × 5 çekiliş): 29 gün.**
+**M1 (3 bütçe × 7 tile × 5 çekiliş): 17 gün.**
 
-Baskın terim hâlâ codebook, ama **payı daralıyor**: diğer ikisinin toplamının
-5 katıydı, şimdi 3.6 katı. Rotasyon (`Q@H@Qᵀ`) T=4'te 1.92 saatle ikinci sıraya
-yerleşti ve TF32 ona 1.66× veriyor (§6.8) — bir sonraki eşik orada.
+**Artık hiçbir terim baskın değil.** Codebook hâlâ en büyüğü ama diğer ikisinin
+toplamının yalnızca **1.7 katı** (5 → 3.6 → 1.7). İki kalan kaldıraç da eşitlendi:
+ölçek uydurmayı düşürmek 8.9 gün,
+blok genişliği 8.3 gün.
+Sıradaki optimizasyon varsayımla değil, o an neyin en büyük olduğu ölçülerek
+seçilmeli — bu varsayım iki kez yanlış çıktı.
 
 ### 6.7 Aramayı taramaktan çıkarmak (08-23)
 
@@ -498,13 +502,48 @@ bütçede de koşacağına dair bir taahhüt yok.
 
 | tasarım | şimdi | +fp16 |
 |---|---|---|
-| A. Tam M1 (3 bütçe × 7 tile × 5 çekiliş) | 29.0 g | 20.0 g |
-| **C. B=1.5'te 5 çekiliş, iç tile'lar 2, diğer bütçeler 1** | **9.8 g** | **6.8 g** |
-| D. Tek bütçe, 5 çekiliş, 7 tile | 8.3 g | 5.8 g |
-| F. Tek bütçe, 1 çekiliş, 7 tile — ilk gerçek U eğrisi | **1.7 g** | 1.2 g |
+| A. Tam M1 (3 bütçe × 7 tile × 5 çekiliş) | 17.4 g | 12.0 g |
+| **C. B=1.5'te 5 çekiliş, iç tile'lar 2, diğer bütçeler 1** | **5.8 g** | **4.0 g** |
+| D. Tek bütçe, 5 çekiliş, 7 tile | 4.9 g | 3.4 g |
+| F. Tek bütçe, 1 çekiliş, 7 tile — ilk gerçek U eğrisi | **23 saat** | 16 saat |
 
 C, Kapı B'yi birincil bütçede tam güçte kararlarken tile eksenini budamıyor ve
 diğer iki bütçeyi sağlamlık kontrolü olarak tutuyor.
+
+### 6.9 Triton: elementwise zincirleri füzyonlamak (08-24)
+
+Profil, GPU'nun **%28.4** meşgul olduğunu gösteriyordu — bir chunk'ta 414,841
+çekirdek çağrısı, ölçülen fırlatma maliyeti 10.1 µs, yani boşta geçen sürenin
+**%80'i** doğrudan fırlatma. Çözüm füzyon, ve `torch.compile` bunu ancak Triton
+ile yapabiliyor.
+
+**Windows'ta Triton var:** upstream `triton` tekerlek yayımlamıyor ama
+`triton-windows` PyPI'da, ve sürüm eşleşiyor (`torch 2.12` → `triton 3.7.0`
+→ `triton-windows==3.7.0.post26`). Kuruldu, `has_triton()` True.
+
+İki elementwise blok ayrı saf fonksiyonlara çıkarılıp `dynamic=True` ile
+derlendi (`_analytic_shift`, `_lattice_shift`):
+
+| ölçek | kazanç |
+|---|---|
+| `_nearest_halfinteger_even` tek başına | 2.30× |
+| analitik aramanın gövdesi | 5.96–6.62× |
+| **tile başına uçtan uca** | **1.64× / 1.72× / 1.87×** |
+
+**Çıktı birebir aynı** — ve bu test edildi, çünkü füzyon bir hız değişikliği
+olmalı, sonuç değişikliği değil. Toolchain'i olmayan bir makinede kod eager'a
+düşüyor; iki yol farklı sonuç verseydi işi hangi makinenin koştuğu modeli
+değiştirirdi.
+
+`dynamic=True` şart: satır sayısı kafes çözücünün çözemediği satır sayısı, yani
+her çağrıda değişiyor. Statik derlense her yeni şekilde birkaç saniye harcardı;
+dinamik, bir kez derlenip 64 kat aralıkta **sıfır yeniden derleme** ile
+çalışıyor.
+
+Derleme, gerçek çağrının içinde değil **bir sonda ile zorlanıyor**: Inductor
+tembel, ve bu makinede CUDA Triton'la derleniyor ama CPU `cl` istiyor ve
+bulamıyor. Cihaz/dtype başına sondalamak bunu bir başlangıç ayrıntısı yapıyor,
+katmanın ortasında bir çökme değil.
 
 ## 7. Sırada ne var
 
@@ -604,6 +643,9 @@ kontrolü bunun için var.
 | **Süreç sayarken kendi ölçüm sürecini sayma** | PowerShell filtresini `python -c` içinden çağırınca kendini yakalıyor |
 | **`e8p_codebook(dtype).to(device)` her çağrıda 2 MB kopyalıyor** | `_on_device(dtype, device)` — cihaz-başı önbellek. Kopya, hızlı yolu seçen kimlik kontrolünü GPU'da hep yanlış yapıyordu ve bir ölçümü tamamen yanılttı |
 | **Python stdout tamponu arka plan koşularında** | `python -u`, yoksa ilerleme satırları sonuna kadar görünmüyor |
+| **`torch.compile` Windows'ta çalışmıyor sanılıyordu** | Upstream `triton` tekerlek yayımlamıyor ama **`triton-windows` var**: `pip install triton-windows==3.7.0.post26` (torch 2.12 → triton 3.7.0). Kurulduktan sonra `has_triton()` True ve CUDA füzyonu çalışıyor |
+| **Inductor CPU'da `cl` (MSVC) istiyor** | CUDA Triton'la derleniyor, CPU derlenemiyor. `quantize._shift_kernel` cihaz/dtype başına sondalıyor ve eager'a düşüyor — sessiz, çünkü iki yol birebir aynı |
+| **`TILESPARSE_NO_COMPILE=1`** | Derlemeyi tamamen kapatır; derli/derlisiz karşılaştırma ve toolchain sorunları için |
 
 **Donanım:** RTX 5060 Laptop, 8 GB VRAM, sm_120 (Blackwell → cu128+;
 `torch 2.12.0+cu130` kurulu). 23.7 GiB RAM, 16 torch thread'i.
@@ -678,7 +720,10 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `f425880` | Bu belge, bilinenin etrafında yeniden yazıldı |
 | `f00fe9c` | Blok genişliği: **geri besleme daraltılır, rotasyon daraltılmaz**; maliyet modelinin Cholesky eğrisi düzeltildi (120 → 94 gün) |
 | `40c8d9c` | Süpürme tile'lar arasında toplu — bit-birebir aynı çıktı, 94 → 48 gün |
-| *(bu oturum)* | Ölçek örneklemesi ölçüldü ve **reddedildi**; fp16 arama eklendi (varsayılan kapalı) |
+| `7da170c` | Ölçek örneklemesi ölçüldü ve **reddedildi**; fp16 arama eklendi (varsayılan kapalı) |
+| `a33839b` | **Analitik en-yakın-kodsözcüğü**: arama çözülüyor, taranmıyor. 48 → 29 gün |
+| `1a27ead` | Analitik aramanın parça boyutu genişletildi (fırlatma bağımlı) |
+| *(bu oturum)* | **Triton kuruldu**, iki elementwise zincir füzyonlandı. 29 → **17 gün** (§6.9) |
 
 ---
 

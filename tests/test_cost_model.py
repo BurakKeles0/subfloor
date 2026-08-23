@@ -447,27 +447,21 @@ def test_compress_time_is_the_three_terms():
         c["cholesky_seconds"] + c["rotation_seconds"] + c["codebook_seconds"])
 
 
-def test_the_codebook_sweep_is_the_wall_not_the_factorization():
-    """The finding that reorders everything.
+def test_no_single_term_dominates_the_pass_any_more():
+    """Where the optimisation ran out, and why that is itself the finding.
 
-    STATUS 6.3 reads the factorization as the structural wall and a block width
-    as the fix.  Measured, the factorization is a fraction of the pass and the
-    scale-fitting sweep is most of it.  Evaluated at the configuration the
-    pipeline actually runs -- feedback confined to 512, sweep chunked, unsettled
-    rows resolved analytically -- the codebook term still outweighs the Cholesky
-    and the rotation together at every tile size, and dropping the per-tile
-    scale fit is still worth more than twice what confining the feedback is.
+    STATUS 6.3 read the factorization as the structural wall.  It was not -- the
+    codebook sweep outweighed the Cholesky and the rotation together by over 5x.
+    Confining the feedback, chunking the sweep, replacing the scan with
+    arithmetic and fusing the elementwise chains have since cut the codebook
+    term about eightfold, and the ratio came down with it: 5x, then 3.6x, now
+    about 1.7x.  The two remaining levers are within 10% of each other in days
+    saved.
 
-    Both margins have NARROWED -- the first from over 5x to 3.6x, the second
-    from 4x to 2.2x -- and that is progress rather than drift: the codebook term
-    fell 2.6x when the scan went away while the rotation did not move.  Once
-    they approach parity the rotation becomes worth attacking (TF32 buys 1.66x
-    on it), so the thresholds below are loose enough to keep passing and tight
-    enough to notice.
-
-    The block width is still worth taking: it is free, it is what makes the
-    chunked sweep affordable, and the measurement says it IMPROVES quality.  It
-    is simply not the lever that decides whether M1 runs.
+    So the invariant worth holding is no longer "the codebook is the wall".  It
+    is that NOTHING is: the terms have converged, and the next optimisation has
+    to be chosen by measuring which is largest rather than by assuming.  That
+    deserves a test because the assumption was wrong twice.
     """
     import json
     from pathlib import Path
@@ -478,14 +472,20 @@ def test_the_codebook_sweep_is_the_wall_not_the_factorization():
     if "cuda_f32" not in rates["setups"]:
         pytest.skip("no cuda rates measured on this machine")
 
+    # Still the largest single term, but no longer by a wide margin.
     for tile in (1, 4, 16):
-        c = CM.model_cost(tile, 1.5, rates, "cuda_f32", hessian_block=512)
-        assert c["codebook_seconds"] >= 2 * (c["cholesky_seconds"]
-                                             + c["rotation_seconds"])
+        c = CM.model_cost(tile, 1.5, rates, "cuda_f32")
+        others = c["cholesky_seconds"] + c["rotation_seconds"]
+        assert c["codebook_seconds"] > others
+        assert c["codebook_seconds"] < 3 * others, (
+            "the codebook term has stopped dominating; if this ever fails "
+            "upward again, something regressed in the search"
+        )
 
+    # And the two remaining levers are comparable, which is what "converged"
+    # means in practice: neither is the obvious next thing to attack.
     base = CM.m1_cost(rates, "cuda_f32")["days"]
-    blocked = CM.m1_cost(rates, "cuda_f32", hessian_block=512)["days"]
-    no_fit = CM.m1_cost(rates, "cuda_f32", scale_fit=False,
-                        hessian_block=512)["days"]
-    assert blocked > 0.7 * base                  # the block width: a minor saving
-    assert (base - no_fit) > 2 * (base - blocked)   # the scale fit: still larger
+    unblocked = CM.m1_cost(rates, "cuda_f32", hessian_block=None)["days"]
+    no_fit = CM.m1_cost(rates, "cuda_f32", scale_fit=False)["days"]
+    scale_lever, block_lever = base - no_fit, unblocked - base
+    assert 0.5 < scale_lever / block_lever < 2.0

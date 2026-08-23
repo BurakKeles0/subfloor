@@ -127,6 +127,15 @@ SCALE_FIT_MULTIPLIER = 6.0
 #: scan where it pays.  The scan numbers it supersedes, for the record:
 #:   cpu_f64  (2560,4,4.49) (2944,16,29.26) (3072,128,266.04)
 #:   cuda_f32 (2560,4,0.28) (2944,16, 0.83) (3072,128,  5.93)
+#: `cuda_f32` re-measured 2026-08-24 with `torch.compile` active on both
+#: elementwise kernels (`quantize._analytic_shift`, `quantize._lattice_shift`),
+#: which `triton-windows` makes possible on this machine: 1.64x / 1.72x / 1.87x,
+#: output bit-identical.  THESE NUMBERS ASSUME A WORKING TRITON.  Without one
+#: the code still runs and still gives the same answer, but roughly 1.7x slower,
+#: and the model would then be optimistic by that factor.
+#:   superseded eager: (2560,4,0.0887) (2944,16,0.1201) (3072,128,0.3883)
+#:
+#: Earlier note:
 #: `cuda_f32` re-measured again 2026-08-23 after `quantize.nearest_e8p_analytic`
 #: replaced the SCAN that unsettled rows used to fall back to: 1.35x / 2.65x /
 #: 5.62x per tile on top of what the chunked sweep already gave.  The gain grows
@@ -153,7 +162,7 @@ SCALE_FIT_MULTIPLIER = 6.0
 #:   superseded cuda_f32, chunk=1: (2560,4,0.247) (2944,16,0.454) (3072,128,2.309)
 TILE_TIMINGS = {
     "cpu_f64": ((2560, 4, 1.741), (2944, 16, 8.721), (3072, 128, 95.83)),
-    "cuda_f32": ((2560, 4, 0.0887), (2944, 16, 0.1201), (3072, 128, 0.3883)),
+    "cuda_f32": ((2560, 4, 0.0534), (2944, 16, 0.0631), (3072, 128, 0.1851)),
 }
 
 #: Seconds for ONE `quantize._upper_inverse_factor` call, measured on this
