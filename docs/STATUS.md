@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-24 · HEAD `1efa971` · Testler: **547 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-24 · HEAD `1efa971` · Testler: **552 geçiyor, 6 atlanıyor**
 
 ---
 
@@ -701,7 +701,8 @@ yok. §8.1'in checkpoint'i bu yüzden kritik yolda.
 | **`torchvision` ABI uyumsuzluğu transformers'ı komple kırıyor** | torch'u yükseltirken eşleştir, ya da kaldır |
 | **`load_dataset("wikitext", ...)` reddediliyor** | `Salesforce/wikitext` — `namespace/name` gerekiyor |
 | **Süreç sayarken kendi ölçüm sürecini sayma** | PowerShell filtresini `python -c` içinden çağırınca kendini yakalıyor |
-| **`_on_device` önbelleği cihaz DİZESİYLE anahtarlı** | `"cuda"` ile `"cuda:0"` **farklı nesneler** döndürüyor, ve hızlı yol bir `is` kontrolüyle seçiliyor. Hat `str(tensor.device)` kullandığı için doğru yolda, ama **kıyaslama yazarken aynısını kullan** — yoksa sessizce kaba kuvvet ölçülür. **08-24'te dört ölçümü daha yanılttı** ve önce GPU çekişmesine, sonra saat düşüşüne yorulup ikisi de yanlış çıktı. Belirtisi: optimizasyon 1.00× görünüyor. Kod hâlâ düzeltilmedi; `torch.device()` ile normalize etmek sınıfı siler |
+| ~~**`_on_device` önbelleği cihaz DİZESİYLE anahtarlı**~~ → **düzeltildi 08-24** | `"cuda"` ile `"cuda:0"` **farklı nesneler** döndürüyordu ve hızlı yol bir `is` kontrolüyle seçiliyor, yani kısa yazımı kullanan her çağıran sessizce kaba kuvvete düşüyordu. Üç oturum boyunca belgede durdu, kodda düzeltilmedi, ve **08-24'te dört ölçümü daha yanılttı** — ikisi önce GPU çekişmesine, sonra saat düşüşüne yoruldu, ikisi de yanlış. Belirtisi kötü: optimizasyon **1.00× görünüyor**, yani hata değil sonuç gibi okunuyor. Artık `_device_key` anahtarı normalleştiriyor; ölçülen ek maliyet dönüşümlü A/B'de −%0.8/+%0.4 |
+| **Kıyaslamada hızlı yolun açık olduğunu doğrula** | `quantize.is_canonical_codebook(cb)` — bir `assert` ile. Kendi codebook kopyasını kuran ya da cihazı kısa yazan bir kıyaslama hâlâ taramayı ölçer, ve bu **doğru** davranış; tek sorun sessiz olmasıydı. Zamanlama yazarken bunu iddia et |
 | **Python stdout tamponu arka plan koşularında** | `python -u` |
 | **`torch.compile` Windows'ta çalışmıyor sanılıyordu** | `pip install triton-windows==3.7.0.post26` (torch 2.12 → triton 3.7.0). Sonra `has_triton()` True |
 | **Inductor CPU'da `cl` (MSVC) istiyor** | CUDA derleniyor, CPU derlenemiyor. `quantize._shift_kernel` cihaz/dtype başına sondalıyor ve eager'a düşüyor — sessiz, çünkü iki yol birebir aynı |
@@ -791,6 +792,7 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `cc3e0f4` | **Triton kuruldu**, iki elementwise zincir füzyonlandı. 29 → 17 gün |
 | `8f5f59f` | Bu belge yeniden yazıldı: yapılan / yapılmayan / reddedilen ayrıldı |
 | `1efa971` | **Ölçek adayları tek aramada** (§6.7); maliyet modelinin **beşinci hatası** ve iki geri çekilen ölçüm (§6.3). 17 → 12 gün, ve baskın terim codebook'tan **rotasyona** geçti |
+| *(bu değişiklik)* | **`_on_device` tuzağı kapatıldı** (§10). Üç oturumdur belgede duran, kodda durmayan hata; dört ölçümü bozmuştu |
 
 ---
 

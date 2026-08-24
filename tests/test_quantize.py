@@ -963,3 +963,98 @@ def test_a_layers_scales_still_come_from_the_unbatched_fit():
            for t in range(n_tiles)]
     assert qb.scales.tolist() == ref
     assert len(set(ref)) > 1                  # the tiles really do differ
+
+
+# --------------------------------------------------------------------------- #
+# DEVICE-KEYED CACHES
+# --------------------------------------------------------------------------- #
+# `_on_device` is cached per device, and `_nearest` decides whether to decode
+# the lattice or scan 65536 codewords by asking whether the codebook it was
+# handed IS that cached tensor.  Keyed on the SPELLING, "cuda" and "cuda:0" are
+# two entries holding two tensors, so a caller who spelled it short failed the
+# identity check and silently got the scan.
+#
+# `docs/STATUS.md` section 10 carried this as a benchmarking hazard for three
+# sessions.  On 2026-08-24 it invalidated four measurements, two of which were
+# first misdiagnosed as GPU contention and as clock throttling -- the symptom is
+# an optimisation that reads 1.00x, which looks like a result rather than a bug.
+#
+# The first two tests below pin the cache.  The third is the one that would
+# actually have caught it: it watches which PATH `_nearest` takes, because
+# agreeing on the answer was never the problem.
+
+def test_the_codebook_cache_ignores_how_the_device_was_spelled():
+    a = Q._on_device(DT, "cpu")
+    assert a is Q._on_device(DT, "cpu:0")
+    assert a is Q._on_device(DT, torch.device("cpu"))
+    assert a is Q._on_device(DT, torch.device("cpu", 0))
+    assert a is Q._on_device(DT, torch.zeros(1).device)
+    # the source table and the membership table share the key, and the same trap
+    assert Q._source_on_device(DT, "cpu") is Q._source_on_device(DT, "cpu:0")
+    assert Q._table_on_device("cpu") is Q._table_on_device("cpu:0")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda")
+def test_the_codebook_cache_ignores_the_spelling_where_it_actually_bit():
+    """The CPU test above cannot fail, and that is worth saying out loud.
+
+    `Tensor.to("cpu")` on a tensor already there returns SELF, so both spellings
+    hand back the one cached table whatever the key does -- the assertions hold
+    even with the bug present.  Moving to cuda copies, so two keys really do
+    make two tensors, and that is where the four measurements were lost.
+    """
+    dt = torch.float32
+    a = Q._on_device(dt, "cuda")
+    assert a is Q._on_device(dt, "cuda:0")
+    assert a is Q._on_device(dt, torch.device("cuda"))
+    assert a is Q._on_device(dt, torch.zeros(1, device="cuda").device)
+    assert Q.is_canonical_codebook(a)
+    assert Q._source_on_device(dt, "cuda") is Q._source_on_device(dt, "cuda:0")
+    assert Q._table_on_device("cuda") is Q._table_on_device("cuda:0")
+
+    # And the whole point: a short spelling must still reach the decoder.
+    x = torch.randn((4096, 8), dtype=dt, device="cuda") * 6.0
+    assert torch.equal(Q._nearest(x, Q._on_device(dt, "cuda"))[0],
+                       Q._nearest(x, Q._on_device(dt, "cuda:0"))[0])
+
+
+def test_is_canonical_codebook_says_whether_the_fast_path_is_armed():
+    assert Q.is_canonical_codebook(Q._on_device(DT, "cpu"))
+    assert Q.is_canonical_codebook(Q._on_device(DT, "cpu:0"))
+    # A private copy has the same VALUES and is still not the cached tensor, so
+    # the scan is correct for it.  Tests that want the scan rely on this.
+    assert not Q.is_canonical_codebook(Q.e8p_codebook(DT).clone())
+
+
+@pytest.mark.parametrize("spelling", ["cpu", "cpu:0"])
+def test_a_short_device_spelling_still_takes_the_fast_path(monkeypatch, spelling):
+    """The test that has teeth: count the rows that reach the scan.
+
+    Checking the ANSWER would prove nothing -- the scan and the decoder agree by
+    construction, which is exactly why the bug survived three sessions.  What
+    changed was the path, so that is what this watches.
+
+    The scale is chosen so the decoder misses on well over `_ANALYTIC_MIN_ROWS`
+    rows, which sends the unsettled ones to the analytic form rather than the
+    scan.  On the fast path the scan should therefore see NOTHING.  (At a scale
+    the decoder handles comfortably it settles 99.6% and the handful left over
+    go to the scan on their own, which would make a zero here unreachable and
+    the test vacuous -- so `* 6.0`, the same "far outside the ball" input
+    `test_the_fallback_is_the_analytic_form_not_a_scan` uses.)
+    """
+    seen = []
+    real = Q._brute_force
+    monkeypatch.setattr(Q, "_brute_force",
+                        lambda x, cb, chunk=4096: (seen.append(x.shape[0]), real(x, cb, chunk))[1])
+
+    x = torch.randn((4096, 8), dtype=DT) * 6.0
+    assert int((~Q.nearest_e8p(x)[2]).sum()) >= Q._ANALYTIC_MIN_ROWS
+    cb = Q._on_device(DT, spelling)
+    fast_idx, _ = Q._nearest(x, cb)
+    assert sum(seen) == 0, f"{sum(seen)} rows fell through to the scan"
+
+    # And the scan is still reachable, so a zero above means something.
+    seen.clear()
+    scan_idx, _ = Q._nearest(x, Q.e8p_codebook(DT).clone())
+    assert sum(seen) == x.shape[0]
+    assert torch.equal(fast_idx, scan_idx)

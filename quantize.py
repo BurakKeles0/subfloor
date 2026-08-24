@@ -56,6 +56,7 @@ __all__ = [
     "source_codebook",
     "e8p_codebook",
     "in_e8_plus_quarter",
+    "is_canonical_codebook",
     "fit_scale",
     "FIT_STEPS",
     "quantize_vectors",
@@ -190,21 +191,68 @@ _LATTICE_MIN_ROWS = {"cpu": 64, "cuda": 1024}
 _ANALYTIC_MIN_ROWS = 384
 
 
+def _device_key(device: torch.device | str) -> str:
+    """Canonical cache key for `device`.
+
+    `"cuda"` and `"cuda:0"` name one card and hash to two entries.  Cached on
+    the spelling, that hands two callers two DIFFERENT codebook tensors -- and
+    since the fast path is selected by an `is` against the cached one, the
+    caller who spelled it short silently drops to the brute-force scan.
+
+    `docs/STATUS.md` section 10 carried this as a benchmarking hazard for three
+    sessions without the code being fixed.  On 2026-08-24 it invalidated four
+    measurements, two of which were first misdiagnosed as GPU contention and as
+    clock throttling, because the symptom is an optimisation that reads 1.00x.
+
+    Tensors always report a fully qualified device, so `str(t.device)` -- what
+    the pipeline itself passes -- takes the cheap branch.  Only a hand-written
+    spelling reaches the resolver, which asks torch where a tensor would
+    actually land rather than assuming device zero, so it stays right under
+    `torch.cuda.set_device`.
+    """
+    d = device if isinstance(device, torch.device) else torch.device(device)
+    if d.type == "cpu":
+        return "cpu"                       # tensors report plain "cpu"
+    if d.index is not None:
+        return f"{d.type}:{d.index}"
+    return str(torch.empty(0, device=d).device)
+
+
 @lru_cache(maxsize=16)
-def _on_device(dtype: torch.dtype, device: str) -> Tensor:
-    """The codebook, cached PER DEVICE.
+def _codebook_cached(dtype: torch.dtype, device_key: str) -> Tensor:
+    return e8p_codebook(dtype).to(device_key)
+
+
+def _on_device(dtype: torch.dtype, device: torch.device | str) -> Tensor:
+    """The codebook, cached PER DEVICE, keyed on the device rather than on how
+    it was spelled (`_device_key`).
 
     `e8p_codebook(dtype).to(device)` copies two megabytes on every call, which
     is more work than the search it was meant to serve and makes an `is` check
     against it always false.  Caching the moved tensor is what lets the fast
     path be selected at all.
     """
-    return e8p_codebook(dtype).to(device)
+    return _codebook_cached(dtype, _device_key(device))
+
+
+def is_canonical_codebook(codebook: Tensor) -> bool:
+    """Is this THE cached E8P table, so `_nearest` will take its fast path?
+
+    Exported because the failure it guards against is silent and expensive: a
+    benchmark that builds its own codebook, or spells the device short, measures
+    the brute-force scan and reports no speedup for a change that has one.
+    Assert this next to any timing of `_nearest`, `fit_scale` or a tile.
+    """
+    return codebook is _on_device(codebook.dtype, codebook.device)
 
 
 @lru_cache(maxsize=16)
-def _table_on_device(device: str) -> Tensor:
-    return _source_index_table().to(device)
+def _table_cached(device_key: str) -> Tensor:
+    return _source_index_table().to(device_key)
+
+
+def _table_on_device(device: torch.device | str) -> Tensor:
+    return _table_cached(_device_key(device))
 
 
 @lru_cache(maxsize=2)
@@ -343,8 +391,12 @@ def nearest_e8p(x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
 
 
 @lru_cache(maxsize=16)
-def _source_on_device(dtype: torch.dtype, device: str) -> Tensor:
-    return source_codebook(dtype).to(device)
+def _source_cached(dtype: torch.dtype, device_key: str) -> Tensor:
+    return source_codebook(dtype).to(device_key)
+
+
+def _source_on_device(dtype: torch.dtype, device: torch.device | str) -> Tensor:
+    return _source_cached(dtype, _device_key(device))
 
 
 def _analytic_shift(z: Tensor, St: Tensor, s_norm2: Tensor,
@@ -538,8 +590,7 @@ def _nearest(x: Tensor, codebook: Tensor, chunk: int = 4096,
         return idx, codebook[idx]
 
     floor_rows = _LATTICE_MIN_ROWS.get(x.device.type, 64)
-    if (x.shape[0] >= floor_rows
-            and codebook is _on_device(x.dtype, str(codebook.device))):
+    if x.shape[0] >= floor_rows and is_canonical_codebook(codebook):
         idx, code, exact = nearest_e8p(x)
         if bool(exact.all()):
             return idx, code
