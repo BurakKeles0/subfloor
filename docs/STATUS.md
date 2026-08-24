@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-24 · HEAD `8f5f59f`+ · Testler: **547 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-24 · HEAD `1efa971` · Testler: **547 geçiyor, 6 atlanıyor**
 
 ---
 
@@ -790,7 +790,7 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `1a27ead` | Analitik aramanın parça boyutu genişletildi (fırlatma bağımlı) |
 | `cc3e0f4` | **Triton kuruldu**, iki elementwise zincir füzyonlandı. 29 → 17 gün |
 | `8f5f59f` | Bu belge yeniden yazıldı: yapılan / yapılmayan / reddedilen ayrıldı |
-| *(bu değişiklik)* | **Ölçek adayları tek aramada** (§6.7); maliyet modelinin **beşinci hatası** ve iki geri çekilen ölçüm (§6.3). 17 → 12 gün, ve baskın terim codebook'tan **rotasyona** geçti |
+| `1efa971` | **Ölçek adayları tek aramada** (§6.7); maliyet modelinin **beşinci hatası** ve iki geri çekilen ölçüm (§6.3). 17 → 12 gün, ve baskın terim codebook'tan **rotasyona** geçti |
 
 ---
 
