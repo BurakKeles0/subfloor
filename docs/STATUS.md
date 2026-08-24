@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-25 · HEAD `PENDING` · Testler: **629 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-25 · HEAD `ffb8a06` · Testler: **629 geçiyor, 6 atlanıyor**
 > Bu oturumun ölçüm dersleri **§14**'te — hız kazançlarından daha taşınabilir.
 
 ---
@@ -386,7 +386,7 @@ ortaya çıktı:
 > Ve üçü de aranarak değil, **başka bir şey düzeltilirken** çıktı: ikisi eksik
 > terim arayışında, biri provenance düzeltilirken.
 
-### 6.3 Maliyet modelinin dokuz hatası
+### 6.3 Maliyet modelinin on hatası
 
 İlk üçü iyimser, dördüncüsü **kötümser** — ve o en çok zarar veren oldu, çünkü
 bu sayı M1'in koşulup koşulmayacağını söyleyen sayı. Beşincisi yine iyimser.
@@ -1120,6 +1120,83 @@ kalibre edilmiş bir sayı.
 koşu, yedi şekil — en büyük sapma **%3.4**. Kıyas için 08-24: elle ölçülmüş üç
 tile süresinden **ikisi hiç tekrarlanmadı** (%28 ve %65, §6.3). Betiğe
 çevirmenin asıl kazancı hız değil, bu.
+
+---
+
+### 6.16 Sürücü koştu, ve model gerçek blokta 5.2× iyimser çıktı
+
+08-25. `m1_run.py` yazıldı (§8.1 kapandı) ve gerçek Llama-2-7B üzerinde koştu.
+İlk gerçek blok sıkıştırıldı, checkpoint yazıldı, ve **resume gerçek modelde
+doğrulandı** — "resuming at block 1 of 32", ardından blok 2, 3, 4.
+
+İlk gerçek sayılar (blok 0, B=1.5, T=16, 4 kalibrasyon penceresi — gösterge
+değil, **tesisat kanıtı**):
+
+| katman | rel. hata | katman | rel. hata |
+|---|---|---|---|
+| q_proj | 0.0988 | gate_proj | 0.2183 |
+| k_proj | 0.1065 | up_proj | 0.2219 |
+| v_proj | 0.1799 | down_proj | 0.2723 |
+| **o_proj** | **0.4199** | | |
+
+**Ve maliyet modeli ilk kez koşarak sınandı.** Blok başına, iki temiz delta
+(blok 3 ve 4: 5.6 ve 5.7 dk):
+
+| | modelin dediği | gözlenen | |
+|---|---|---|---|
+| kaldıraçlar açık | 65 s | **339 s** | **5.2×** |
+| kaldıraçlar kapalı | 180 s | 339 s | 1.9× |
+
+**Bu, dokuz hatanın hiçbirinin sınıfı değil.** Öncekilerin yedisi "modelin
+bilmediği bir şey"di ve hepsi modeli *okuyarak* bulundu. Bu, liste doğruyken
+**oranların** yanlış olması — ve hattı **koşarak** bulundu.
+
+**Kaldıraç çarpanları ölçülmedi, türetildi.** Kron için 5.52×, fp16 için 1.38×
+kullandım; birincisi §6.8'in tile-ağırlıklı ortalaması, ikincisi §6.9'un
+medyanından çıkardığım bir terim oranı. §6.3'ün kendi kuralı —
+*mikro-benchmark'lardan maliyet kurmak burada işlemiyor* — terim oranlarına hiç
+uygulanmamıştı.
+
+**Nerede OLMADIĞI da ölçüldü.** Bir bloğun fazları:
+
+| faz | süre | pay |
+|---|---|---|
+| **`run_config`** | **141.75 s** | **%99.1** |
+| `collect_block_statistics` | 0.68 s | %0.5 |
+| `output_error` (kayıt için) | 0.41 s | %0.3 |
+| blok yeniden ileri | 0.14 s | %0.1 |
+| `LayerProblem` kurulumu | 0.02 s | %0.0 |
+
+Üç aday — kalibrasyon, kayıt için hesaplanan `output_error`, problem kurulumu —
+**hepsi elendi**. Boşluk `run_config`'in dışında değil, içinde.
+
+**Geriye bağlam kaldı, ve desen şu:**
+
+| aynı yedi katman, aynı şekiller | süre |
+|---|---|
+| tek tek, **ısınmış** (`m0_pass_breakdown`'ın 2. çağrısı) | 84 s |
+| tek blok, **soğuk**, boş kartta ayrı süreçte | 142 s |
+| **sürücünün içinde**, blok 3 | **339 s** |
+
+Aritmetik aynı, **bağlam** değişiyor. Sürücüdeki fark kartın o an **7.7 GB**'ta
+olmasıyla örtüşüyor; ayrı süreçteki profil 285 MiB'de başladı. Baskın hipotez
+**bellek baskısı**: `sequential_calibrate` yedi Hessian'ı (846 MB) blok boyunca
+canlı tutuyor, oysa her katman sıkıştırıldıktan sonra kendisininki bırakılabilir.
+**Ölçülmedi — sıradaki iş.**
+
+> **Katman ölçümleri de "ısınmış" olduğu için düşük.** `m0_pass_breakdown`
+> `clean_seconds` diye **ikinci** çağrıyı raporluyor; birincisi derliyor ve
+> önbellek ısıtıyor. Gerçek koşuda her şekil bir kez soğuk karşılanıyor — 84'e
+> karşı 142 arasındaki fark bu. **`TILE_TIMINGS` de aynı ısınmış biçimde
+> ölçüldü**, yani §6.14'ün sayıları da bu yönde düşük.
+
+**Bir de araç bir kez kendi korumasından geçemedi.** `m0_pass_breakdown`'ın
+"sarmalamak cevabı değiştirmemeli" assert'i bir koşuda kırıldı, ertesinde
+kırılmadı — **aralıklı**. Gevşetmek yerine **konuşturuldu**: assert duruyor ama
+artık farkın büyüklüğünü basıyor. Sebebi: float32-epsilon düzeyinde bir fark
+(hatta belirlenimsiz bir indirgeme var) ile büyük bir fark (araç yanlış şeyi
+ölçüyor) **zıt tepkiler** gerektiriyor, ve bir tolerans ikisini ayırt edilemez
+yapardı. Tekrar görülene kadar açık.
 
 ---
 
