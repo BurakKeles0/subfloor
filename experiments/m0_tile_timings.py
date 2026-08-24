@@ -84,7 +84,19 @@ def grid_shapes(n_out: int = LAYER[0], n_in: int = LAYER[1],
 
 def measure(k: int, lines: int, n_tiles: int, *, device: str, dtype,
             reps: int, seed: int = 0) -> dict:
-    """Seconds per tile for `ldlq_quantize_blocks` at this cell."""
+    """Seconds per tile, with the per-tile scale fit and without it.
+
+    Both arms in ONE alternating run rather than two, because the RATIO between
+    them is what `SCALE_FIT_MULTIPLIER` carries, and absolute times on this
+    machine move 14-37% between runs -- a ratio taken across two runs would be
+    measuring the machine.
+
+    The no-fit arm gets the scale `fit_scale` would have found, not an arbitrary
+    one.  That matters more than it looks: a badly scaled input misses far more
+    often in the lattice decoder, so a fixed `scale=1.0` would quietly change how
+    much search work the sweep does, and the ratio would be pricing two
+    different amounts of work rather than the fit.
+    """
     g = torch.Generator().manual_seed(seed)
     blocks = torch.randn((n_tiles, lines, k), generator=g).to(device=device,
                                                               dtype=dtype)
@@ -94,26 +106,33 @@ def measure(k: int, lines: int, n_tiles: int, *, device: str, dtype,
     # Assert the fast path is open.  A benchmark that quietly measures the scan
     # is the failure `is_canonical_codebook` was exported for, and it has cost
     # this project four measurements.
-    assert Qz.is_canonical_codebook(Qz._on_device(blocks.dtype,
-                                                  str(blocks.device)))
+    cb = Qz._on_device(blocks.dtype, str(blocks.device))
+    assert Qz.is_canonical_codebook(cb)
 
     chunk = Qz.auto_chunk(n_tiles, lines, k, blocks.element_size(),
                           HESSIAN_BLOCK)
+    alpha = Qz.fit_scale(blocks[0].reshape(-1, Qz.E8P_DIM), cb)
 
-    def run():
-        Qz.ldlq_quantize_blocks(blocks, lambda t: H,
-                                hessian_block=HESSIAN_BLOCK, chunk=chunk)
+    def arm(scale):
+        def f():
+            Qz.ldlq_quantize_blocks(blocks, lambda t: H, scale=scale,
+                                    hessian_block=HESSIAN_BLOCK, chunk=chunk)
+        return f
 
-    timed = BG.alternating({"tile": run}, reps=reps, warmup=2)["tile"]
+    timed = BG.alternating({"fit": arm("per_tile"), "no_fit": arm(alpha)},
+                           reps=reps, warmup=2)
     del blocks, H
     if device == "cuda":
         torch.cuda.empty_cache()
     return {
         "k": k, "lines": lines, "n_tiles": n_tiles, "chunk": chunk,
         "rows_into_nearest": chunk * lines,
-        "seconds_per_tile": timed["median"] / n_tiles,
-        "seconds_total": timed["median"],
-        "spread": timed["spread"],
+        "seconds_per_tile": timed["fit"]["median"] / n_tiles,
+        "seconds_per_tile_no_fit": timed["no_fit"]["median"] / n_tiles,
+        "tile_ratio": timed["fit"]["median"] / timed["no_fit"]["median"],
+        "seconds_total": timed["fit"]["median"],
+        "spread": timed["fit"]["spread"],
+        "spread_no_fit": timed["no_fit"]["spread"],
     }
 
 
@@ -123,23 +142,26 @@ def run(device: str = "cuda", dtype=torch.float32, reps: int = 3,
         print(f"  GPU: {BG.require_quiet_gpu(strict=strict)}\n")
 
     rows = []
-    print("%-6s %6s %6s %8s %7s %7s %14s %8s"
-          % ("T", "k", "lines", "n_tiles", "chunk", "satir", "s/tile", "yayilim"))
+    print("%-6s %6s %6s %8s %7s %7s %12s %12s %7s %10s"
+          % ("T", "k", "lines", "n_tiles", "chunk", "satir", "s/tile",
+             "fitsiz", "oran", "yayilim"))
     for t, k, lines, n_tiles in grid_shapes():
         r = measure(k, lines, n_tiles, device=device, dtype=dtype, reps=reps)
         r["tile_size"] = t
         rows.append(r)
-        print("%-6s %6d %6d %8d %7d %7d %14.6f %7.0f%%"
+        print("%-6s %6d %6d %8d %7d %7d %12.6f %12.6f %7.3f %6.0f%%/%.0f%%"
               % (t, k, lines, n_tiles, r["chunk"], r["rows_into_nearest"],
-                 r["seconds_per_tile"], r["spread"] * 100))
+                 r["seconds_per_tile"], r["seconds_per_tile_no_fit"],
+                 r["tile_ratio"], r["spread"] * 100, r["spread_no_fit"] * 100))
     return rows
 
 
 def as_literal(rows: list[dict], setup: str = "cuda_f32") -> str:
-    """The `TILE_TIMINGS` entry, ready to paste, tile count included."""
+    """The `TILE_TIMINGS` entry, ready to paste, provenance included."""
     body = ",\n".join(
-        f"                 ({r['k']}, {r['lines']}, {r['n_tiles']}, "
-        f"{r['seconds_per_tile']:.6g})" for r in rows)
+        f"        ({r['k']}, {r['lines']}, {r['n_tiles']}, "
+        f"{r['seconds_per_tile']:.6g}, {r['seconds_per_tile_no_fit']:.6g})"
+        for r in rows)
     return f'    "{setup}": (\n{body},\n    ),'
 
 

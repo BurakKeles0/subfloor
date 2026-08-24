@@ -149,37 +149,26 @@ CHOL_FLOPS_PER_K3 = 5.0 / 3.0
 CODEBOOK_SIZE = 1 << 16
 E8P_DIM = Qz.E8P_DIM
 
-#: `ldlq_quantize` does not search the codebook once per group -- it first calls
-#: `fit_scale`, which sweeps 24 candidate scales over the whole tile.
+#: Nominal figure for how much the per-tile scale fit adds to a tile, used only
+#: where no measurement is in reach (`layer_cost`'s flop accounting, which is
+#: reporting rather than costing).
 #:
-#: THIS CONSTANT WAS 6.0 AND IS NOW 1.39, and the change is the point.  The
-#: sweep used to be 83% of an o_proj-shaped tile (4 lines x 2560 survivors)
-#: because it paid a launch-bound search's fixed cost once per candidate.  Since
-#: the candidates are evaluated together (`quantize.fit_scale`, 2026-08-24) it
-#: is 28% at four lines, 17% at sixteen and 12.5% at 128 -- measured against the
-#: same code with a fixed `scale`, which is exactly what `scale_fit=False`
-#: prices.  1.39 is the four-line figure, the most favourable of the three, kept
-#: on the old convention of overstating the lever being argued about so that
-#: rejecting it stays robust.
+#: THE REAL ONE IS PER LINE COUNT -- see `scale_fit_multiplier`, which reads it
+#: off `TILE_TIMINGS`.  This was a single constant until 2026-08-25, measured at
+#: four lines and taken as the whole story, and it was the same defect as the
+#: tile times one level down: `fit_scale` runs once per tile over the vectors
+#: that tile holds, so its share is set by how many there are -- 128 at T=1,
+#: 1,280 at T=4, 5,888 at T=16 -- and one number cannot describe that.
 #:
-#: What that costs the argument: dropping the per-tile fit used to be the
-#: largest single saving available, worth several-fold.  It is now worth at most
-#: 28% of a tile, so `scale="per_layer"` -- already rejected on quality
-#: (11% worse, 2026-08-23) -- has lost its cost case as well.  So has sampling
-#: the fit, which `docs/STATUS.md` section 5.8 rejected on variance.
-#:
-#: READ `scale_fit=False` AS A CEILING, NOT AS A PLAN.  It prices removing the
-#: per-tile fit altogether -- a fixed scale, or `scale="per_layer"`.  It does
-#: NOT price `fit_scale(sample=N)`, which is the option `docs/STATUS.md` names,
-#: and the two are not close: the sweep only looks at the vectors a tile HAS, so
-#: capping it at N does nothing to a tile with fewer than N.  At B=1.5 a tile
-#: holds 128 vectors at T=1, 1,280 at T=4 and 5,888 at T=16, against a default
-#: cap of 8,192 -- so per-tile sampling at that cap is a no-op at exactly the
-#: tile sizes where the cost lives, and only bites at T=max, already the
-#: cheapest column.  `scale_sample_bites` is the check; the caps that would
-#: bite are small enough that their quality cost has to be measured rather than
-#: assumed.
-SCALE_FIT_MULTIPLIER = 1.39
+#: What the lever is FOR, unchanged: `scale_fit=False` prices removing the
+#: per-tile fit altogether -- a fixed scale, or `scale="per_layer"`, already
+#: rejected on quality (11% worse, 2026-08-23).  It does NOT price
+#: `fit_scale(sample=N)`, which is the option `docs/STATUS.md` names, and the
+#: two are not close: the sweep only looks at the vectors a tile HAS, so capping
+#: it at N does nothing to a tile with fewer than N.  Against a default cap of
+#: 8,192, per-tile sampling is a no-op at every tile size except T=max, already
+#: the cheapest column.  `scale_sample_bites` is the check.
+NOMINAL_SCALE_FIT_MULTIPLIER = 1.39
 
 #: END-TO-END per-tile wall times measured on this machine: (k, lines, seconds).
 #: One `ldlq_quantize` call each, at o_proj-shaped widths.
@@ -283,16 +272,17 @@ SCALE_FIT_MULTIPLIER = 1.39
 #: construction -- it describes the one-tile-at-a-time arrangement -- so it is
 #: the one place the provenance was never actually missing.
 TILE_TIMINGS = {
-    "cpu_f64": ((2560, 4, 1, 1.741), (2944, 16, 1, 8.721),
-                (3072, 128, 1, 95.83)),
+    # No fixed-scale arm: not re-measured, see above.
+    "cpu_f64": ((2560, 4, 1, 1.741, None), (2944, 16, 1, 8.721, None),
+                (3072, 128, 1, 95.83, None)),
     "cuda_f32": (
-        (1024, 1, 4096, 0.00729346),
-        (2048, 2, 2048, 0.00880856),
-        (2560, 4, 1024, 0.00996955),
-        (2816, 8, 512, 0.0140972),
-        (2944, 16, 256, 0.018819),
-        (3008, 32, 128, 0.0300036),
-        (3072, 4096, 1, 1.9503),
+        (1024, 1, 4096, 0.00735822, 0.0033168),
+        (2048, 2, 2048, 0.0091078, 0.00521151),
+        (2560, 4, 1024, 0.0102277, 0.00627163),
+        (2816, 8, 512, 0.0143954, 0.00927163),
+        (2944, 16, 256, 0.0189218, 0.0120188),
+        (3008, 32, 128, 0.0293969, 0.0187397),
+        (3072, 4096, 1, 1.9766, 0.914286),
     ),
 }
 
@@ -517,6 +507,7 @@ def _scheme(t):
 def layer_cost(n_out: int, n_in: int, tile_size, budget: float, *,
                vq_bits: float = 2.0, dtype_bytes: int = 8,
                scale_fit: bool = True,
+               scale_fit_multiplier: float = NOMINAL_SCALE_FIT_MULTIPLIER,
                hessian_block: int | None = DEFAULT_HESSIAN_BLOCK) -> dict | None:
     """Flops and bytes for one linear at one tile size.
 
@@ -553,7 +544,8 @@ def layer_cost(n_out: int, n_in: int, tile_size, budget: float, *,
         # one search per tile per group of eight, over that tile's lines --
         # times the scale-fitting sweep that precedes every tile
         "codebook_flops": (n_out * (k / E8P_DIM) * 2 * E8P_DIM * CODEBOOK_SIZE
-                           * (SCALE_FIT_MULTIPLIER if scale_fit else 1.0)),
+                           * (scale_fit_multiplier if scale_fit else 1.0)),
+        "scale_fit_multiplier": scale_fit_multiplier,
         "scale_fit": scale_fit,
         # what `tile_hessians` allocates in one go
         "hessian_bytes": n_tiles * k * k * dtype_bytes,
@@ -656,7 +648,7 @@ def codebook_seconds_per_vector(rates: dict, setup: str,
     measured_block = rates["setups"][setup].get(
         "tile_timing_block", TILE_TIMING_BLOCK.get(setup))
     fitted = []
-    for k, sample_lines, _n_tiles, seconds in samples:
+    for k, sample_lines, _n_tiles, seconds, _no_fit in samples:
         residual = seconds - cholesky_seconds(k, rates, setup,
                                               block=measured_block)
         if residual > 0:
@@ -667,6 +659,57 @@ def codebook_seconds_per_vector(rates: dict, setup: str,
         return max(v for _, v in fitted)
     # Nearest measured line count in log space -- the samples are octaves apart,
     # so interpolating between them would invent precision the data lacks.
+    return min(fitted, key=lambda s: abs(math.log(s[0] / max(lines, 1))))[1]
+
+
+def scale_fit_multiplier(rates: dict, setup: str,
+                         lines: int | None = None) -> float:
+    """How much more a tile costs because its scale is fitted per tile.
+
+    Read off the same measurement the tile times come from: each row of
+    `TILE_TIMINGS` carries the tile with the fit and the same tile given a fixed
+    scale, timed alternately in one process.  The ratio is taken on the
+    RESIDUALS -- Cholesky subtracted from both -- because the factorization is
+    not part of what the fit changes and leaving it in would dilute the ratio by
+    a different amount at every width.
+
+    NOT ONE NUMBER, for the same reason `codebook_seconds_per_vector` is not.
+    `fit_scale` runs once per tile over the vectors that tile holds, so its
+    share is set by how many there are: 128 at T=1, 1,280 at T=4, 5,888 at
+    T=16.  A single constant measured at four lines -- which is what this was
+    until 2026-08-25 -- understates the fine end, and the fine end is where the
+    grid's cost turned out to live.
+
+    `lines=None` returns the largest, which overstates the lever being argued
+    about and so keeps a REJECTION robust.  That was the old convention and it
+    is kept deliberately: every use of this so far has been to show the fit is
+    not worth removing.
+    """
+    samples = (rates["setups"][setup].get("tile_timings")
+               or TILE_TIMINGS.get(setup))
+    if not samples:
+        raise ValueError(f"no measured tile timings for setup {setup!r}")
+    measured_block = rates["setups"][setup].get(
+        "tile_timing_block", TILE_TIMING_BLOCK.get(setup))
+
+    fitted = []
+    for k, sample_lines, _n_tiles, seconds, seconds_no_fit in samples:
+        # `None` means the setup has no fixed-scale arm.  `cpu_f64` is the only
+        # one: it is not re-measured because the pipeline runs cuda/float32, and
+        # inventing a ratio for it would be worse than declining to have one.
+        if seconds_no_fit is None:
+            continue
+        chol = cholesky_seconds(k, rates, setup, block=measured_block)
+        with_fit, without = seconds - chol, seconds_no_fit - chol
+        if with_fit > 0 and without > 0:
+            fitted.append((sample_lines, with_fit / without))
+    if not fitted:
+        raise ValueError(
+            f"setup {setup!r} has no fixed-scale arm in its tile timings, so "
+            "the scale fit's share cannot be read off it"
+        )
+    if lines is None:
+        return max(v for _, v in fitted)
     return min(fitted, key=lambda s: abs(math.log(s[0] / max(lines, 1))))[1]
 
 
@@ -755,8 +798,12 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
         per_vector = codebook_seconds_per_vector(rates, setup,
                                                  c["lines_per_tile"])
         vectors = n_out * c["k"] / E8P_DIM
+        # The fit's share is read at THIS cell's line count, not from one
+        # constant: it is 128 vectors to amortize over at T=1 against 5,888 at
+        # T=16, and a single figure prices one of those two right.
         cb_seconds += count * vectors * E8P_DIM * per_vector * (
-            1.0 if scale_fit else 1.0 / SCALE_FIT_MULTIPLIER)
+            1.0 if scale_fit
+            else 1.0 / scale_fit_multiplier(rates, setup, c["lines_per_tile"]))
         peak = max(peak, c["hessian_bytes"])
         peak_streamed = max(peak_streamed, c["hessian_bytes_streamed"])
 

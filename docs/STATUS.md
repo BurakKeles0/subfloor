@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-25 · HEAD `96f973b` · Testler: **619 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-25 · HEAD `PENDING` · Testler: **621 geçiyor, 6 atlanıyor**
 > Bu oturumun ölçüm dersleri **§14**'te — hız kazançlarından daha taşınabilir.
 
 ---
@@ -13,7 +13,7 @@ Hat uçtan uca çalışıyor, gerçek Llama-2-7B'ye bağlı, ve gerçek ağırl�
 üzerinde üç ölçüm var: dense perplexity (yayımlanmıştan 0.006 içinde),
 rotasyonun katman değeri (**−70%**), ve blok genişliğinin etkisi. M0'ın
 uçuş-öncesi kalemleri kapandı. **Maliyet artık bağlayıcı kısıt değil:** M1 bu
-makinede 120 günden **14.9 güne**, `τ` süpürmesi 29 günden **5.5 güne** indi — yani
+makinede 120 günden **15.0 güne**, `τ` süpürmesi 29 günden **5.5 güne** indi — yani
 ön-kaydı bloke eden şey ortadan kalktı. Sayının bir kez **yukarı** gittiğine
 dikkat: 12'ye inmişti, sonra modelin hiç yazmadığı iki terim bulununca gerçek
 maliyetin ~40 olduğu anlaşıldı, ve 15'e o terimler düzeltilerek inildi (§6.2). Ama **sıkıştırılmış modelin
@@ -108,7 +108,7 @@ rotasyon + GPTQ-3bit (`W=3.148`), bant 1.83–2.83'e kayar.
 verisi yok**. Sentetik smoke testte hata eğrisi U şeklinde çıkıyor ve Kapı A
 geçiyor — **ama veriyi biz ürettik, bu tez lehine kanıt değil.**
 
-Sebebi artık maliyet değil (bir U eğrisi **19.9 saat**): **tam modeli sıkıştıran
+Sebebi artık maliyet değil (bir U eğrisi **20.1 saat**): **tam modeli sıkıştıran
 betik yok.** `calibrate.sequential_calibrate` kütüphane olarak var ama yalnızca
 testlerden çağrılıyor. Aynı şey `τ` süpürmesi için de geçerli — maliyeti
 modellenmiş, kodu yazılmamış (§8.3).
@@ -144,7 +144,7 @@ Ayrıca hiç ölçülmemiş: **eval'in gerçek maliyeti** (238 s yalnız WikiTex
 | **Ölçek örneklemesi reddedildi** | 08-23 | Ortalama bedeli küçük ama tohumdan tohuma **15.8 puan** oynuyor — Kapı B'nin ayırmaya çalıştığı 0.31 σ'yı boğar (§5.8) |
 | fp16 arama **eklendi, varsayılan kapalı** | 08-23 | 1.3–1.7×, bedel ≤%1 ve **belirlenimci**. Kaliteyi ölçülebilir biçimde değiştirdiği için varsayılan olması bir karar gerektirir |
 | **Kronecker kongrüansı eklendi, varsayılan kapalı** | 08-24 | Gerçek katmanda `H512` kolunda −0.03…−0.31% (lehte), rotasyon terimi **5.52×**. Bit-birebir olmadığı için açmak ayrı bir karar (§6.8, §8.5) |
-| **fp16 arama ve telafi bloklaması da kapalı kaldı** | 08-24 | Kullanıcı kararı: şimdiye kadarki her kalite sayısı üçü de kapalıyken alındı. Üçü birlikte M1 14.9 → 7.5 g (§8.5) |
+| **fp16 arama ve telafi bloklaması da kapalı kaldı** | 08-24 | Kullanıcı kararı: şimdiye kadarki her kalite sayısı üçü de kapalıyken alındı. Üçü birlikte M1 15.0 → 7.5 g (§8.5) |
 | **TF32 kapandı — kalite yüzdesiyle değil** | 08-24 | Hattı kırıyor: döndürülmüş alt-Hessian Cholesky'den geçmiyor, sönümleme payının %85'i gidiyor. Çalıştığı yerde de %3.2'yi aşan tek kol (§6.9) |
 | **Analitik en-yakın-kodsözcüğü** taramanın yerine | 08-23 | Kodsözcüğü uzayının yapısı aramayı çözüyor. Uçtan uca 1.3–4.0×, float64'te kesin (§6.4) |
 | **Triton kuruldu, iki zincir füzyonlandı** | 08-24 | GPU %28.4 meşguldü; boşta geçenin %80'i fırlatma. Uçtan uca 1.64–1.87×, çıktı birebir aynı (§6.5) |
@@ -298,7 +298,7 @@ değil **"pencereyi sabitle"**.
 
 ---
 
-## 6. Maliyet: 120 gün → 14.9 gün — ve bir kez yukarı gitti
+## 6. Maliyet: 120 gün → 15 gün — ve bir kez yukarı gitti
 
 Bu bölüm mühendislik, §5 bilim. Ayrı tutuluyor çünkü buradaki hiçbir şey tezi
 değiştirmiyor — yalnızca sınanabilir hâle getiriyor.
@@ -307,12 +307,12 @@ değiştirmiyor — yalnızca sınanabilir hâle getiriyor.
 
 | T | d | **nokta** | codebook | rotasyon | telafi | kalib | chol | eval |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 0.2500 | **4.42 h** | **2.86** | 0.46 | 0.36 | 0.33 | 0.34 | 0.07 |
-| 2 | 0.5000 | **4.41 h** | 1.59 | **1.72** | 0.36 | 0.33 | 0.34 | 0.07 |
-| 4 | 0.6250 | 3.77 h | 0.88 | **1.92** | 0.36 | 0.33 | 0.21 | 0.07 |
-| 8 | 0.6875 | 2.81 h | 0.66 | 1.27 | 0.36 | 0.33 | 0.11 | 0.07 |
-| 16 | 0.7188 | 1.99 h | 0.46 | 0.72 | 0.36 | 0.33 | 0.06 | 0.07 |
-| 32 | 0.7344 | 1.55 h | 0.38 | 0.38 | 0.36 | 0.33 | 0.03 | 0.07 |
+| 1 | 0.2500 | **4.45 h** | **2.89** | 0.46 | 0.36 | 0.33 | 0.34 | 0.07 |
+| 2 | 0.5000 | **4.48 h** | 1.65 | **1.72** | 0.36 | 0.33 | 0.34 | 0.07 |
+| 4 | 0.6250 | 3.79 h | 0.91 | **1.92** | 0.36 | 0.33 | 0.21 | 0.07 |
+| 8 | 0.6875 | 2.82 h | 0.68 | 1.27 | 0.36 | 0.33 | 0.11 | 0.07 |
+| 16 | 0.7188 | 2.00 h | 0.46 | 0.72 | 0.36 | 0.33 | 0.06 | 0.07 |
+| 32 | 0.7344 | 1.54 h | 0.37 | 0.38 | 0.36 | 0.33 | 0.03 | 0.07 |
 | max | 0.7500 | 0.97 h | 0.21 | 0.00 | 0.36 | 0.33 | 0.00 | 0.07 |
 
 Sağdaki üç sütun **tile boyutundan bağımsız** — aynı 32 bloğu aynı şekilde
@@ -320,8 +320,11 @@ dolaşıyorlar. Bu, tasarım ekonomisini yeniden sıralıyor: sıkıştırma bas
 maliyeti *hangi* tile'ları koştuğun belirliyordu, düz nokta-başı terimler
 varken **kaç nokta** koştuğun belirliyor (§6.10).
 
-Toplam paylar (7 tile): codebook %35.3, rotasyon %32.5, **telafi %12.7**,
-kalibrasyon %11.6, cholesky %5.5, eval %2.3.
+Toplam paylar (7 tile): codebook %35.8, rotasyon %32.3, **telafi %12.6**,
+kalibrasyon %11.5, cholesky %5.5, eval %2.3.
+
+T=1 ile T=2 arasındaki fark (4.45'e karşı 4.48) ölçüm yayılımının içinde — tepe
+"T=1'de" değil, **ince uçta**.
 
 > **Tepe 08-25'te yer değiştirdi ve bu tablodaki en önemli değişiklik.** Bu
 > bölüm "maliyet ızgaranın **ortasında** tepe yapıyor" diyordu; yapmıyor.
@@ -330,9 +333,9 @@ kalibrasyon %11.6, cholesky %5.5, eval %2.3.
 > 4096'ya **41 kat**, ilk adımda tek başına 8 kat düşüyor. Gerçek eğri T=1'den
 > itibaren **monoton azalıyor**, ve pahalı uç ince uç (§6.14).
 
-**M1 (3 bütçe × 7 tile × 5 çekiliş): 14.9 gün.**
+**M1 (3 bütçe × 7 tile × 5 çekiliş): 15.0 gün.**
 **`τ` süpürmesi: 5.5 gün** (spec 25 *saat* diyordu).
-**Tasarım F (ilk gerçek U eğrisi): 19.9 saat.**
+**Tasarım F (ilk gerçek U eğrisi): 20.1 saat.**
 
 > **Baskın terim tile'a göre değişiyor, ve tek bir cevabı yok.** T=2 ve T=4'te
 > en büyük kalem **rotasyon** (1.72h ve 1.92h). **T=1'de codebook** (2.86h,
@@ -340,11 +343,13 @@ kalibrasyon %11.6, cholesky %5.5, eval %2.3.
 > bedeli: tek satırlık bir tile ona amortize edecek 128 vektör veriyor, T=4
 > 1280. Ve T=1 tezin kıyas grubu olan yapısız taban.
 
-**Ölçek kaldıracı da çöktü.** Per-tile fit'i tamamen atmak 8.8 gün değil
-**1.4 gün** kazandırıyor — çünkü fit artık tile'ın %28'i, %83'ü değil. Bu,
-`per_layer`'ın ve örneklemenin *maliyet* gerekçesini de siliyor; ikisi de zaten
-kalite gerekçesiyle reddedilmişti (§5.8, §7.1). Geriye büyük ve kaliteye mal
-olan bir kaldıraç kalmadı.
+**Ölçek kaldıracı çökmüştü, kısmen geri geldi.** Per-tile fit'i tamamen atmak
+bir zamanlar 8.8 gün, sonra **1.4 gün** yazılmıştı; 08-25'te fitin payı satır
+eksenine yayılınca **2.76 gün** çıktı (T=1'de nokta başına 1.66×, §6.15). Yine de
+`per_layer` ve örnekleme geri gelmiyor — ikisi de **kalite** gerekçesiyle
+reddedildi (§5.8, §7.1), ve örnekleme ince uçta zaten no-op (tile 128 vektör
+tutuyor, sınır 8,192). Erişilebilir tek biçim fiti **tile'lar arasında**
+toplamak, ve o bit-birebir değil (§7.2).
 
 ### 6.2 Kapatılan duvarlar, sırayla
 
@@ -369,7 +374,7 @@ ortaya çıktı:
 | 10 | **İleri telafi de yazılmamış** | Nokta başına 0.36 saat, tile boyutundan bağımsız | Modele yazıldı: → **15.0 gün** (§6.11b). Bloklanabilir ama bit-birebir değil, varsayılan kapalı |
 | 11 | **`_nearest`'in ikinci kapısı** | 21 hücrenin 10'u 65,536 kodsözcüğü tarıyordu | 384–1024 aralığı analitik yola açıldı. Süpürmede **2.0–3.5×** (§6.11a) |
 | 12 | **Üç sabitin yazılmamış eşitsizliği** | Süpürmenin her grubu taranıyordu; 21 hücrenin 8'i | İki sabit ölçülerek oynadı. Tile'da **1.25×**, kalite bit-birebir (§6.13) |
-| 13 | **`TILE_TIMINGS`'te 4 satırın altı yok** | T=1 ve T=2 4-satır oranını ödünç alıyordu | `n_tiles` kaydedilerek yeniden ölçüldü: 15.0 → **14.9 gün**, ama **tepe ortadan ince uca kaydı** (§6.14) |
+| 13 | **`TILE_TIMINGS`'te 4 satırın altı yok** | T=1 ve T=2 4-satır oranını ödünç alıyordu | `n_tiles` kaydedilerek yeniden ölçüldü: toplam **15.0'da kaldı** ama **tepe ortadan ince uca kaydı** (§6.14) |
 
 > **9, 10 ve 13 hızlanma değil, düzeltme.** İlk ikisi M1'i *pahalılaştırdı* çünkü
 > zaten öyleydi; 13 toplamı neredeyse hiç oynatmadı ama **eğrinin şeklini**
@@ -380,12 +385,12 @@ ortaya çıktı:
 > Ve üçü de aranarak değil, **başka bir şey düzeltilirken** çıktı: ikisi eksik
 > terim arayışında, biri provenance düzeltilirken.
 
-### 6.3 Maliyet modelinin sekiz hatası
+### 6.3 Maliyet modelinin dokuz hatası
 
 İlk üçü iyimser, dördüncüsü **kötümser** — ve o en çok zarar veren oldu, çünkü
 bu sayı M1'in koşulup koşulmayacağını söyleyen sayı. Beşincisi yine iyimser.
-Altıncı, yedinci ve sekizinci (§6.10, §6.11b, §6.14) **modelin bilmediği
-şeyler** — ve sekizin altısı bu sınıftan. Yani bu modelde asıl soru "oran doğru mu" değil, **"listede
+Altıncı, yedinci, sekizinci ve dokuzuncu (§6.10, §6.11b, §6.14, §6.15)
+**modelin bilmediği şeyler** — ve dokuzun yedisi bu sınıftan. Yani bu modelde asıl soru "oran doğru mu" değil, **"listede
 ne yok"**.
 
 1. **`fit_scale` hiç yoktu** — 6× az. `ldlq_quantize` quantize etmeden önce 24
@@ -514,16 +519,16 @@ koşacağı.
 
 | tasarım | nokta | süre |
 |---|---|---|
-| A. Tam M1 (3 bütçe × 7 tile × 5 çekiliş) | 105 | **14.9 g** |
+| A. Tam M1 (3 bütçe × 7 tile × 5 çekiliş) | 105 | **15.0 g** |
 | C. B=1.5'te 5 çekiliş, diğer bütçeler 1 | 49 | 6.3 g |
 | D. Tek bütçe, 5 çekiliş, 7 tile | 35 | 4.2 g |
-| **F. Tek bütçe, 1 çekiliş, 7 tile — ilk gerçek U eğrisi** | **7** | **19.9 saat** |
-| G. Yalnız iki uç (T=1, T=max), 5 çekiliş | 10 | **26.9 saat** |
+| **F. Tek bütçe, 1 çekiliş, 7 tile — ilk gerçek U eğrisi** | **7** | **20.1 saat** |
+| G. Yalnız iki uç (T=1, T=max), 5 çekiliş | 10 | **27.1 saat** |
 
 **Ve G/F kıyası 08-25'te bir kez daha döndü — üçüncü kez.** Önce G, F'in otuzda
 biriydi; kalibrasyon modele yazılınca nokta sayısı baskın oldu ve ikisi eşitlendi
 (19.1'e karşı 20.4); şimdi `TILE_TIMINGS` ince ucu doğru fiyatlayınca G **F'ten
-pahalı** (26.9'a karşı 19.9). Sebep tek: G'nin iki ucundan biri **T=1**, ve T=1
+pahalı** (27.1'e karşı 20.1). Sebep tek: G'nin iki ucundan biri **T=1**, ve T=1
 ızgaranın en pahalı hücresi çıktı (§6.14).
 
 Ders G hakkında değil: **ucuz kaçış kapısı diye bir tasarıma bakmak, maliyetin
@@ -620,7 +625,7 @@ aşağı çeken şey o. Orada kazanmak için gerçek bir hızlı Hadamard gereki
 
 > **Aşağıdaki mutlak günler o günün tabanına ait (11.98).** Taban sonra üç kez
 > değişti — kalibrasyon (§6.10), telafi (§6.11b) ve `TILE_TIMINGS`'in yeniden
-> ölçümü (§6.14) ile 14.9 oldu.
+> ölçümü (§6.14) ile 15.0'da kaldı.
 > **Ölçülen şey oran**, ve oran duruyor: rotasyon terimi 5.52×. Güncel toplam
 > için §8.5.
 
@@ -738,7 +743,7 @@ belirliyor. Tasarım G (2 tile × 5 çekiliş = 10 nokta) Tasarım F'ten (7 nokt
 **pahalı** hâle geliyordu — ucuz kaçış kapısı olmaktan çıkıyordu. Hessian
 GPU'ya alınınca G yeniden ucuza döndü ve ikisi eşitlendi (19.1'e karşı 20.4).
 **08-25'te üçüncü kez döndü:** `TILE_TIMINGS` ince ucu doğru fiyatlayınca G,
-F'ten belirgin biçimde pahalı çıktı (26.9'a karşı 19.9), çünkü uçlarından biri
+F'ten belirgin biçimde pahalı çıktı (27.1'e karşı 20.1), çünkü uçlarından biri
 T=1 (§6.14). Gözlem duruyor; yönü üç kez değişti.
 
 **`m1_run.py` bugün başlatılsaydı:**
@@ -748,10 +753,10 @@ T=1 (§6.14). Gözlem duruyor; yönü üç kez değişti.
 | modelin söylediği (iki terim de yok) | 11.98 g | 15.6 saat |
 | **gerçek kod, iki düzeltmeden önce** | **~38–40 g** | **~57–60 saat** |
 | + Hessian GPU'da (§6.10) | 15.0 g | 20.4 saat |
-| + `TILE_TIMINGS` yeniden ölçüldü (§6.14) | **14.9 g** | **19.9 saat** |
-| + telafi bloklanmış (§6.11c, varsayılan kapalı) | 13.6 g | 17.8 saat |
-| + fp16 + kron (varsayılan kapalı) | 8.8 g | 12.7 saat |
-| + üçü birden (varsayılan kapalı) | **7.5 g** | **10.5 saat** |
+| + `TILE_TIMINGS` yeniden ölçüldü (§6.14) | **15.0 g** | **20.1 saat** |
+| + telafi bloklanmış (§6.11c, varsayılan kapalı) | 13.7 g | 17.9 saat |
+| + fp16 + kron (varsayılan kapalı) | 8.9 g | 12.9 saat |
+| + üçü birden (varsayılan kapalı) | **7.5 g** | **10.6 saat** |
 
 "Önce" satırı aralık, çünkü aynı ölçümün iki koşusu 19.65 s ve 22.37 s verdi —
 bu makinede %14 koşudan koşuya. Kod artık öyle yapmadığı için kesinleştirmeye
@@ -847,7 +852,7 @@ eklendi ve **varsayılan `None`** — kesin düzen.
 | cholesky | 1.10 h | 5.4% |
 | eval | 0.46 h | 2.3% |
 
-**M1 = 14.9 gün** (§6.14'ten sonra). Telafi yazılınca 13.4'ten 15.0'a çıkmıştı;
+**M1 = 15.0 gün** (§6.14'ten sonra). Telafi yazılınca 13.4'ten 15.0'a çıkmıştı;
 bloklanırsa 13.6'ya döner (§8.5).
 
 ---
@@ -880,7 +885,7 @@ CPU bloğun yanında zaten doğru, hiçbir şey taşınmıyorsa yeniden bağlama
 
 | | M1 |
 |---|---|
-| modelin fiyatladığı (`cuda_f32`) | **14.9 gün** |
+| modelin fiyatladığı (`cuda_f32`) | **15.0 gün** |
 | kodun varsayılanının ürettiği (`cuda_f64`) | **50.9 gün** |
 
 25× kazanç gerçek ama **çağıranın `dtype=torch.float32` yazmasına bağlı**.
@@ -1034,7 +1039,7 @@ Uçtan uca **41 kat**, ilk adımda tek başına **8 kat**. Sebebi `fit_scale`: t
 başına bir kez uydurulyor, ve tek satırlık bir tile ona amortize edecek **128
 vektör** veriyor, T=4 **1280**.
 
-**Toplam neredeyse kıpırdamadı, şekil kaydı.** M1 15.0 → **14.9 gün** — ince uç
+**Toplam neredeyse kıpırdamadı, şekil kaydı.** M1 **15.0 gün**te kaldı — ince uç
 pahalılaştı, kaba uç ucuzladı, ikisi birbirini götürdü. Ama:
 
 - **Tepe ortadan ince uca kaydı.** §6.1 "maliyet ızgaranın ortasında tepe
@@ -1044,7 +1049,7 @@ pahalılaştı, kaba uç ucuzladı, ikisi birbirini götürdü. Ama:
   "hiçbir terim kaçmıyor" iddiası bu yüzden kırmızıya döndü ve **haklı olarak**:
   o iddia da süresi dolmuş bir olguymuş, ince uç yanlış fiyatlandığı sürece
   doğru duruyordu.
-- **Tasarım G, F'ten pahalı oldu** (26.9'a karşı 19.9 saat) — üçüncü kez yer
+- **Tasarım G, F'ten pahalı oldu** (27.1'e karşı 20.1 saat) — üçüncü kez yer
   değiştirdiler, ve sebebi G'nin uçlarından birinin T=1 olması (§6.6).
 - **`τ` süpürmesi 4.5 → 5.5 gün.**
 
@@ -1055,6 +1060,65 @@ pahalılaştı, kaba uç ucuzladı, ikisi birbirini götürdü. Ama:
 **Bu hata üçüncü kez provenance düzeltilirken çıktı**, aranarak değil. Diğer
 ikisi kalibrasyon ve ileri telafiydi (§6.10, §6.11b). Üçünün ortak yanı: model
 bir şeyi *yanlış* hesaplamıyordu — **bilmiyordu**.
+
+---
+
+### 6.15 Dokuzuncu hata: aynı kusur, ikinci sabitte
+
+`SCALE_FIT_MULTIPLIER` de tek bir sayıydı — 1.39 — ve `fit_scale`'in bir tile'a
+ne kadar eklediğini tarif ediyordu. §6.14 ile aynı sınıf: satır ekseni boyunca
+değişen bir nicelik, tek bir sabitle modellenmiş.
+
+Aynı koşuda ikinci bir kol ölçüldü — her hücre bir kez `scale="per_tile"`, bir
+kez `fit_scale`'in bulacağı ölçek **sabit verilerek**, dönüşümlü. (Rastgele bir
+sabit ölçek olmaz: kötü ölçeklenmiş girdi kafes çözücüde çok daha fazla ıskalar,
+yani süpürmenin iş miktarı değişir ve oran iki farklı şeyi fiyatlar.)
+
+Oran **artıklar üzerinden** okunuyor, ham tile süresi üzerinden değil: cholesky
+iki kolda da var ve fitin değiştirdiği bir şey değil, içeride bırakılsa oranı
+her genişlikte farklı bir miktarda seyreltirdi — satır-eksenli tablo sessizce
+genişlik-eksenli olurdu.
+
+| satır | 1 | 2 | 4 | 8 | 16 | 32 | 4096 |
+|---|---|---|---|---|---|---|---|
+| ham | 2.22 | 1.75 | 1.63 | 1.55 | 1.57 | 1.57 | 2.16 |
+| **artık** | **2.60** | 2.07 | 1.92 | 1.71 | 1.70 | **1.65** | **2.17** |
+
+**Eğri U şeklinde, ve iki ucun sebebi farklı:**
+
+- **İnce uçta** `fit_scale`'in *sabit* bedeli az vektöre bölünüyor — T=1'de bir
+  tile 128 vektör tutuyor, T=4'te 1,280.
+- **Kaba uçta** fit her vektöre **24 kez** bakıyor, süpürme bir kez. T=max'te
+  süpürme verimli (tek tile, grup başına 4096 satır, kart dolu), yani fitin
+  orantılı 24 katı artık süpürme yükünün arkasına saklanamıyor.
+
+Yani tek bir sabit **iki ucu birden** kaçırıyor. 1.39, eğrinin düz ortasında
+kalibre edilmiş bir sayı.
+
+> **Ve kaydedilmiş gerekçe tersine dönüyor.** Sabitin kendi notu "1.39 dört-satır
+> figürü, üçünün **en elverişlisi**, tartışılan kaldıracı abartma konvansiyonuyla
+> tutuldu" diyordu. Abartmıyormuş: bugün ölçülen **her** değer onun üstünde,
+> %18'den %87'ye kadar. Yani "tile başına fiti atmanın maliyet gerekçesi kalmadı"
+> reddi, kaldıracı olduğundan **küçük** gösteren bir sayıyla savunulmuş.
+
+**Kaldıraç gerçekten büyüdü:** fiti tamamen atmak 1.42 gün değil **2.76 gün**
+(M1 15.0 → 12.25), ve T=1'de nokta başına **1.66×**.
+
+**Ama erişilebilir olan değişmedi**, ve asıl kayıt bu:
+
+- Fiti **tamamen** kaldırmak (sabit ölçek / `per_layer`) zaten **kalite**
+  gerekçesiyle reddedildi (%11 kötü, 08-23). Büyüyen bir sayı kapanmış bir
+  seçeneği geri açmıyor.
+- §5.8'in önerdiği **örnekleme** ince uçta bir **no-op**: T=1'de tile 128 vektör
+  tutuyor, varsayılan sınır 8,192. Sınır, maliyetin yaşadığı yerde hiç ısırmıyor.
+- Geriye erişilebilir tek biçim fiti **tile'lar arasında** toplamak kalıyor —
+  §7.2'de bit-birebir olmadığı için (indirgeme sırası) alınmamıştı, 2.16×
+  ölçülerek. İnce uçta yeniden fiyatlanmayı hak ediyor; **yapılmadı**, kaydedildi.
+
+**Yan sonuç: ölçüm artık tekrarlanıyor.** Aynı betik, aynı makine, iki bağımsız
+koşu, yedi şekil — en büyük sapma **%3.4**. Kıyas için 08-24: elle ölçülmüş üç
+tile süresinden **ikisi hiç tekrarlanmadı** (%28 ve %65, §6.3). Betiğe
+çevirmenin asıl kazancı hız değil, bu.
 
 ---
 
@@ -1135,8 +1199,8 @@ anahtar `(model, budget, tile, draw, block)`.
 
 ### 8.2 Sonra: ilk gerçek koşu
 
-**Tasarım F** — tek bütçe, tek çekiliş, 7 tile, **19.9 saat** (§8.5'in üç
-kaldıracı açılırsa 10.5). Hattın gerçek modelde uçtan uca çalıştığını kanıtlar
+**Tasarım F** — tek bütçe, tek çekiliş, 7 tile, **20.1 saat** (§8.5'in üç
+kaldıracı açılırsa 10.6). Hattın gerçek modelde uçtan uca çalıştığını kanıtlar
 ve **ilk gerçek U eğrisini** verir.
 
 Kapı B'yi karara bağlamaz (§5.6: verdikt için ≥5 çekiliş, `gate_b` altında
@@ -1165,10 +1229,11 @@ Sıra önemli: ön-kayıt donmadan M1 başlamaz. Ama F koşusu ön-kayda girmiyo
 `‖x − αQ(x/α)‖²` minimize ediliyor, oysa hattın hedefi `tr(E H Eᵀ)`.
 Örneklemenin T=16 ve T=max'te kaliteyi **iyileştirmesi** bunun belirtisi.
 
-> **Gerekçesi 08-24'te daraldı ama yön değiştirdi.** "Hem daha iyi hem daha
-> ucuz olabilir" diyordu; ucuzluk tarafı gitti — fit artık tile'ın %28'i, yani
-> tamamen atsan bile 1.4 gün. Geriye **yalnız kalite** gerekçesi kaldı, ve o
-> gerekçe zayıflamadı: yanlış ölçüye göre daha kesin bir α hâlâ yanlış.
+> **Gerekçesi 08-24'te daraldı, 08-25'te kısmen geri geldi.** "Hem daha iyi hem
+> daha ucuz olabilir" diyordu; ucuzluk tarafı gitmiş sayılmıştı (tamamen atsan
+> 1.4 gün). Fitin payı satır eksenine yayılınca **2.76 gün** oldu ve T=1'de nokta
+> başına 1.66× (§6.15) — yani ucuzluk tarafı tamamen ölü değil. Ama asıl gerekçe
+> hiç zayıflamadı ve hâlâ o: **yanlış ölçüye göre daha kesin bir α hâlâ yanlış.**
 
 ### 8.5 Maliyet tarafında elde duran, ölçülmüş ama açılmamış kaldıraçlar
 
@@ -1182,9 +1247,9 @@ alındı — açmak bir karar, bir sonuç değil (kullanıcı kararı, 08-24).
 | `search_dtype=float16` | arama fp16'da (§6.9) | codebook terimi 1.24–1.52× | ≤%0.90 |
 | `compensate_block=512` | telafi bloklanmış (§6.11c) | telafi terimi 6.63× | 2.7e-6…4.8e-6 |
 
-Birlikte **M1 14.9 → 7.5 gün** (2.00×), Tasarım F 19.9 → 10.5 saat. `fp16` ile
+Birlikte **M1 15.0 → 7.5 gün** (1.99×), Tasarım F 20.1 → 10.6 saat. `fp16` ile
 `kron` ayrık terimlere biniyor ve ayrık-null'a göre %99 birleşiyorlar (§6.9).
-Tek tek: kron 10.2 g (1.46×), telafi 13.6 g (1.10×), fp16 13.5 g (1.10×).
+Tek tek: kron 10.3 g (1.46×), telafi 13.7 g (1.10×), fp16 13.6 g (1.10×).
 
 **Kapsam dışı bırakılanlar** (ölçüldü ya da tanımlandı, yapılmadı):
 - **TF32** — reddedildi, kalite yüzdesi yüzünden değil: hattı **kırıyor** (§6.9)
@@ -1207,9 +1272,9 @@ Tek tek: kron 10.2 g (1.46×), telafi 13.6 g (1.10×), fp16 13.5 g (1.10×).
   `T=max` için sert kısıt, hâlâ yalnızca ima edilmiş
 - **Eval maliyeti** — 238 s yalnız WikiText-2; C4 ve 5 zero-shot görev hiç
   ölçülmedi ve ön-kayıt §4 ikisini de şart koşuyor
-- **`SCALE_FIT_MULTIPLIER` tek bir sabit** (1.39) ve satır sayısıyla değişmiyor —
-  oysa `fit_scale`'in payı T=1'de çok daha büyük olmalı (§6.14'ün mekanizması).
-  `TILE_TIMINGS` ile aynı sınıf: satır eksenine yayılmamış bir ölçüm
+- **Fiti tile'lar arasında toplamak** — §7.2'de bit-birebir olmadığı için
+  alınmamıştı (2.16×). §6.15 fitin payını ince uçta 2.60× ölçtü, yani o ret
+  yeniden fiyatlanmayı hak ediyor; erişilebilir tek biçim o
 
 ---
 
@@ -1233,11 +1298,11 @@ kontrolü bunun için var.
 
 **Maliyet artık birincil risk değil ama sıfır da değil.** 15 gün hâlâ uzun, ve
 bütün süreler **bu makineye ve Triton'lu bir kuruluma** ait. Başka donanımda
-eğriler yeniden ölçülmeli. Model **sekiz** kez yanıldı, ve 08-24'te iki ölçümü de
+eğriler yeniden ölçülmeli. Model **dokuz** kez yanıldı, ve 08-24'te iki ölçümü de
 geri çekildi (§6.3) — yani bu sayının belirsizliği modelin kendi hata payından
 değil, ölçümlerin tekrarlanabilirliğinden geliyor. Ve 08-25 bir sınır daha
 gösterdi: model, kodun **varsayılanlarıyla** koşulduğunda ne olacağını yazmıyor
-(§6.12'de 14.9 güne karşı 51).
+(§6.12'de 15.0 güne karşı 51).
 
 **Kesinti.** 15 saatlik bir koşu bile dizüstünde kesilir ve şu an devam etme
 yok. §8.1'in checkpoint'i bu yüzden kritik yolda.
@@ -1313,7 +1378,7 @@ tam model sürücüsü + checkpoint · `experiments/tau_sweep.py` — `τ` yüze
 İkisi de `sequential_calibrate` + `streamed_perplexity` dikişini kullanacak.
 
 ```bash
-python -m pytest tests/ -q                         # 619 test, ~2 dk
+python -m pytest tests/ -q                         # 621 test, ~2.5 dk
 HF_HUB_DISABLE_XET=1 python experiments/m0_dense_ppl.py --seqlens 2048 4096 --device cuda
 HF_HUB_DISABLE_XET=1 python -u experiments/m0_rotation_value.py \
     --tiles 4 16 max --seqs 16 --rows 512 --solve-device cuda --solve-dtype float32
@@ -1364,7 +1429,7 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `98c0413` | **`_nearest`'in ikinci kapısı** (§6.11a, süpürmede 2.0–3.5×) ve **yedinci eksik terim** (§6.11b). Ayrıca §7.2'deki bir ret **yanlış rejimde ölçülmüş** çıktı (§6.11c) |
 | `a3d5a05` | **§8.1'in dikişi GPU'da hiç koşmamış** (§6.12). Bir yolda **beş** kusur, beşi de 599 CPU testinin kör noktasında. Zincir artık uçtan uca koşuyor: gerçek Llama blokları → `sequential_calibrate` → `run_config` → `streamed_perplexity` |
 | `7872949` | **Süpürme ızgaranın ortasında 65,536 kodsözcüğü tarıyordu** (§6.13). Üç sabit arasındaki yazılmamış eşitsizlik; 21 hücrenin 8'i. Ağırlıklı **1.25×**, kalite bit-birebir. Ayrıca `bench_guard`: boşluk testi artık alışkanlık değil **assert**, çünkü alışkanlığın baktığı sayı boş kartta %42 okuyor |
-| `96f973b` | **`TILE_TIMINGS` `n_tiles` kaydedilerek yeniden ölçüldü** ve modelin **sekizinci hatası** çıktı (§6.14): 4 satırın altında hiç örnek yokmuş. Toplam 15.0 → 14.9 g ama **tepe ortadan ince uca kaydı**, T=1'de duvar geri geldi, Tasarım G/F üçüncü kez yer değiştirdi |
+| `96f973b` | **`TILE_TIMINGS` `n_tiles` kaydedilerek yeniden ölçüldü** ve modelin **sekizinci hatası** çıktı (§6.14): 4 satırın altında hiç örnek yokmuş. Toplam **15.0'da kaldı** ama **tepe ortadan ince uca kaydı**, T=1'de duvar geri geldi, Tasarım G/F üçüncü kez yer değiştirdi |
 
 **08-24 oturumunun yayı, tek satırda:** hat 17 günden 12'ye indi (`1efa971`),
 sonra modelin iki eksik terimi bulununca gerçeğin ~40 olduğu anlaşıldı
@@ -1384,11 +1449,11 @@ Bu projede en pahalı hata sınıfı **sessizce yanlış bir sayı üretmek**. B
 - Doğrulanmamış şeyler açıkça "varsayım" diye işaretlenir
 - Bir hipotez ölçümden **önce** yazılır
 - Hız iddiaları **uçtan uca** ölçülür, çekirdek mikro-benchmark'ıyla değil —
-  maliyet modeli tam olarak bu yüzden sekiz kez yanıldı
+  maliyet modeli tam olarak bu yüzden dokuz kez yanıldı
 - Bir optimizasyonun kabul kriteri **çıktının değişmemesi**; değişiyorsa
   değişimin ne olduğu ölçülür ve karar tablosuna yazılır
 - Aleyhe bulgular da kaydedilir (eşleştirme kazancı 1.16×, ayrılabilirlik
-  önyargısı, maliyet modelinin **sekiz** hatası, Triton tahminimin 2–3 kat
+  önyargısı, maliyet modelinin **dokuz** hatası, Triton tahminimin 2–3 kat
   iyimser çıkması, Kronecker'ın sentetik ölçümümün iki mertebe yanılması)
 - **Denenip elenen fikirler kaydedilir** (§7) — kaydetmemek ikinci kez denemek
 
@@ -1454,7 +1519,7 @@ sessizce yanlıştı ve ikisini önce yanlış teşhis ettim. Dördünün de ort
 
 ### 14.3 Ve modele dair olan
 
-Maliyet modeli sekiz kez yanıldı; **altısı modelin bilmediği şeydi**, oran hatası
+Maliyet modeli dokuz kez yanıldı; **yedisi modelin bilmediği şeydi**, oran hatası
 değil. Yani
 bu modelde sorulacak soru "oran doğru mu" değil, **"listede ne yok"**. Son ikisi
 (kalibrasyon, ileri telafi) hiçbir şey patlamadığı için değil, *ne eksik* diye

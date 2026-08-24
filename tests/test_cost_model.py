@@ -35,8 +35,13 @@ RATES = {
             # The tile count rides along because a tile time means nothing
             # without it: `auto_chunk` turns it into the row count that decides
             # which search path `_nearest` takes.
-            "tile_timings": ((1000, 10, 64, 2.167e-2),
-                             (1000, 100, 64, 1.0167e-1)),
+            # The fifth column is the same tile with a FIXED scale, so the
+            # ratio between the two is what `scale_fit_multiplier` reads.  It is
+            # deliberately different at the two line counts -- 1.5x at ten
+            # lines, 1.2x at a hundred -- because a single figure for it was the
+            # defect that made this column necessary.
+            "tile_timings": ((1000, 10, 64, 2.167e-2, 1.50023e-2),
+                             (1000, 100, 64, 1.0167e-1, 8.50028e-2)),
         }
     },
 }
@@ -149,7 +154,7 @@ def test_timing_comes_from_the_measured_tile_fit():
     fake = RATES["setups"]["fake"]
     chol = CM.CHOL_FLOPS_PER_K3 * 1000 ** 3 / fake["cholesky_flops_per_s"]
     residuals = {lines: (sec - chol) / (lines * k)
-                 for k, lines, _n, sec in fake["tile_timings"]}
+                 for k, lines, _n, sec, _nf in fake["tile_timings"]}
 
     # exact line counts pick their own sample
     for lines, want in residuals.items():
@@ -279,7 +284,7 @@ def test_the_cholesky_is_subtracted_at_the_width_it_was_measured_under():
     got = CM.codebook_seconds_per_vector(blocked, "fake", 10)
     assert got > full, "subtracting less Cholesky must charge the codebook more"
 
-    k, lines, _n, sec = RATES["setups"]["fake"]["tile_timings"][0]
+    k, lines, _n, sec, _nf = RATES["setups"]["fake"]["tile_timings"][0]
     want = (sec - CM.cholesky_seconds(k, blocked, "fake", block=250)) / (lines * k)
     assert got == pytest.approx(want)
 
@@ -302,7 +307,7 @@ def test_the_per_weight_constant_falls_with_the_line_count():
     """Bigger tiles amortize the codebook load and the decoder's fixed cost.
     If this ever inverted, the model would be reading its samples backwards."""
     fake = RATES["setups"]["fake"]
-    counts = sorted(lines for _, lines, _, _ in fake["tile_timings"])
+    counts = sorted(lines for _, lines, _, _, _ in fake["tile_timings"])
     values = [CM.codebook_seconds_per_vector(RATES, "fake", n) for n in counts]
     assert values == sorted(values, reverse=True)
 
@@ -409,7 +414,7 @@ def test_the_scale_fit_multiplier_hits_only_the_codebook_term():
     without = CM.layer_cost(4096, 11008, 16, 1.5, scale_fit=False)
     assert with_fit["cholesky_flops"] == without["cholesky_flops"]
     assert with_fit["codebook_flops"] == pytest.approx(
-        CM.SCALE_FIT_MULTIPLIER * without["codebook_flops"])
+        CM.NOMINAL_SCALE_FIT_MULTIPLIER * without["codebook_flops"])
 
 
 def test_dropping_the_per_tile_scale_fit_is_worth_real_time():
@@ -420,8 +425,50 @@ def test_dropping_the_per_tile_scale_fit_is_worth_real_time():
     assert b["compress_seconds"] < a["compress_seconds"]
     assert a["cholesky_seconds"] == pytest.approx(b["cholesky_seconds"])
     saved = a["codebook_seconds"] - b["codebook_seconds"]
-    assert saved == pytest.approx(
-        b["codebook_seconds"] * (CM.SCALE_FIT_MULTIPLIER - 1))
+    mult = CM.scale_fit_multiplier(RATES, "fake", 16)
+    assert saved == pytest.approx(b["codebook_seconds"] * (mult - 1))
+
+
+def test_the_scale_fit_multiplier_varies_with_the_line_count():
+    """The defect that made the fifth column necessary, asserted directly.
+
+    `fit_scale` runs once per tile over the vectors that tile holds, so its
+    share of a tile is set by how many there are -- 128 at T=1 against 5,888 at
+    T=16 on the real grid.  A single constant prices one of those right and the
+    other wrong, and until 2026-08-25 the constant was the four-line figure,
+    which is the end the grid's cost actually lives at.
+
+    Asserted on the fixture rather than on the real table so it states the
+    RELATIONSHIP -- fewer lines, larger share -- instead of pinning a machine's
+    numbers.
+    """
+    small = CM.scale_fit_multiplier(RATES, "fake", 10)
+    large = CM.scale_fit_multiplier(RATES, "fake", 100)
+    assert small == pytest.approx(1.5, rel=1e-3)
+    assert large == pytest.approx(1.2, rel=1e-3)
+    assert small > large, (
+        "the per-tile fit's share must fall as a tile holds more vectors; if "
+        "this inverted, the model is reading its samples backwards"
+    )
+
+    # `lines=None` keeps the old convention: report the WORST, so a rejection
+    # argued on this number stays robust.
+    assert CM.scale_fit_multiplier(RATES, "fake") == pytest.approx(small)
+
+
+def test_the_scale_fit_multiplier_is_read_on_residuals_not_raw_times():
+    """The Cholesky is in both arms and is not part of what the fit changes.
+    Leaving it in would dilute the ratio by a different amount at every width,
+    which is how a per-line-count table would quietly become a per-width one.
+    """
+    fake = RATES["setups"]["fake"]
+    k, lines, _n, sec, no_fit = fake["tile_timings"][0]
+    chol = CM.cholesky_seconds(k, RATES, "fake")
+    got = CM.scale_fit_multiplier(RATES, "fake", lines)
+    assert got == pytest.approx((sec - chol) / (no_fit - chol))
+    assert got != pytest.approx(sec / no_fit), (
+        "ratio taken on raw tile times; the Cholesky has to come out of both"
+    )
 
 
 def test_scale_fit_is_on_by_default_because_that_is_what_the_code_does():
