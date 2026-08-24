@@ -801,3 +801,165 @@ def test_compiled_and_eager_kernels_agree_bit_for_bit(device):
             fused = kernel(z, St, s_norm2, pow2)
             assert torch.equal(fused[1], eager[1])
             assert torch.equal(fused[0], eager[0])
+
+
+# --------------------------------------------------------------------------- #
+# BATCHED CANDIDATE SCALES
+# --------------------------------------------------------------------------- #
+# `fit_scale` used to run one nearest-codeword pass per candidate scale.  The
+# search is launch-bound rather than compute-bound -- measured, 1,280 vectors
+# cost 41.3 ms and 5,888 cost 43.4 ms, 4.6x the work for 1.05x the time -- so
+# twenty-four separate passes paid the fixed cost twenty-four times.  Evaluating
+# them together is only a rearrangement: the candidates are independent, each
+# asking what a different scaling of the same vectors rounds to.
+#
+# Measured end to end on `ldlq_quantize_blocks`, against the same code with
+# `FIT_ROW_BUDGET = 1` (which reproduces the old arrangement exactly): 3.78x at
+# four lines, 2.01x at sixteen, 1.09x at 128 -- largest exactly at the fine
+# granularities where the grid is most expensive.
+#
+# Because nothing about the arithmetic changes, the only acceptable outcome is
+# the SAME alpha.  These check that against a reference written out below rather
+# than against the implementation itself.
+#
+# Note what the batching does change: how `_nearest` ROUTES.  A tile of seven
+# vectors is below the lattice decoder's floor and used to go to the scan; as
+# part of a 168-row batch it goes to the decoder and the analytic fallback.
+# All three are exact, so the alpha must not move -- and `n=7` below is there to
+# say so.
+#
+# What this battery kills, checked by mutating the implementation and confirming
+# the tests go red -- a test suite that passes against a broken implementation
+# is decoration:
+#   pairing a candidate with a neighbour's codewords          8 fail
+#   interleaving the rows instead of blocking them           18 fail
+#   scoring every candidate with the seed scale              15 fail
+#   pairing an alpha with another candidate's error          18 fail
+#   dropping a candidate from each pass                       1 fail
+# What it does NOT kill, because none of them moves the answer at any size
+# tried: reducing the error jointly across candidates instead of per candidate
+# (argmin identical over 40 float32 draws), breaking a candidate tie with `<=`
+# instead of `<` (exact ties do not occur), dividing by a dtype tensor instead
+# of the Python float (identical in float64 and in float32), and perturbing
+# every candidate by 0.1% (the grid is spaced 6.7% apart, so the argmin holds).
+# The first three are recorded so nobody defends them as load-bearing.
+
+def _fit_one_candidate_at_a_time(x, codebook, n_steps=Q.FIT_STEPS,
+                                 lo=0.4, hi=2.0, search_dtype=None):
+    """`fit_scale` as it was before the candidates were batched.
+
+    Written out rather than imported on purpose: a test that called the batched
+    implementation to check the batched implementation would prove nothing.
+    This is the same discipline as `tests/golden.py` not importing
+    `accounting.py`.
+    """
+    rms_x = float(x.square().mean().sqrt())
+    rms_c = float(codebook.square().mean().sqrt())
+    if rms_x == 0.0:
+        return 1.0
+    seed = rms_x / rms_c
+    best, best_err = seed, float("inf")
+    for f in torch.linspace(lo, hi, n_steps).tolist():
+        a = seed * f
+        _, q = Q._nearest(x / a, codebook, search_dtype=search_dtype)
+        err = float((x - a * q).square().sum())
+        if err < best_err:
+            best, best_err = a, err
+    return best
+
+
+#: Draws per shape.  One is not enough: alpha is an argmin over a 24-point grid,
+#: so a defect that shifts the error surface without reshaping it moves the
+#: answer only for some data.  Mutating the implementation to pair each
+#: candidate with a NEIGHBOUR'S codewords -- a real and plausible indexing bug --
+#: survives a single draw per shape and dies on six.
+_FIT_DRAWS = 6
+
+
+@pytest.mark.parametrize("n", [7, 64, 300, 1024])
+@pytest.mark.parametrize("spread", [0.01, 0.05, 1.0])
+def test_batching_the_candidates_gives_the_same_alpha(n, spread):
+    cb = Q._on_device(DT, "cpu")             # armed, so the routing is exercised
+    for draw in range(_FIT_DRAWS):
+        torch.manual_seed(draw)
+        x = torch.randn((n, 8), dtype=DT) * spread
+        assert Q.fit_scale(x, cb) == _fit_one_candidate_at_a_time(x, cb),             f"draw {draw}"
+
+
+def test_batching_the_candidates_holds_on_the_heavy_tail():
+    """The distribution that matters: survivors are the fat tail by
+    construction, and it is where the decoder misses most -- so it is where the
+    batched pass and the unbatched one take the most different routes."""
+    cb = Q._on_device(DT, "cpu")
+    for draw in range(_FIT_DRAWS):
+        torch.manual_seed(draw)
+        x = (torch.randn((512, 8), dtype=DT)
+             * torch.rand((512, 1), dtype=DT).pow(3) * 8)
+        assert Q.fit_scale(x, cb) == _fit_one_candidate_at_a_time(x, cb),             f"draw {draw}"
+
+
+def test_the_alpha_is_unchanged_in_the_float32_the_pipeline_runs():
+    """float64 is where the analytic search is provably exact; the pipeline runs
+    float32, where a genuine tie can in principle be broken either way
+    (`test_float32_disagreements_are_ties_not_errors`).  A tie broken
+    differently would move alpha, so this is the case worth pinning."""
+    cb = Q._on_device(torch.float32, "cpu")
+    for draw in range(_FIT_DRAWS):
+        torch.manual_seed(draw)
+        x = torch.randn((640, 8), dtype=torch.float32) * 0.05
+        assert Q.fit_scale(x, cb) == _fit_one_candidate_at_a_time(x, cb),             f"draw {draw}"
+
+
+@pytest.mark.parametrize("budget", [1, 500, 1 << 20])
+def test_the_row_budget_splits_the_candidates_without_moving_alpha(monkeypatch, budget):
+    """`budget=1` forces one candidate per pass -- exactly the old arrangement --
+    and 500 gives a ragged split of the 24 (five passes: 5,5,5,5,4)."""
+    x = torch.randn((97, 8), dtype=DT) * 0.05
+    cb = Q._on_device(DT, "cpu")
+    ref = _fit_one_candidate_at_a_time(x, cb)
+    monkeypatch.setattr(Q, "FIT_ROW_BUDGET", budget)
+    assert Q.fit_scale(x, cb) == ref
+
+
+def test_batching_leaves_sampling_and_the_narrow_search_alone():
+    """Both levers sit outside the batched loop and must keep working: `sample`
+    picks the subset before the sweep starts, `search_dtype` narrows the search
+    inside `_nearest`.  Neither was measured under the batched form until now."""
+    x = torch.randn((512, 8), dtype=DT) * 0.05
+    cb = Q._on_device(DT, "cpu")
+
+    g = torch.Generator(device="cpu").manual_seed(3)
+    idx = torch.randperm(x.shape[0], generator=g)[:64]
+    assert (Q.fit_scale(x, cb, sample=64, seed_rng=3)
+            == _fit_one_candidate_at_a_time(x[idx], cb))
+
+    assert (Q.fit_scale(x, cb, search_dtype=torch.float32)
+            == _fit_one_candidate_at_a_time(x, cb, search_dtype=torch.float32))
+
+
+def test_fewer_steps_still_walk_the_same_grid():
+    """`n_steps` is a lever `experiments/m0_scale_fit.py` prices, so the batched
+    form has to reproduce the unbatched answer at other step counts too -- not
+    just at the default 24."""
+    x = torch.randn((256, 8), dtype=DT) * 0.05
+    cb = Q._on_device(DT, "cpu")
+    for n_steps in (1, 6, 12, 24):
+        assert (Q.fit_scale(x, cb, n_steps=n_steps)
+                == _fit_one_candidate_at_a_time(x, cb, n_steps=n_steps))
+
+
+def test_a_layers_scales_still_come_from_the_unbatched_fit():
+    """The integration guard: `ldlq_quantize_blocks` fits one alpha per tile, and
+    every one of them must be the number the old code would have produced."""
+    torch.manual_seed(4)
+    n_tiles, lines, k = 5, 8, 128
+    blocks = torch.stack([torch.randn((lines, k), dtype=DT) * (0.01 * (t + 1))
+                          for t in range(n_tiles)])
+    hs = torch.stack([_spd(k, seed=t) for t in range(n_tiles)])
+    cb = Q._on_device(DT, str(blocks.device))
+
+    qb = Q.ldlq_quantize_blocks(blocks, lambda t: hs[t], chunk=n_tiles)
+    ref = [_fit_one_candidate_at_a_time(blocks[t].reshape(-1, 8), cb)
+           for t in range(n_tiles)]
+    assert qb.scales.tolist() == ref
+    assert len(set(ref)) > 1                  # the tiles really do differ

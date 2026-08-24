@@ -12,18 +12,24 @@ figures.  Three terms are charged, each from its own measured curve:
   rotation   `q @ H_t @ q.T`, once per tile
   cholesky   the per-tile sub-Hessian factorization LDLQ needs, O(k^3) per tile
 
-They are listed in that order because that is their size, and it took four
-corrections to find out.  The factorization LOOKS like it should dominate --
-it is the only cubic term -- and for a while the model said it did.  It does
-not: at B=1.5, T=4 the pass is 11.0 hours of codebook against 1.92 of rotation
-and 0.21 of Cholesky.
+That order is historical, not current.  The factorization LOOKS like it should
+dominate -- it is the only cubic term -- and for a while the model said it did.
+It never did.  But as of 2026-08-24 the codebook does not either: at B=1.5, T=4
+the pass is 1.92 hours of ROTATION against 1.34 of codebook and 0.21 of
+Cholesky.  The lead has changed hands twice; read the numbers, not the order.
 
 The model describes the pipeline as it now runs: feedback confined to width-512
-blocks and the sweep chunked across tiles, both bit-identical to what they
-replace.  Together they took M1 from 94 days to 48.  What is left is almost
-entirely `fit_scale` -- dropping the per-tile scale fit would take it to 14 --
-which is why the codebook line above is first and why the next measurement is
-its quality cost, not another kernel.
+blocks, the sweep chunked across tiles, and the scale fit's 24 candidates
+evaluated in one search call -- all three bit-identical to what they replace.
+Together they took M1 from 94 days to 12.
+
+What is left is no longer `fit_scale`.  It was 83% of a tile and is 28%, so the
+saving from dropping the per-tile fit fell from several-fold to 1.4 days, and
+with it the cost case for `per_layer` and for sampling -- both already rejected
+on quality.  The largest term is now `q @ H_t @ q.T`, which is computed as a
+dense GEMM against a matrix that is a Kronecker product of a Hadamard and a
+small orthogonal factor (`rotation.structured_orthogonal`).  That is a
+structural cost, not a launch-bound one, and it is the next thing to measure.
 
 The corrections, in order, because each one is a way this file was wrong:
 
@@ -39,6 +45,17 @@ The corrections, in order, because each one is a way this file was wrong:
      benchmark that warmed `cholesky` but not `cholesky_inverse`.  9.4x too HIGH
      at real widths, and this one mattered most: it is the number that says
      whether M1 can be run, and it read 120 days when the answer was 94.
+  5. it subtracted a FULL-WIDTH Cholesky out of tile timings that were measured
+     with `hessian_block=512`, taking out time the tile never spent and so
+     undercharging the codebook -- 34% at (2560,4), 24% at (2944,16), 9% at
+     (3072,128).  Optimistic, and worst at the fine granularities where the
+     grid's cost lives.  Fixed by recording each row's measurement width
+     (`TILE_TIMING_BLOCK`), because the cpu and cuda rows were taken under
+     different arrangements and no single assumption is right for both.
+
+And one thing that was not a modelling error but a measurement that did not
+hold: two of the three `cuda_f32` tile timings recorded on 2026-08-24 do not
+reproduce, both optimistically (1.28x and 1.65x).  See `TILE_TIMINGS`.
 
 The through-line is that composing a cost from kernel microbenchmarks does not
 work here.  Where a curve is measured, it is measured at the sizes the code will
@@ -94,14 +111,23 @@ CODEBOOK_SIZE = 1 << 16
 E8P_DIM = Qz.E8P_DIM
 
 #: `ldlq_quantize` does not search the codebook once per group -- it first calls
-#: `fit_scale`, which sweeps 24 candidate scales and searches the WHOLE tile at
-#: each one.  Measured on an o_proj-shaped tile (4 lines x 2560 survivors), that
-#: sweep is 83% of the tile's total time, a 6x multiplier on everything below.
+#: `fit_scale`, which sweeps 24 candidate scales over the whole tile.
 #:
-#: It is also the most avoidable cost in the pipeline: QuIP# fits one scale per
-#: LAYER, and a per-tile scale buys little while costing this.  Left in the
-#: model as a measured multiplier rather than quietly assumed away, with
-#: `--no-scale-fit` to price the alternative.
+#: THIS CONSTANT WAS 6.0 AND IS NOW 1.39, and the change is the point.  The
+#: sweep used to be 83% of an o_proj-shaped tile (4 lines x 2560 survivors)
+#: because it paid a launch-bound search's fixed cost once per candidate.  Since
+#: the candidates are evaluated together (`quantize.fit_scale`, 2026-08-24) it
+#: is 28% at four lines, 17% at sixteen and 12.5% at 128 -- measured against the
+#: same code with a fixed `scale`, which is exactly what `scale_fit=False`
+#: prices.  1.39 is the four-line figure, the most favourable of the three, kept
+#: on the old convention of overstating the lever being argued about so that
+#: rejecting it stays robust.
+#:
+#: What that costs the argument: dropping the per-tile fit used to be the
+#: largest single saving available, worth several-fold.  It is now worth at most
+#: 28% of a tile, so `scale="per_layer"` -- already rejected on quality
+#: (11% worse, 2026-08-23) -- has lost its cost case as well.  So has sampling
+#: the fit, which `docs/STATUS.md` section 5.8 rejected on variance.
 #:
 #: READ `scale_fit=False` AS A CEILING, NOT AS A PLAN.  It prices removing the
 #: per-tile fit altogether -- a fixed scale, or `scale="per_layer"`.  It does
@@ -114,7 +140,7 @@ E8P_DIM = Qz.E8P_DIM
 #: cheapest column.  `scale_sample_bites` is the check; the caps that would
 #: bite are small enough that their quality cost has to be measured rather than
 #: assumed.
-SCALE_FIT_MULTIPLIER = 6.0
+SCALE_FIT_MULTIPLIER = 1.39
 
 #: END-TO-END per-tile wall times measured on this machine: (k, lines, seconds).
 #: One `ldlq_quantize` call each, at o_proj-shaped widths.
@@ -160,10 +186,51 @@ SCALE_FIT_MULTIPLIER = 6.0
 #: and the CPU row exists only for comparison.  Do not read the two rows as a
 #: like-for-like device comparison any more.
 #:   superseded cuda_f32, chunk=1: (2560,4,0.247) (2944,16,0.454) (3072,128,2.309)
+#: `cuda_f32` re-measured 2026-08-24 after `fit_scale` began evaluating its 24
+#: candidate scales in one search call instead of one apiece.  Measured against
+#: the same code with `FIT_ROW_BUDGET = 1`, which reproduces the old
+#: one-candidate-per-pass arrangement exactly: 3.78x / 2.01x / 1.09x, output
+#: bit-identical.  The gain is largest at the fine granularities, where a tile
+#: holds too few vectors to pay for 24 separate launches.
+#:   superseded batched-fit-off, this machine, today: (2560,4,0.0535)
+#:   (2944,16,0.0810) (3072,128,0.3058)
+#:
+#: TWO OF THE THREE PREVIOUS `cuda_f32` VALUES DID NOT REPRODUCE, both
+#: optimistically: the table said 0.0631 at (2944,16) where the same
+#: configuration measures 0.0810 today (1.28x), and 0.1851 at (3072,128)
+#: against 0.3058 (1.65x).  This is not a difference in setup -- (2560,4)
+#: reproduces to 1.00x, and the superseded EAGER row reproduces to 0.2%
+#: (0.3883 against 0.3874 measured with `TILESPARSE_NO_COMPILE=1`).  What did
+#: not hold up is the Triton gain claimed for the two coarse widths: 1.72x and
+#: 1.87x were recorded, 1.18x and 1.09x measure today.  Treat the pre-08-24
+#: coarse rows as withdrawn rather than superseded.
+#:
+#: The mechanism is worth carrying, because it says these levers do not
+#: multiply: Triton's gain WAS the launch overhead, and batching the candidates
+#: removes the same overhead a level up.  Two fixes for one waste share it;
+#: they do not compound.  The model must never be handed both factors.
 TILE_TIMINGS = {
     "cpu_f64": ((2560, 4, 1.741), (2944, 16, 8.721), (3072, 128, 95.83)),
-    "cuda_f32": ((2560, 4, 0.0534), (2944, 16, 0.0631), (3072, 128, 0.1851)),
+    "cuda_f32": ((2560, 4, 0.0142), (2944, 16, 0.0404), (3072, 128, 0.2811)),
 }
+
+#: The `hessian_block` each row of `TILE_TIMINGS` was measured under, or `None`
+#: for a full-width factorization.
+#:
+#: `codebook_seconds_per_vector` subtracts the Cholesky out of a tile time
+#: before fitting the codebook constant, and it has to subtract the one that was
+#: actually IN the measurement.  The two rows were taken under different
+#: arrangements -- `cuda_f32` was re-measured with `hessian_block=512` on
+#: 2026-08-23, `cpu_f64` still describes the full-width one-tile form -- so a
+#: single assumption cannot be right for both.
+#:
+#: Getting this wrong was the model's FIFTH error and its second optimistic one.
+#: Subtracting a full-width Cholesky from a blocked measurement removed time the
+#: tile never spent, undercharging the codebook by 34% at (2560, 4), 24% at
+#: (2944, 16) and 9% at (3072, 128) -- worst at the fine granularities, which is
+#: where the grid's cost lives.  A setup may override this on its rates entry as
+#: `tile_timing_block`; anything unlisted keeps the full-width assumption.
+TILE_TIMING_BLOCK = {"cpu_f64": None, "cuda_f32": 512}
 
 #: Seconds for ONE `quantize._upper_inverse_factor` call, measured on this
 #: machine with both kernels warmed: (k, seconds).
@@ -413,7 +480,10 @@ def codebook_seconds_per_vector(rates: dict, setup: str,
 
     The Cholesky is subtracted first at its microbenchmarked rate -- that one
     IS a clean LAPACK measurement -- and what is left is charged to the codebook
-    work, the scale-fitting sweep included.
+    work, the scale-fitting sweep included.  It is subtracted at the width the
+    timings were MEASURED under (`TILE_TIMING_BLOCK`), not at full width:
+    subtracting a full-width factorization from a blocked measurement takes out
+    time the tile never spent and undercharges the codebook by up to 34%.
 
     The constant is NOT one number.  A tile's line count is its tile size, and
     per-weight cost falls sharply with it: bigger batches amortize both the
@@ -432,9 +502,12 @@ def codebook_seconds_per_vector(rates: dict, setup: str,
             f"no measured tile timings for setup {setup!r}; add them to "
             "TILE_TIMINGS or carry them on the rates entry"
         )
+    measured_block = rates["setups"][setup].get(
+        "tile_timing_block", TILE_TIMING_BLOCK.get(setup))
     fitted = []
     for k, sample_lines, seconds in samples:
-        residual = seconds - cholesky_seconds(k, rates, setup)
+        residual = seconds - cholesky_seconds(k, rates, setup,
+                                              block=measured_block)
         if residual > 0:
             fitted.append((sample_lines, residual / (sample_lines * k)))
     if not fitted:

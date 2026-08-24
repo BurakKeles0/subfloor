@@ -173,7 +173,9 @@ _LEVELS = 3
 #: This is why the win lands where it does.  `fit_scale` sweeps whole tiles at
 #: once (thousands of rows) and takes the fast path; the LDLQ group sweep asks
 #: for one group of lines at a time (sixteen, say) and keeps the scan.  Since
-#: the scale sweep is 83% of a tile's cost, that is the useful half.
+#: the scale sweep was 83% of a tile's cost, that was the useful half.  It is
+#: 28% since the candidates were batched (`fit_scale`), so this floor now
+#: matters less than it did -- but it still decides which path a fit takes.
 _LATTICE_MIN_ROWS = {"cpu": 64, "cuda": 1024}
 
 #: Unsettled rows below which a scan beats `nearest_e8p_analytic`.
@@ -525,9 +527,10 @@ def _nearest(x: Tensor, codebook: Tensor, chunk: int = 4096,
 
     For the canonical E8P table this defers to `nearest_e8p`, which decodes the
     lattice instead of scanning it, and only scans the rows the decoder could
-    not settle.  That search is the pipeline's dominant cost -- 79% of a GPU
-    pass, `experiments/m0_cost_model.py` -- and it is the one part of the
-    dominant cost that is engineering rather than structure.
+    not settle.  That search WAS the pipeline's dominant cost -- 79% of a GPU
+    pass -- and it is no longer: the scale fit is 28% of a tile since its
+    candidates were batched, and the largest term is now the sub-Hessian
+    rotation (`experiments/m0_cost_model.py`).
     """
     if search_dtype is not None and search_dtype != x.dtype:
         idx, _ = _nearest(x.to(search_dtype),
@@ -580,6 +583,16 @@ def _brute_force(x: Tensor, codebook: Tensor, chunk: int = 4096
 #: `experiments/m0_scale_fit.py` is for.
 FIT_STEPS = 24
 
+#: Rows one batched pass of `fit_scale` may hand `_nearest`.  The candidates are
+#: split into groups of `FIT_ROW_BUDGET // len(x)` so a tile with many vectors
+#: does not materialize `n_steps` copies of itself at once; the peak is two
+#: tensors of this many rows, 64 MiB together at float32.
+#:
+#: Measured, the gain is already saturated well below it -- a 5,888-vector tile
+#: sweeps all 24 candidates in 141,312 rows -- so the budget only ever bites at
+#: `T=max`, where the fit was the cheapest column to begin with.
+FIT_ROW_BUDGET = 1 << 20
+
 
 def fit_scale(
     x: Tensor, codebook: Tensor, n_steps: int = FIT_STEPS,
@@ -592,12 +605,28 @@ def fit_scale(
     Seeded by matching RMS to the codebook's, then refined by a coarse sweep --
     the objective is not convex in alpha, so a search beats a closed form.
 
-    That sweep is the single most expensive thing in the pipeline: `n_steps`
-    passes of nearest-codeword search over every vector, measured at 83% of
-    `ldlq_quantize`'s time on a real layer.  `sample` caps how many vectors the
-    sweep looks at.  Alpha is one scalar; estimating it from thousands of
-    8-dimensional vectors is already far past the point of diminishing returns,
-    and the vectors not sampled are still quantized with the result.
+    The candidates are evaluated TOGETHER, in one nearest-codeword call per
+    group rather than one per candidate.  They are independent -- each asks what
+    a different scaling of the same vectors rounds to -- so stacking them is
+    only a rearrangement, and the search is launch-bound rather than
+    compute-bound: measured, 1,280 vectors cost 41.3 ms and 5,888 cost 43.4 ms,
+    4.6x the work for 1.05x the time.  Twenty-four separate passes therefore
+    paid the fixed cost twenty-four times.  Measured end to end on
+    `ldlq_quantize_blocks`, against the same code with `FIT_ROW_BUDGET = 1`:
+    3.78x at four lines, 2.01x at sixteen, 1.09x at 128, output bit-identical.
+
+    This is the same lever as chunking the sweep across tiles, one level up, and
+    it is NOT the rejected one.  Batching the fit ACROSS TILES was measured at
+    2.16x and turned down because it reduces every tile's error together and so
+    changes the arithmetic (`docs/STATUS.md` section 7.2).  Batching across
+    CANDIDATES leaves each candidate's error on its own [n, 8] tensor, summed in
+    the same order as before, and `tests/test_quantize.py` requires the alpha to
+    come out identical.
+
+    `sample` caps how many vectors the sweep looks at.  Alpha is one scalar;
+    estimating it from thousands of 8-dimensional vectors is already far past
+    the point of diminishing returns, and the vectors not sampled are still
+    quantized with the result.
     """
     if sample is not None and sample < x.shape[0]:
         g = torch.Generator(device="cpu").manual_seed(seed_rng)
@@ -610,13 +639,34 @@ def fit_scale(
         return 1.0
     seed = rms_x / rms_c
 
+    alphas = [seed * f for f in torch.linspace(lo, hi, n_steps).tolist()]
+    n, width = x.shape[0], x.shape[1]
+    per_pass = max(1, FIT_ROW_BUDGET // max(n, 1))
+
     best, best_err = seed, float("inf")
-    for f in torch.linspace(lo, hi, n_steps).tolist():
-        a = seed * f
-        _, q = _nearest(x / a, codebook, search_dtype=search_dtype)
-        err = float((x - a * q).square().sum())
-        if err < best_err:
-            best, best_err = a, err
+    for start in range(0, len(alphas), per_pass):
+        group = alphas[start:start + per_pass]
+        # Divided one candidate at a time, by the same Python float the
+        # unbatched form used, so the search sees exactly the same numbers.
+        scaled = torch.empty((len(group), n, width), dtype=x.dtype,
+                             device=x.device)
+        for i, a in enumerate(group):
+            torch.div(x, a, out=scaled[i])
+        _, q = _nearest(scaled.reshape(-1, width), codebook,
+                        search_dtype=search_dtype)
+        q = q.reshape(len(group), n, width)
+        # One reduction per candidate over its own [n, width], never a single
+        # reduction across the stack.  This is insurance rather than a measured
+        # need: a joint reduction sums the same terms in a different order, and
+        # over 40 float32 draws at n = 1,280 / 5,888 / 49,152 it never moved the
+        # argmin, the two error vectors agreeing to 1.1e-07 relative.  It is
+        # kept because it costs 24 tiny reductions and makes "summed in the same
+        # order as the unbatched form" exactly true rather than nearly true.
+        errs = torch.stack([(x - group[i] * q[i]).square().sum()
+                            for i in range(len(group))]).tolist()
+        for a, err in zip(group, errs):
+            if err < best_err:
+                best, best_err = a, err
     return best
 
 
@@ -928,7 +978,9 @@ def ldlq_quantize_blocks(
     `scale` decides where alpha comes from:
 
       "per_tile"   fit it inside every tile -- what the pipeline has always
-                   done, and 83% of its runtime
+                   done.  It was 83% of a tile and is 28% since `fit_scale`
+                   batched its candidates, which is why the alternatives below
+                   no longer have a cost case
       "per_layer"  fit it once from a sample of `layer_scale_sample` vectors
                    drawn across all tiles, then use it everywhere.  This is what
                    QuIP# does, and it is the cheapest large saving available:

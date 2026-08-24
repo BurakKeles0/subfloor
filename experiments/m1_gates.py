@@ -160,14 +160,16 @@ def run_config(
     cost the quality.
 
     `scale_sample` and `scale_steps` cap the per-tile scale fit, which after the
-    sweep was chunked is most of what a tile costs.  They default to the full
+    sweep was chunked was most of what a tile costs -- 83% then, 28% now that
+    `fit_scale` batches its candidates.  They default to the full
     fit because that is what every quality number so far was measured under;
     `experiments/m0_scale_fit.py` is what prices moving them.
 
     `scale="per_layer"` fits the quantizer's scale once from a sample instead of
-    once inside every tile.  That sweep is 83% of the pipeline's runtime, so the
-    switch is worth several-fold; it is not the default because the default has
-    to describe what has been measured so far.
+    once inside every tile.  That sweep was 83% of the pipeline's runtime and is
+    28%, so the switch is no longer worth several-fold -- about 1.4 days off M1.
+    It is not the default, and now has neither a cost case nor a quality one
+    (measured 11% worse, 2026-08-23).
     """
     if ldlq and quantize and axis != "B":
         raise NotImplementedError(

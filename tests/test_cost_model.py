@@ -160,6 +160,47 @@ def test_timing_comes_from_the_measured_tile_fit():
     assert c["codebook_seconds"] == pytest.approx(4096 * k * per_weight)
 
 
+def test_the_cholesky_is_subtracted_at_the_width_it_was_measured_under():
+    """The model's fifth error, and the second of them to be optimistic.
+
+    `TILE_TIMINGS`'s cuda row was re-measured with `hessian_block=512`, so the
+    factorization inside those tiles was (k/512) small ones rather than one of
+    width k.  Subtracting a FULL-width Cholesky from that measurement takes out
+    time the tile never spent, and what is left over-attributes nothing and
+    under-attributes the codebook: 34% at (2560, 4), 24% at (2944, 16), 9% at
+    (3072, 128).  Worst at the fine granularities, which is where the grid's
+    cost lives and which the granularity question is about.
+
+    The two rows really were taken under different arrangements -- `cpu_f64` is
+    still the full-width one-tile form -- so this cannot be a single constant.
+    """
+    import copy
+    blocked = copy.deepcopy(RATES)
+    blocked["setups"]["fake"]["tile_timing_block"] = 250      # k=1000 -> 4 parts
+
+    full = CM.codebook_seconds_per_vector(RATES, "fake", 10)
+    got = CM.codebook_seconds_per_vector(blocked, "fake", 10)
+    assert got > full, "subtracting less Cholesky must charge the codebook more"
+
+    k, lines, sec = RATES["setups"]["fake"]["tile_timings"][0]
+    want = (sec - CM.cholesky_seconds(k, blocked, "fake", block=250)) / (lines * k)
+    assert got == pytest.approx(want)
+
+    # A setup that names no measurement width keeps the full-width assumption,
+    # so nothing that was already right silently moves.
+    assert CM.codebook_seconds_per_vector(RATES, "fake", 10) == pytest.approx(
+        (sec - CM.cholesky_seconds(k, RATES, "fake")) / (lines * k))
+
+
+def test_the_real_cuda_timings_declare_their_measurement_width():
+    """The cuda row is the one the pipeline runs under, and it is blocked.  If
+    someone re-measures it full-width and forgets this map, the codebook
+    constant silently gains 34% -- so the map has to be part of the table."""
+    assert CM.TILE_TIMING_BLOCK["cuda_f32"] == 512
+    assert CM.TILE_TIMING_BLOCK["cpu_f64"] is None
+    assert set(CM.TILE_TIMING_BLOCK) == set(CM.TILE_TIMINGS)
+
+
 def test_the_per_weight_constant_falls_with_the_line_count():
     """Bigger tiles amortize the codebook load and the decoder's fixed cost.
     If this ever inverted, the model would be reading its samples backwards."""
@@ -462,6 +503,16 @@ def test_no_single_term_dominates_the_pass_any_more():
     is that NOTHING is: the terms have converged, and the next optimisation has
     to be chosen by measuring which is largest rather than by assuming.  That
     deserves a test because the assumption was wrong twice.
+
+    2026-08-24: it was wrong a third time, and this test caught it.  Batching
+    `fit_scale`'s candidate scales cut the codebook term again (3.78x per tile
+    at four lines), and the assertion that the codebook is still the LARGEST
+    term went red.  It is not: at T=4 the sub-Hessian rotation is now 1.92h
+    against the codebook's 1.34h.  That assertion was a fact with an expiry
+    date, not an invariant, so it has been replaced by the invariant the
+    docstring was already claiming -- no term runs away from the others -- plus
+    a check on WHICH one leads, so the next person reads the answer instead of
+    inheriting mine.
     """
     import json
     from pathlib import Path
@@ -472,20 +523,48 @@ def test_no_single_term_dominates_the_pass_any_more():
     if "cuda_f32" not in rates["setups"]:
         pytest.skip("no cuda rates measured on this machine")
 
-    # Still the largest single term, but no longer by a wide margin.
+    # No term runs away from the rest.  Stated on the terms themselves rather
+    # than on any one of them, so it survives the lead changing hands again.
     for tile in (1, 4, 16):
         c = CM.model_cost(tile, 1.5, rates, "cuda_f32")
-        others = c["cholesky_seconds"] + c["rotation_seconds"]
-        assert c["codebook_seconds"] > others
-        assert c["codebook_seconds"] < 3 * others, (
-            "the codebook term has stopped dominating; if this ever fails "
-            "upward again, something regressed in the search"
+        terms = {k: c[k + "_seconds"]
+                 for k in ("codebook", "rotation", "cholesky")}
+        top = max(terms, key=terms.__getitem__)
+        rest = sum(terms.values()) - terms[top]
+        assert terms[top] < 3 * rest, (
+            f"{top} has run away from the other terms at T={tile}; the model "
+            "was rebuilt around no single wall, so this means one is back"
         )
 
-    # And the two remaining levers are comparable, which is what "converged"
-    # means in practice: neither is the obvious next thing to attack.
+    # Which term leads is a measured fact and it has changed twice.  Pinning it
+    # is the point: the ROTATION is now the largest at the grid's expensive
+    # middle, and it is the one term still computed as a dense GEMM against a
+    # matrix that is a Kronecker product (`rotation.structured_orthogonal`).
+    at_four = CM.model_cost(4, 1.5, rates, "cuda_f32")
+    assert at_four["rotation_seconds"] > at_four["codebook_seconds"], (
+        "the codebook has retaken the lead at T=4; the sub-Hessian rotation was "
+        "the largest term as of 2026-08-24 and the next lever was priced on that"
+    )
+
+    # The two levers that cost quality used to be comparable -- 8.8 days against
+    # 8.3 -- which was the argument for measuring rather than guessing which to
+    # pull.  Batching the candidate fit took the scale lever's cost away with
+    # it: dropping the per-tile fit now saves about a seventh of what confining
+    # the feedback already saves, and confining the feedback is a decision
+    # already taken (and one that IMPROVES quality, 2026-08-23).
+    #
+    # So the state to hold is that no large quality-costing lever is left: the
+    # cheap wins have been taken, and anything further has to be paid for in
+    # accuracy or in a structural change like the rotation's Kronecker form.
     base = CM.m1_cost(rates, "cuda_f32")["days"]
     unblocked = CM.m1_cost(rates, "cuda_f32", hessian_block=None)["days"]
     no_fit = CM.m1_cost(rates, "cuda_f32", scale_fit=False)["days"]
     scale_lever, block_lever = base - no_fit, unblocked - base
-    assert 0.5 < scale_lever / block_lever < 2.0
+    assert scale_lever < 0.5 * block_lever, (
+        "the scale fit has grown back into a major cost; it was 83% of a tile "
+        "before the candidates were batched and 28% after"
+    )
+    assert scale_lever / base < 0.2, (
+        "dropping the per-tile scale fit is supposed to be a minor saving now; "
+        "if it is large again the fit is being paid for once per candidate"
+    )
