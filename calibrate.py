@@ -293,6 +293,8 @@ def sequential_calibrate(
     device: torch.device | str | None = None,
     compute_dtype: torch.dtype | None = None,
     progress: Callable[[int, str], None] | None = None,
+    on_block_done: Callable[[int, list[Tensor], list[dict]], None] | None = None,
+    block_offset: int = 0,
 ) -> list[dict]:
     """Walk the blocks in order, compressing each before moving on.
 
@@ -327,6 +329,18 @@ def sequential_calibrate(
     anyway, because it is the reference the float32 arm's 5.06e-06 is measured
     against and nothing has yet been measured THROUGH this driver -- picking
     the cheaper arm is a decision for whoever runs it, not a side effect.
+
+    `on_block_done(index, inputs, records)` fires after a block is compressed
+    AND re-run, which is the only moment a run can be resumed from: by then the
+    block is final and `inputs` holds what the NEXT one will see.  That is the
+    checkpoint unit `docs/STATUS.md` section 8.1 asks for, and the reason it is a
+    callback rather than something the caller does around this function is that
+    the caller has no way to observe that moment from outside.
+
+    `block_offset` is added to the index in every record and callback, so a run
+    resumed at block 17 reports block 17 rather than block 0.  Without it a
+    resumed run's records silently renumber and nothing downstream can tell two
+    halves of one point apart.
 
     Returns one record per compressed layer.
     """
@@ -373,7 +387,7 @@ def sequential_calibrate(
                 name=f"blocks.{i}.{name}", n_tokens=acc.n_tokens,
             )
             if progress:
-                progress(i, name)
+                progress(i + block_offset, name)
             new_W = compress_fn(i, name, problem)
             if new_W.shape != W.shape:
                 raise ValueError(
@@ -382,7 +396,7 @@ def sequential_calibrate(
                 )
             mod.weight.data = new_W.to(W.dtype).to(W.device)
             records.append({
-                "block": i,
+                "block": i + block_offset,
                 "name": name,
                 "layer": problem.name,
                 "n_in": problem.n_in,
@@ -400,6 +414,10 @@ def sequential_calibrate(
         if device is not None:
             block.to("cpu")
             inputs[:] = [b.to("cpu") for b in inputs]
+
+        # Only here: the block is final and `inputs` is what block i+1 sees.
+        if on_block_done:
+            on_block_done(i + block_offset, inputs, records)
 
     return records
 

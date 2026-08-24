@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-25 · HEAD `PENDING` · Testler: **624 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-25 · HEAD `PENDING` · Testler: **629 geçiyor, 6 atlanıyor**
 > Bu oturumun ölçüm dersleri **§14**'te — hız kazançlarından daha taşınabilir.
 
 ---
@@ -1368,18 +1368,19 @@ yok. §8.1'in checkpoint'i bu yüzden kritik yolda.
 | `experiments/bench_guard.py` | kartın ölçülecek kadar boş olduğunu **fırlatarak** doğrular; dönüşümlü A/B ve yayılım raporu |
 | `experiments/m0_chunk_rows.py` | `auto_chunk`'ın satır hedefi ile arama eşiğinin etkileşimi — yol sayımı + zaman |
 | `experiments/m0_tile_timings.py` | `TILE_TIMINGS`'i ızgaranın gerçek hücrelerinden **türeterek** ölçer; `n_tiles` kaydeder |
+| `experiments/m1_run.py` | **tam model sürücüsü** — kalibre et, sıkıştır, ölç; blok granülerliğinde checkpoint |
 
 **Belgeler:** `docs/spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı** — iki kutu kaldı, artık maliyet engeli yok) ·
 `docs/audit.md` (v6 denetimi) · `docs/gate_a_dry_run.md` (literatür provası) ·
 bu belge.
 
-**Henüz yazılmamış betikler** (§8.1, §8.3): `experiments/m1_run.py` —
-tam model sürücüsü + checkpoint · `experiments/tau_sweep.py` — `τ` yüzeyi.
-İkisi de `sequential_calibrate` + `streamed_perplexity` dikişini kullanacak.
+**Henüz yazılmamış betik** (§8.3): `experiments/tau_sweep.py` — `τ` yüzeyi.
+`m1_run.py` ile aynı dikişi kullanacak, yani yarısı yazılmış sayılır.
+*(`experiments/m1_run.py` **08-25'te yazıldı** — §8.1 kapandı.)*
 
 ```bash
-python -m pytest tests/ -q                         # 624 test, ~2.5 dk
+python -m pytest tests/ -q                         # 629 test, ~2.8 dk
 HF_HUB_DISABLE_XET=1 python experiments/m0_dense_ppl.py --seqlens 2048 4096 --device cuda
 HF_HUB_DISABLE_XET=1 python -u experiments/m0_rotation_value.py \
     --tiles 4 16 max --seqs 16 --rows 512 --solve-device cuda --solve-dtype float32

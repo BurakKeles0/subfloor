@@ -359,3 +359,120 @@ def test_the_pipeline_runs_through_the_seam_on_cuda():
     # Lossy at 1.5 bits, so every layer has to move -- a zero here would mean
     # the fallback weight went back in and nothing was actually compressed.
     assert all(0.0 < r["rel_output_error"] < 1.0 for r in records)
+
+
+# --------------------------------------------------------------------------- #
+# The full-model driver, and the one property that makes its checkpoint worth
+# having (`docs/STATUS.md` section 8.1)
+# --------------------------------------------------------------------------- #
+
+def _tiny_for_m1(tmp_path, monkeypatch):
+    """A tiny Llama the driver can compress end to end, plus its token stream.
+
+    `m1_run` loads a checkpoint by name; here it is handed the tiny model
+    instead, which is what lets the resume property be tested at all.  On the
+    real 7B one run is hours, so a test that needed it would never be run.
+    """
+    import m1_run
+
+    def fake_load(name, *, dtype=torch.float16, device_map=None):
+        h = HF.tiny_llama(vocab_size=VOCAB, hidden_size=64, intermediate_size=128,
+                          num_hidden_layers=4, num_attention_heads=4,
+                          num_key_value_heads=2, dtype=DT, seed=21)
+        h.tokenizer = None
+        return h
+
+    g = torch.Generator().manual_seed(5)
+    tokens = torch.randint(VOCAB, (8, SEQ), generator=g)
+    stream = torch.randint(VOCAB, (SEQ * 6,), generator=g)
+
+    monkeypatch.setattr(m1_run.HF, "load_llama", fake_load)
+    monkeypatch.setattr(m1_run.Cal, "load_calibration_tokens",
+                        lambda tok, **k: tokens)
+    monkeypatch.setattr(m1_run.PPL, "load_eval_tokens",
+                        lambda tok, dataset="wikitext2", split="test": stream)
+    return m1_run
+
+
+@pytest.mark.parametrize("device", ["cpu"])
+def test_a_resumed_run_lands_where_an_uninterrupted_one_does(
+        tmp_path, monkeypatch, device):
+    """THE checkpoint test, and the reason section 8.1 insists resume is part of
+    the driver rather than something added afterwards.
+
+    A resume that restored only the weights and re-ran the dense model would
+    calibrate the remaining blocks against activations no version of the model
+    ever produced.  It would not fail -- it would return a plausible perplexity
+    that is simply not the one the run was computing.  So the property is not
+    "resume works", it is "resume is INVISIBLE in the answer".
+    """
+    m1_run = _tiny_for_m1(tmp_path, monkeypatch)
+    spec = m1_run.PointSpec(model="tiny", budget_bits=1.5, tile_size=4, draw=0)
+    common = dict(device=device, calib_samples=8, calib_seqlen=SEQ,
+                  eval_datasets=("wikitext2",), eval_seqlen=SEQ, progress=lambda *a: None)
+
+    uninterrupted = m1_run.run_point(spec, resume_root=None, **common)
+
+    root = tmp_path / "resume"
+    stopped = m1_run.run_point(spec, resume_root=root, stop_after_block=1, **common)
+    assert stopped["stopped_after_block"] == 1
+    assert (root / spec.slug() / "state.json").exists(), "no checkpoint was left"
+
+    resumed = m1_run.run_point(spec, resume_root=root, **common)
+
+    assert resumed["perplexity"]["wikitext2"] == pytest.approx(
+        uninterrupted["perplexity"]["wikitext2"], rel=1e-9), (
+        "the resumed run reached a different model than the uninterrupted one"
+    )
+    assert len(resumed["records"]) == len(uninterrupted["records"])
+    assert [r["block"] for r in resumed["records"]] == \
+           [r["block"] for r in uninterrupted["records"]]
+
+
+def test_the_checkpoint_is_cleared_when_the_point_finishes(tmp_path, monkeypatch):
+    """A point that completed must not leave state a later run would resume
+    from -- that would silently skip the whole compression."""
+    m1_run = _tiny_for_m1(tmp_path, monkeypatch)
+    spec = m1_run.PointSpec(model="tiny", budget_bits=1.5, tile_size=4, draw=0)
+    root = tmp_path / "resume"
+    m1_run.run_point(spec, device="cpu", resume_root=root, calib_samples=8,
+                     calib_seqlen=SEQ, eval_datasets=("wikitext2",),
+                     eval_seqlen=SEQ, progress=lambda *a: None)
+    assert not (root / spec.slug()).exists()
+
+
+def test_the_checkpoint_refuses_to_resume_a_different_configuration(
+        tmp_path, monkeypatch):
+    """The key is `(model, budget, tile, draw)`.  Resuming one point's blocks
+    into another's would mix two configurations into one perplexity, and every
+    number downstream would be of a model that was never specified."""
+    m1_run = _tiny_for_m1(tmp_path, monkeypatch)
+    root = tmp_path / "resume"
+    a = m1_run.PointSpec(model="tiny", budget_bits=1.5, tile_size=4, draw=0)
+    m1_run.run_point(a, device="cpu", resume_root=root, stop_after_block=0,
+                     calib_samples=8, calib_seqlen=SEQ,
+                     eval_datasets=("wikitext2",), eval_seqlen=SEQ,
+                     progress=lambda *a: None)
+
+    b = m1_run.PointSpec(model="tiny", budget_bits=1.5, tile_size=4, draw=1)
+    ckpt = m1_run.Checkpoint(root, b)
+    ckpt.dir = root / a.slug()             # point b at a's directory
+    with pytest.raises(ValueError, match="refusing to resume"):
+        ckpt.load()
+
+
+def test_the_driver_reports_the_early_warning_rule(tmp_path, monkeypatch):
+    """Section 3.2's assumption is this project's largest single risk and the
+    driver can check it for free -- it already has both numbers."""
+    m1_run = _tiny_for_m1(tmp_path, monkeypatch)
+    spec = m1_run.PointSpec(model="tiny", budget_bits=1.5, tile_size=4, draw=0)
+    out = m1_run.run_point(spec, device="cpu", resume_root=None, calib_samples=8,
+                           calib_seqlen=SEQ, eval_datasets=("wikitext2",),
+                           eval_seqlen=SEQ, progress=lambda *a: None)
+    assert out["diagnostics"], "no early-warning diagnostics were produced"
+    for d in out["diagnostics"]:
+        assert d["block"] == 0
+        assert d["ratio_to_dense"] > 0
+        assert isinstance(d["assumption_broken"], bool)
+    # And the levers that produced the numbers travel with them.
+    assert out["levers"]["rotate_kron"] is True

@@ -570,16 +570,44 @@ def test_the_pipeline_levers_are_on_by_default_and_the_record_says_so():
 
     # what the record claims
     assert r["rotate_kron"] is True
-    assert r["search_dtype"] == str(torch.float16)
     assert r["compensate_block"] == M.PIPELINE_COMPENSATE_BLOCK
     assert r["rotate_kron_auto_disabled"] is False
 
     # what actually ran
     assert seen["kron"] == 1, "the Kronecker factors were never built"
-    assert seen["fp16"] > 0, "the scale fit did not search in fp16"
     assert seen["block"] == [M.PIPELINE_COMPENSATE_BLOCK], (
         f"compensation ran with block={seen['block']}, not the pipeline's"
     )
+
+    # fp16 is a CUDA lever and only a CUDA lever: on the CPU it is 4.3x SLOWER,
+    # so the pipeline resolves it per device.  Both halves are asserted, because
+    # a global constant here would quietly tax every CPU run -- which is how it
+    # was caught: the suite went from 2:44 to 6:20.
+    on_cpu = problem.W.device.type == "cpu"
+    assert r["search_dtype"] == (None if on_cpu else str(torch.float16))
+    assert (seen["fp16"] == 0) if on_cpu else (seen["fp16"] > 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda")
+def test_the_fp16_lever_is_resolved_per_device():
+    """The half of the lever a CPU-only run would never see.
+
+    Measured when it became a default: 0.55 s a call in fp32 against 2.34 in
+    fp16 on the CPU, where the arithmetic is emulated.  The 1.24-1.52x that
+    justified the lever was a CUDA number, and applying it everywhere is the
+    shape of defect this file's constants were rewritten to stop.
+    """
+    import calibrate as Cal
+    cpu = Cal.synthetic_problem(64, 128, 256)
+    gpu = Cal.LayerProblem(cpu.W.float().cuda(), cpu.X.float().cuda())
+
+    assert M.run_config(cpu, budget_bits=1.5, tile_size=4)["search_dtype"] is None
+    assert M.run_config(gpu, budget_bits=1.5, tile_size=4)["search_dtype"] ==         str(M.PIPELINE_SEARCH_DTYPE)
+
+    # And an explicit request still wins on either device.
+    forced = M.run_config(cpu, budget_bits=1.5, tile_size=4,
+                          search_dtype=torch.float16)
+    assert forced["search_dtype"] == str(torch.float16)
 
 
 def test_a_lever_the_pipeline_cannot_reach_is_not_a_lever():

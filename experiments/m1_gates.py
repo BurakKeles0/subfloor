@@ -84,10 +84,20 @@ DEFAULT_TILES = (1, 2, 4, 8, 16, 32, Tl.MAX_TILE)
 #: moves -0.03..-0.31%, i.e. in our favour (section 6.8).
 PIPELINE_ROTATE_KRON = True
 
-#: Search the codebook in fp16.  1.24-1.52x on the codebook term, at most 0.90%
-#: quality (section 6.9).  Verified not to disturb the search routing: the
-#: decoder's miss fraction is the same to within 0.1 pp in fp16 and fp32, so the
-#: inequality section 6.13 rests on still holds.
+#: Search the codebook in fp16 -- ON CUDA, and the qualifier is the point.
+#:
+#: 1.24-1.52x on the codebook term there, at most 0.90% quality (section 6.9),
+#: and verified not to disturb the routing: the decoder's miss fraction is the
+#: same to within 0.1 pp in fp16 and fp32, so the inequality section 6.13 rests
+#: on still holds.
+#:
+#: ON THE CPU IT IS 4.3x SLOWER, measured the moment it became a default and the
+#: test suite went from 2:44 to 6:20.  fp16 arithmetic is emulated there, so the
+#: lever runs backwards.  The measurement that justified it was a CUDA
+#: measurement and saying "fp16 is faster" without that qualifier is the same
+#: shape as every other constant corrected this week -- right in one regime,
+#: applied in all of them.  `_pipeline_search_dtype` resolves it per device and
+#: the record says which was used.
 PIPELINE_SEARCH_DTYPE = torch.float16
 
 #: Defer each block of the compensation sweep's errors into one matmul.  6.63x
@@ -102,6 +112,11 @@ PIPELINE_COMPENSATE_BLOCK = 512
 #: explicit request is how a caller loses the ability to ask for the old
 #: behaviour.
 _PIPELINE = object()
+
+
+def _pipeline_search_dtype(device: torch.device) -> torch.dtype | None:
+    """`PIPELINE_SEARCH_DTYPE` where it is a speedup, `None` where it is not."""
+    return PIPELINE_SEARCH_DTYPE if device.type == "cuda" else None
 
 
 # --------------------------------------------------------------------------- #
@@ -239,7 +254,7 @@ def run_config(
     if not kron_explicit:
         rotate_kron = PIPELINE_ROTATE_KRON
     if search_dtype is _PIPELINE:
-        search_dtype = PIPELINE_SEARCH_DTYPE
+        search_dtype = _pipeline_search_dtype(problem.W.device)
     if compensate_block is _PIPELINE:
         compensate_block = PIPELINE_COMPENSATE_BLOCK
 
