@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-25 · HEAD `PENDING` · Testler: **604 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-25 · HEAD `a3d5a05` · Testler: **604 geçiyor, 6 atlanıyor**
 > Bu oturumun ölçüm dersleri **§14**'te — hız kazançlarından daha taşınabilir.
 
 ---
@@ -1173,6 +1173,7 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `383a64a` | **Üç hassasiyet kaldıracı, tek tek ve kombine** (§6.9). TF32 **hattı kırıyor** — §3.3'ün açık kalemi kapandı. `fp16+kron` bağımsız, birlikte M1 11.98 → **6.63 g** |
 | `8c56f1e` | **Kalibrasyon Hessian'ı GPU'da** (25×) ve maliyet modelinin **altıncı hatası** (§6.10). `m1_run.py` bugün 40 gün sürerdi, 13.4 değil |
 | `98c0413` | **`_nearest`'in ikinci kapısı** (§6.11a, süpürmede 2.0–3.5×) ve **yedinci eksik terim** (§6.11b). Ayrıca §7.2'deki bir ret **yanlış rejimde ölçülmüş** çıktı (§6.11c) |
+| `a3d5a05` | **§8.1'in dikişi GPU'da hiç koşmamış** (§6.12). Bir yolda **beş** kusur, beşi de 599 CPU testinin kör noktasında. Zincir artık uçtan uca koşuyor: gerçek Llama blokları → `sequential_calibrate` → `run_config` → `streamed_perplexity` |
 
 **08-24 oturumunun yayı, tek satırda:** hat 17 günden 12'ye indi (`1efa971`),
 sonra modelin iki eksik terimi bulununca gerçeğin ~40 olduğu anlaşıldı
