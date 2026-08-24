@@ -292,3 +292,88 @@ def test_a_corpus_shorter_than_one_window_says_so(monkeypatch):
 def test_an_unknown_calibration_dataset_is_rejected():
     with pytest.raises(ValueError, match="unknown dataset"):
         Cal.load_calibration_tokens(_FakeTokenizer(), dataset="nope")
+
+
+# --------------------------------------------------------------------------- #
+# WHERE THE HESSIAN IS ACCUMULATED
+# --------------------------------------------------------------------------- #
+# `collect_block_statistics` used to build every accumulator on the CPU and copy
+# each activation off the device it was already on, so the largest matmul in a
+# full-model run happened on the slower processor.  Measured on one Llama-2-7B
+# block over 16,384 tokens: 19.7 s that way against 0.91 s on the GPU in
+# float32 -- and this term, which the cost model had never charged at all, is
+# 5.6 hours per M1 point as it stood and 0.26 after.
+
+def test_the_accumulator_follows_its_hessian_not_its_input():
+    """`update` must move the ACTIVATION to H, never H to the activation.
+
+    The other way round reallocates a k-by-k tensor per batch, and on the sizes
+    that matter (11008^2) that is most of a gigabyte each time.
+    """
+    acc = Cal.HessianAccumulator(4, device="cpu", dtype=torch.float64)
+    x = torch.randn((6, 4), dtype=torch.float32)
+    acc.update(x)
+    assert acc.H.device.type == "cpu" and acc.H.dtype is torch.float64
+    assert acc.n_tokens == 6
+    assert torch.allclose(acc.H, x.double().T @ x.double(), atol=1e-12)
+
+
+def test_statistics_land_on_the_blocks_own_device_by_default():
+    block = _blocks(1)[0]
+    accs = Cal.collect_block_statistics(block, _inputs(), dtype=DT)
+    want = next(block.parameters()).device
+    assert accs and all(a.H.device == want for a in accs.values())
+
+
+def test_an_explicit_device_still_wins():
+    """The default is a convenience, not a policy: seven Hessians of a 7B block
+    are 1.73 GiB at float64, so a caller short of VRAM has to be able to put
+    them somewhere else."""
+    block = _blocks(1)[0]
+    accs = Cal.collect_block_statistics(block, _inputs(), dtype=DT, device="cpu")
+    assert accs and all(a.H.device.type == "cpu" for a in accs.values())
+
+
+def test_a_narrow_compute_dtype_does_not_change_where_the_sum_is_kept():
+    """`compute_dtype` narrows the PRODUCT only.  Measured, that is also all it
+    can do for accuracy -- float32 products into a float64 H agree with float64
+    throughout to 5.08e-06, against 5.06e-06 for a plain float32 accumulator.
+    The rounding is in the multiply, and a wider accumulator cannot undo it."""
+    x = torch.randn((512, 16), dtype=torch.float32) * 3.0
+    wide = Cal.HessianAccumulator(16, dtype=torch.float64)
+    mixed = Cal.HessianAccumulator(16, dtype=torch.float64,
+                                   compute_dtype=torch.float32)
+    narrow = Cal.HessianAccumulator(16, dtype=torch.float32)
+    for a in (wide, mixed, narrow):
+        a.update(x)
+    assert mixed.H.dtype is torch.float64 and narrow.H.dtype is torch.float32
+    # The mixed accumulator is no closer to the float64 answer than the narrow
+    # one -- that is the measurement, and it is why neither is the default.
+    ref = wide.H
+    d_mixed = float((mixed.H - ref).abs().max() / ref.abs().max())
+    d_narrow = float((narrow.H.double() - ref).abs().max() / ref.abs().max())
+    assert d_mixed == pytest.approx(d_narrow, rel=0.5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda")
+def test_the_default_device_is_the_one_that_actually_distinguishes():
+    """The two tests above cannot fail on a CPU-only run, and that is the point.
+
+    `next(block.parameters()).device` IS "cpu" there, so the old hard-wired
+    "cpu" and the new default agree and the assertions hold either way -- the
+    same shape of blind spot `quantize.is_canonical_codebook` had.  With the
+    block on a GPU they diverge, and this is where the 25x lives.
+    """
+    block = _blocks(1)[0].to("cuda")
+    inputs = [x.to("cuda") for x in _inputs()]
+
+    accs = Cal.collect_block_statistics(block, inputs, dtype=DT)
+    assert accs and all(a.H.is_cuda for a in accs.values())
+
+    on_cpu = Cal.collect_block_statistics(block, inputs, dtype=DT, device="cpu")
+    assert all(a.H.device.type == "cpu" for a in on_cpu.values())
+
+    # Same answer either way: where it is accumulated is a speed decision, and
+    # at float64 it is not even a precision one.
+    for name, a in accs.items():
+        assert torch.equal(a.H.cpu(), on_cpu[name].H)

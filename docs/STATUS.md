@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-24 · HEAD `de8a5ec` · Testler: **573 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-24 · HEAD `383a64a` · Testler: **580 geçiyor, 6 atlanıyor**
 
 ---
 
@@ -312,8 +312,11 @@ değiştirmiyor — yalnızca sınanabilir hâle getiriyor.
 Eval'in kendisi **238 s** — ihmal edilebilir. Maliyet ızgaranın **ortasında**
 tepe yapıyor: `n_tiles = n_out/T` düşerken `d` (dolayısıyla `k`) yükseliyor.
 
-**M1 (3 bütçe × 7 tile × 5 çekiliş): 12.0 gün.**
-**`τ` süpürmesi: 3.3 gün** (spec 25 *saat* diyordu).
+**M1 (3 bütçe × 7 tile × 5 çekiliş): 13.4 gün** — kalibrasyon dâhil (§6.10).
+**`τ` süpürmesi: 3.9 gün** (spec 25 *saat* diyordu).
+
+Yukarıdaki tablo yalnız **sıkıştırmayı** gösteriyor; her noktaya ayrıca
+**0.33 saat kalibrasyon** ve 238 s eval biniyor.
 
 > **Baskın terim el değiştirdi ve artık codebook değil.** T=2 ve T=4'te en büyük
 > kalem **rotasyon** (1.72h ve 1.92h, noktanın ~%54'ü). Sıradaki iş §6.8.
@@ -636,6 +639,59 @@ M1 düzeyinde de ayrık: 1.15 ve 1.47'den ayrık-null 1.82×, ölçülen 1.81×.
 
 ---
 
+### 6.10 Maliyet modelinin altıncı hatası: kalibrasyon hiç yazılmamış
+
+**Bu, altı sürümde bulunanların en büyüğü, ve `m1_run.py`'nin süresini soran
+soru ortaya çıkardı.**
+
+`sequential_calibrate` nokta başına her bloğu **iki kez** dolaşıyor: bir kez
+hook'larla Hessian'ları toplamak, bir kez de sonraki blok sıkıştırılmış çıktıyı
+görsün diye (Spec v6 tuzak 20). Model ikisini de yazmıyordu.
+
+Ölçüldü (Llama-2-7B blok 0, 7 linear, 16,384 token):
+
+| biriktirici | süre | nokta başına | float64'e bağıl fark |
+|---|---|---|---|
+| **CPU float64** (kodun geldiği hâl) | 19.65 s | **5.59 h** | 0 |
+| CUDA float64 | 29.86 s | 8.49 h | 3.1e-17 |
+| **CUDA float32** | **0.91 s** | **0.26 h** | 5.06e-06 |
+| CUDA float64 + float32 çarpım | 0.99 s | 0.28 h | 5.08e-06 |
+
+Nokta başına 5.59 saat — **her tile boyutunda sıkıştırmanın tamamından
+pahalı**. M1'in 105 noktasında 28 gün.
+
+**Sebebi mekanik.** `collect_block_statistics` biriktiriciyi `device="cpu"` ile
+kuruyordu ve hook her aktivasyonu `.to("cpu")` ile kopyalıyordu — yani `Xᵀ X`,
+aktivasyonlar ve blok zaten GPU'dayken CPU'da yapılıyordu. Bloğun kendi
+cihazında biriktirmek **25×**.
+
+> **Ve kendi önerimi çürüttüm.** "float32 çarpımı float64 bir toplayıcıya
+> eklemek hassasiyeti neredeyse bedava geri alır" demiştim. Ölçüldü: %9 daha
+> pahalı ve **hiçbir şey kazandırmıyor** (5.08e-6'ya karşı 5.06e-6). Hata
+> toplamada değil **çarpımda**; daha geniş bir toplayıcı çarpımın attığını geri
+> getiremiyor. Parçaları küçültmek de işe yaramıyor — toplam hata her hâlükârda
+> `√(toplam token)` gidiyor. API'de kaldı ve *neden işe yaramadığı* yazıldı.
+
+**Tasarım ekonomisi tersine döndü.** Sıkıştırma baskınken maliyeti *hangi*
+tile'ları koştuğun belirliyordu; kalibrasyon baskınken **kaç nokta** koştuğun
+belirliyor. Tasarım G (2 tile × 5 çekiliş = 10 nokta) Tasarım F'ten (7 nokta)
+**pahalı** hâle geliyordu — ucuz kaçış kapısı olmaktan çıkıyordu.
+
+**`m1_run.py` bugün başlatılsaydı:**
+
+| senaryo | M1 | Tasarım F |
+|---|---|---|
+| modelin söylediği (kalibrasyon yok) | 11.98 g | 15.6 saat |
+| **gerçek kod, düzeltmeden önce** | **39.8 g** | **60.1 saat** |
+| Hessian GPU'da (bu değişiklik) | **13.4 g** | 17.3 saat |
+| + fp16 + kron | **~7.1 g** | ~10.4 saat |
+
+**Neyin altı sürüm boyunca saklanmasına izin verdiği kayda değer:** tam
+sürücüyü kimse koşmadı, çünkü `m1_run.py` yok. §8.1'in kritik yol olmasının
+sebebi yalnızca "veri yok" değil — **ölçülmeyen maliyet de orada birikiyor.**
+
+---
+
 ## 7. Denenip **reddedilenler** — tekrar denenmesin
 
 Bu bölüm kasıtlı olarak uzun. Bir fikrin denenip elendiğini kaydetmemek, onu
@@ -823,7 +879,7 @@ yok. §8.1'in checkpoint'i bu yüzden kritik yolda.
 | `compact.py` | survivor'ları tile başına yoğun bloklara topla |
 | `rotation.py` | maske-koruyan rotasyon, blok-köşegen varyant |
 | `quantize.py` | E8P codebook, kafes çözücü, **analitik arama**, LDLQ, ölçek politikası, füzyon çekirdekleri |
-| `calibrate.py` | sıralı kalibrasyon, `LayerProblem` (**dikiş yeri**), `sequential_calibrate` (**sürücü — henüz yalnız testlerden çağrılıyor**) |
+| `calibrate.py` | sıralı kalibrasyon, `LayerProblem` (**dikiş yeri**), `sequential_calibrate` (**sürücü — henüz yalnız testlerden çağrılıyor**), Hessian biriktirici (cihazda) |
 | `hf_llama.py` | HF adaptörü — blok 0 girdilerini yakalar; `to_device` |
 | `eval/perplexity.py` | ppl + protokol koruması + yayımlanmış sayı tablosu |
 | `eval/streamed.py` | katman-akışlı ppl |
@@ -894,6 +950,7 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `0a19f90` | **`_on_device` tuzağı kapatıldı** (§10). Üç oturumdur belgede duran, kodda durmayan hata; dört ölçümü bozmuştu |
 | `de8a5ec` | **Kronecker kongrüansı gerçek katmanda ölçüldü** (§6.8). Sentetik ölçüm iki mertebe yanılmıştı; hattın kolunda etki lehte, M1 11.98 → 8.17 g. Varsayılan kapalı |
 | `383a64a` | **Üç hassasiyet kaldıracı, tek tek ve kombine** (§6.9). TF32 **hattı kırıyor** — §3.3'ün açık kalemi kapandı. `fp16+kron` bağımsız, birlikte M1 11.98 → **6.63 g** |
+| *(bu değişiklik)* | **Kalibrasyon Hessian'ı GPU'da** (25×) ve maliyet modelinin **altıncı hatası** (§6.10). `m1_run.py` bugün 40 gün sürerdi, 13.4 değil |
 
 ---
 

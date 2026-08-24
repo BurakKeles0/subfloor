@@ -6,11 +6,16 @@ anything is committed.  This checks it -- and the answer is not the one the
 question expected, because the sweep is not the first thing that stops working.
 
 Everything here rests on constants measured ON THIS MACHINE, not on peak
-figures.  Three terms are charged, each from its own measured curve:
+figures.  Four terms are charged, each from its own measured curve:
 
-  codebook   the nearest-codeword search and the scale sweep in front of it
-  rotation   `q @ H_t @ q.T`, once per tile
-  cholesky   the per-tile sub-Hessian factorization LDLQ needs, O(k^3) per tile
+  calibration  two passes over every block, per point: gather the Hessians,
+               then re-run so the next block sees the compressed output
+  codebook     the nearest-codeword search and the scale sweep in front of it
+  rotation     `q @ H_t @ q.T`, once per tile
+  cholesky     the per-tile sub-Hessian factorization, O(k^3) per tile
+
+The last three were the whole model until 2026-08-24; calibration is new and was
+worth 28 days of M1 at the configuration the code shipped with.
 
 That order is historical, not current.  The factorization LOOKS like it should
 dominate -- it is the only cubic term -- and for a while the model said it did.
@@ -19,9 +24,11 @@ the pass is 1.92 hours of ROTATION against 1.34 of codebook and 0.21 of
 Cholesky.  The lead has changed hands twice; read the numbers, not the order.
 
 The model describes the pipeline as it now runs: feedback confined to width-512
-blocks, the sweep chunked across tiles, and the scale fit's 24 candidates
-evaluated in one search call -- all three bit-identical to what they replace.
-Together they took M1 from 94 days to 12.
+blocks, the sweep chunked across tiles, the scale fit's 24 candidates evaluated
+in one search call -- all three bit-identical to what they replace -- and the
+calibration Hessians accumulated on the block's own device rather than copied to
+the CPU, which is 25x on a term that had never been charged.  M1 is 13.4 days;
+without the calibration fix the same grid would be 40.
 
 What is left is no longer `fit_scale`.  It was 83% of a tile and is 28%, so the
 saving from dropping the per-tile fit fell from several-fold to 1.4 days, and
@@ -52,6 +59,16 @@ The corrections, in order, because each one is a way this file was wrong:
      grid's cost lives.  Fixed by recording each row's measurement width
      (`TILE_TIMING_BLOCK`), because the cpu and cuda rows were taken under
      different arrangements and no single assumption is right for both.
+
+  6. it charged NO CALIBRATION AT ALL.  `calibrate.sequential_calibrate` walks
+     every block twice per point -- once with hooks to accumulate the Hessians,
+     once more so the next block sees the compressed output -- and neither pass
+     appeared here.  At the configuration the code shipped with, accumulators
+     pinned to the CPU, that was 5.59 hours per point, more than the entire
+     compression pass at every tile size.  M1 read 12 days when the answer was
+     40.  See `CALIBRATION_TIMINGS`, and note what let it hide for six versions:
+     nothing had ever run the full driver, because `experiments/m1_run.py` does
+     not exist.
 
 And one thing that was not a modelling error but a measurement that did not
 hold: two of the three `cuda_f32` tile timings recorded on 2026-08-24 do not
@@ -269,6 +286,42 @@ ROT_TIMINGS = {
 #: Measured, `experiments/m0_dense_ppl.py`: one streamed WikiText-2 pass at
 #: seqlen 4096 on this 8 GB card.
 EVAL_SECONDS = 238.0
+
+#: Calibration tokens one M1 point sees: the preregistration's 128 samples at
+#: its primary seqlen of 4096.
+CALIBRATION_TOKENS = 128 * 4096
+
+#: (tokens, seqlen, statistics seconds, block-forward seconds) for ONE block,
+#: measured on this machine over Llama-2-7B block 0 with its seven linears.
+#:
+#: THE MODEL'S SIXTH ERROR, AND ITS LARGEST.  This term was never charged at
+#: all.  `calibrate.sequential_calibrate` runs every block TWICE per point --
+#: once with hooks to accumulate each linear's Hessian, once more so the next
+#: block sees what the compressed model actually produces (Spec v6 trap 20) --
+#: and neither pass appeared anywhere in this file.  Nothing caught it because
+#: nothing had ever run the full driver: `experiments/m1_run.py` does not exist,
+#: which is the same gap `docs/STATUS.md` section 8.1 is about.
+#:
+#: At the configuration the code shipped with -- accumulators pinned to the CPU
+#: -- it was 5.59 hours per point, MORE than the entire compression pass at
+#: every tile size, and M1 would have taken 39.8 days rather than the 12 this
+#: model reported.  Accumulating on the block's own device in float32 is 25x
+#: (`calibrate.collect_block_statistics`) and brings it to 0.26.
+#:
+#: The variants, measured over 16,384 tokens on one block, for the record:
+#:   cpu float64 (the old default)   19.65 s
+#:   cuda float64                    29.86 s   -- fp64 is ~1/64 rate here
+#:   cuda float32                     0.91 s   -- 5.06e-06 from the float64 answer
+#:   cuda float64, float32 products   0.99 s   -- 5.08e-06, so it buys nothing
+#:
+#: The statistics term is linear in tokens and independent of seqlen.  The
+#: forward term is linear in tokens too but its attention is quadratic in
+#: SEQLEN, and this was measured at 2048 against M1's 4096 -- so that half is
+#: understated roughly twofold.  It is 0.25 s against 0.91, so the total is not
+#: sensitive to it; say so rather than quietly scale it.
+CALIBRATION_TIMINGS = {
+    "cuda_f32": (16384, 2048, 0.91, 0.25),
+}
 
 TILES = (1, 2, 4, 8, 16, 32, Tl.MAX_TILE)
 
@@ -519,10 +572,35 @@ def codebook_seconds_per_vector(rates: dict, setup: str,
     return min(fitted, key=lambda s: abs(math.log(s[0] / max(lines, 1))))[1]
 
 
+def calibration_seconds(rates: dict, setup: str, *,
+                        tokens: int = CALIBRATION_TOKENS,
+                        n_blocks: int = N_BLOCKS) -> float:
+    """One point's calibration: statistics plus the re-forward, over all blocks.
+
+    Independent of the tile size and of the budget -- it is the same walk
+    whatever is being compressed -- so it is a flat addition per point, and that
+    changes which DESIGNS are cheap.  When compression dominated, cost followed
+    which tiles were run; when calibration does, it follows how many POINTS are
+    run, and design G (two tile sizes, five draws, ten points) stops being
+    cheaper than design F (seven tile sizes, one draw, seven points).
+
+    Returns 0.0 for a setup with no measurement rather than guessing: this term
+    was invisible for six versions of this model and a fabricated number would
+    put it back.
+    """
+    entry = rates["setups"][setup].get("calibration_timings") \
+        or CALIBRATION_TIMINGS.get(setup)
+    if not entry:
+        return 0.0
+    ref_tokens, _seqlen, stats_s, fwd_s = entry
+    return (stats_s + fwd_s) * (tokens / ref_tokens) * n_blocks
+
+
 def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
                batched: bool = False, scale_fit: bool = True,
                hessian_block: int | None = DEFAULT_HESSIAN_BLOCK,
-               inventory=LLAMA2_7B, n_blocks: int = N_BLOCKS) -> dict:
+               inventory=LLAMA2_7B, n_blocks: int = N_BLOCKS,
+               calibration_tokens: int = CALIBRATION_TOKENS) -> dict:
     """One full compression pass over Llama-2-7B at one tile size.
 
     Timing comes from the measured per-tile fit, not from flops over kernel
@@ -562,6 +640,8 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
     # genuinely separate term rather than a double count of one already inside
     # the fitted codebook constant.
     seconds = chol_seconds + rot_seconds + cb_seconds
+    cal_seconds = calibration_seconds(rates, setup, tokens=calibration_tokens,
+                                      n_blocks=n_blocks)
     return {
         "tile_size": tile_size, "setup": setup, "batched": batched,
         "scale_fit": scale_fit,
@@ -571,8 +651,12 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
         "codebook_seconds": cb_seconds,
         "codebook_seconds_per_vector": per_vector,   # last layer's
         "compress_seconds": seconds,
+        "calibration_seconds": cal_seconds,
         "eval_seconds": EVAL_SECONDS,
-        "point_seconds": seconds + EVAL_SECONDS,
+        # A point is what `m1_run.py` will actually do: gather the statistics,
+        # compress, evaluate.  `compress_seconds` was standing in for all three
+        # until 2026-08-24 and the difference was 28 days of M1.
+        "point_seconds": seconds + cal_seconds + EVAL_SECONDS,
         "peak_hessian_bytes": peak,
         "peak_hessian_bytes_streamed": peak_streamed,
     }

@@ -160,6 +160,49 @@ def test_timing_comes_from_the_measured_tile_fit():
     assert c["codebook_seconds"] == pytest.approx(4096 * k * per_weight)
 
 
+def test_a_point_charges_the_calibration_it_actually_does():
+    """The model's sixth error, and the largest.
+
+    `sequential_calibrate` walks every block TWICE per point -- once with hooks
+    to accumulate the Hessians, once more so the next block sees the compressed
+    output -- and neither pass was charged anywhere.  Nothing caught it because
+    nothing had ever run the full driver.  At the configuration the code shipped
+    with it was 5.59 hours per point, more than the whole compression pass at
+    every tile size, and M1 read 12 days when the answer was 40.
+    """
+    import json
+    from pathlib import Path
+    rates_file = Path(__file__).resolve().parent.parent / "results" / "m0_rates.json"
+    if not rates_file.exists():
+        pytest.skip("no measured rates on this machine")
+    rates = json.loads(rates_file.read_text(encoding="utf-8"))
+    if "cuda_f32" not in rates["setups"]:
+        pytest.skip("no cuda rates measured on this machine")
+
+    cal = CM.calibration_seconds(rates, "cuda_f32")
+    assert cal > 0
+    c = CM.model_cost(4, 1.5, rates, "cuda_f32")
+    assert c["calibration_seconds"] == pytest.approx(cal)
+    assert c["point_seconds"] == pytest.approx(
+        c["compress_seconds"] + cal + c["eval_seconds"])
+
+    # Linear in both, because it is one pass over the tokens per block.
+    assert CM.calibration_seconds(rates, "cuda_f32", tokens=2 * CM.CALIBRATION_TOKENS)         == pytest.approx(2 * cal)
+    assert CM.calibration_seconds(rates, "cuda_f32", n_blocks=2 * CM.N_BLOCKS)         == pytest.approx(2 * cal)
+
+    # And it does not depend on the tile size, which is what re-orders the
+    # designs: cost now follows the number of POINTS, not which tiles they use.
+    for t in (1, 16, Tl.MAX_TILE):
+        assert CM.model_cost(t, 1.5, rates, "cuda_f32")["calibration_seconds"]             == pytest.approx(cal)
+
+
+def test_an_unmeasured_setup_is_charged_nothing_rather_than_a_guess():
+    """This term was invisible for six versions of the model.  A fabricated
+    default would put it back, silently and in the optimistic direction."""
+    bare = {"setups": {"unmeasured": {"cholesky_flops_per_s": 1e12}}}
+    assert CM.calibration_seconds(bare, "unmeasured") == 0.0
+
+
 def test_the_cholesky_is_subtracted_at_the_width_it_was_measured_under():
     """The model's fifth error, and the second of them to be optimistic.
 

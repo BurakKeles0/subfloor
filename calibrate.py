@@ -153,22 +153,47 @@ class HessianAccumulator:
 
     Kept in float64 (or float32 on device) regardless of the model's dtype: H is
     a sum over hundreds of thousands of tokens and fp16 loses it.
+
+    `compute_dtype` splits the two jobs the dtype was doing: the PRODUCT is
+    `O(tokens * n_in^2)` and wants to be fast, the SUM is `O(n_in^2)` per batch
+    and could be accurate.
+
+    MEASURED, AND IT BUYS NOTHING HERE.  Adding float32 products into a float64
+    H costs 9% more time and lands on 5.08e-06 against float64's answer, where
+    a plain float32 accumulator lands on 5.06e-06 -- the same number.  The error
+    is in the PRODUCT, not in the sum: each batch's `x^T x` already rounds
+    `sqrt(tokens) * eps` worth of it away, and a wider accumulator cannot undo
+    what the multiply discarded.  Splitting the batches finer does not help
+    either, since the error over the whole pass goes as `sqrt(total tokens)`
+    however it is grouped.
+
+    Kept anyway, and documented, for two reasons: a card with real float64
+    throughput would make the trade differently, and it is the first thing
+    anyone will reach for on seeing 5e-06 -- better to find the measurement here
+    than to repeat it.
     """
 
     def __init__(self, n_in: int, device: torch.device | str = "cpu",
-                 dtype: torch.dtype = torch.float64) -> None:
+                 dtype: torch.dtype = torch.float64,
+                 compute_dtype: torch.dtype | None = None) -> None:
         self.n_in = n_in
         self.H = torch.zeros((n_in, n_in), dtype=dtype, device=device)
+        self.compute_dtype = compute_dtype or dtype
         self.n_tokens = 0
 
     def update(self, x: Tensor) -> None:
-        """`x` is [..., n_in]; every leading dimension counts as tokens."""
-        flat = x.reshape(-1, self.n_in).to(self.H.dtype)
+        """`x` is [..., n_in]; every leading dimension counts as tokens.
+
+        `x` is moved to H's device rather than H to x's: the accumulator is the
+        thing that must not be reallocated per batch.
+        """
+        flat = x.reshape(-1, self.n_in).to(device=self.H.device,
+                                           dtype=self.compute_dtype)
         if flat.shape[1] != self.n_in:
             raise ValueError(
                 f"expected last dim {self.n_in}, got {flat.shape[1]}"
             )
-        self.H += flat.T @ flat
+        self.H += (flat.T @ flat).to(self.H.dtype)
         self.n_tokens += flat.shape[0]
 
     @property
@@ -193,11 +218,28 @@ def collect_block_statistics(
     block_kwargs: dict | None = None,
     dtype: torch.dtype = torch.float64,
     names: Iterable[str] | None = None,
+    device: torch.device | str | None = None,
+    compute_dtype: torch.dtype | None = None,
 ) -> dict[str, HessianAccumulator]:
     """Run `block` over `inputs` and accumulate each linear's input Hessian.
 
     `inputs` is a sequence of batches so the caller controls peak memory; each
     entry is fed through the block once.
+
+    `device` is where the Hessians live and where `x^T x` therefore runs.  It
+    used to be hard-wired to the CPU, which meant copying every activation off
+    the card it was already on and doing the largest matmul in the calibration
+    on the slower processor.  Measured on one Llama-2-7B block over 16,384
+    tokens: 22.4 s that way, 0.89 s accumulating on the GPU in float32 -- 25x,
+    and this is the single biggest term in a full-model run.  `None` means the
+    block's own device.
+
+    Two costs to weigh when overriding it.  The Hessians are resident for the
+    whole pass: seven linears of a 7B block are 0.87 GiB at float32 and 1.73 GiB
+    at float64, against activations that are already several GiB. And float64
+    matmuls are roughly 1/64 rate on a consumer card, so `dtype=float64` alone
+    would trade one slow path for another -- `compute_dtype=torch.float32` is
+    what makes the accurate accumulator affordable.
     """
     linears = find_linears(block)
     if names is not None:
@@ -206,15 +248,20 @@ def collect_block_statistics(
     if not linears:
         raise ValueError("block contains no nn.Linear modules")
 
+    if device is None:
+        device = next(block.parameters()).device
     accs = {
-        name: HessianAccumulator(mod.in_features, device="cpu", dtype=dtype)
+        name: HessianAccumulator(mod.in_features, device=device, dtype=dtype,
+                                 compute_dtype=compute_dtype)
         for name, mod in linears.items()
     }
 
     handles = []
     for name, mod in linears.items():
         def hook(_mod, args, _out, _name=name):
-            accs[_name].update(args[0].detach().to("cpu"))
+            # No `.to(...)` here: the accumulator moves what it needs, so a
+            # same-device activation is never copied.
+            accs[_name].update(args[0].detach())
         handles.append(mod.register_forward_hook(hook, with_kwargs=False))
 
     try:
@@ -244,6 +291,7 @@ def sequential_calibrate(
     block_kwargs: dict | None = None,
     dtype: torch.dtype = torch.float64,
     device: torch.device | str | None = None,
+    compute_dtype: torch.dtype | None = None,
     progress: Callable[[int, str], None] | None = None,
 ) -> list[dict]:
     """Walk the blocks in order, compressing each before moving on.
@@ -271,7 +319,8 @@ def sequential_calibrate(
             inputs = [b.to(device) for b in inputs]
 
         accs = collect_block_statistics(
-            block, inputs, block_kwargs=block_kwargs, dtype=dtype
+            block, inputs, block_kwargs=block_kwargs, dtype=dtype,
+            compute_dtype=compute_dtype,
         )
         linears = find_linears(block)
 
