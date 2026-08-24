@@ -1058,3 +1058,105 @@ def test_a_short_device_spelling_still_takes_the_fast_path(monkeypatch, spelling
     scan_idx, _ = Q._nearest(x, Q.e8p_codebook(DT).clone())
     assert sum(seen) == x.shape[0]
     assert torch.equal(fast_idx, scan_idx)
+
+
+# --------------------------------------------------------------------------- #
+# THE WINDOW BETWEEN THE TWO THRESHOLDS
+# --------------------------------------------------------------------------- #
+# `_nearest` opened its fast path with `_LATTICE_MIN_ROWS` and only consulted
+# `_ANALYTIC_MIN_ROWS` INSIDE that gate, so a row count between the two could
+# not reach the analytic search at all and scanned 65536 codewords instead.
+#
+# Not a corner.  The LDLQ sweep hands `_nearest` `chunk * lines_per_tile` rows:
+# 512 at T=1 and T=2, 816 at T=4, against a cuda floor of 1024.  Ten of the
+# twenty-one layer-by-tile cells at B=1.5 were in the window, and they are the
+# fine-granularity columns where the tile counts are largest.
+#
+# The tests follow the PATH, not the answer.  The scan and the analytic form
+# agree by construction -- that is exactly why this went unnoticed -- so an
+# assertion on the result would have passed against the broken gate.
+
+@pytest.mark.parametrize("n", [256, 512, 816])
+@pytest.mark.parametrize("spread", [0.05, 0.6, 6.0])
+def test_the_window_between_the_thresholds_reaches_the_analytic_form(
+        monkeypatch, n, spread):
+    """Monkeypatched to a cuda-like floor so this runs everywhere.
+
+    On a real CPU the floor is 64, below `_ANALYTIC_DIRECT_MIN_ROWS`, so the
+    window is empty there and the branch never fires -- the bug was cuda-only.
+    Raising the floor here exercises the logic on any machine; the companion
+    test below exercises it where it actually bit.
+    """
+    monkeypatch.setattr(Q, "_LATTICE_MIN_ROWS", {"cpu": 1024, "cuda": 1024})
+    seen = []
+    real = Q._brute_force
+    monkeypatch.setattr(Q, "_brute_force",
+                        lambda x, cb, chunk=4096: (seen.append(x.shape[0]),
+                                                   real(x, cb, chunk))[1])
+    x = torch.randn((n, 8), dtype=DT) * spread
+    cb = Q._on_device(DT, "cpu")
+    idx, code = Q._nearest(x, cb)
+    assert sum(seen) == 0, f"{sum(seen)} rows still went to the scan"
+
+    seen.clear()
+    ref_i, ref_c = Q._brute_force(x, cb)
+    assert torch.equal(idx, ref_i) and torch.equal(code, ref_c)
+
+
+def test_below_the_window_the_scan_is_still_the_right_answer(monkeypatch):
+    """The other edge, and it has to stay put.  Under 256 rows the analytic
+    form's fixed cost is not covered -- measured 0.41x at 128 -- so routing
+    everything to it would be the same mistake pointed the other way."""
+    monkeypatch.setattr(Q, "_LATTICE_MIN_ROWS", {"cpu": 1024, "cuda": 1024})
+    seen = []
+    real = Q._brute_force
+    monkeypatch.setattr(Q, "_brute_force",
+                        lambda x, cb, chunk=4096: (seen.append(x.shape[0]),
+                                                   real(x, cb, chunk))[1])
+    x = torch.randn((128, 8), dtype=DT) * 0.6
+    Q._nearest(x, Q._on_device(DT, "cpu"))
+    assert sum(seen) == 128, "under the threshold the scan should still be used"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda")
+def test_the_sweeps_own_row_counts_no_longer_scan():
+    """Where it bit: the row counts the LDLQ sweep actually produces.
+
+    512 is T=1 and T=2, 816 is T=4 -- read off `auto_chunk` at the real layer
+    widths.  1024 is the first count that was already fine, and it is here so a
+    regression that broke the decoder's path would show up too.
+    """
+    dt = torch.float32
+    cb = Q._on_device(dt, str(torch.zeros(1, device="cuda").device))
+    assert Q.is_canonical_codebook(cb)
+    real = Q._brute_force
+    for n in (256, 512, 816, 1024, 4096):
+        x = torch.randn((n, 8), dtype=dt, device="cuda") * 0.6
+        ref, _ = real(x, cb)
+
+        # Counted, not just compared.  An earlier draft of this test only
+        # checked the ANSWER and passed against the broken gate, because the
+        # scan and the analytic form agree by construction -- which is the
+        # reason the gap survived in the first place.
+        seen = []
+        Q._brute_force = lambda a, c, chunk=4096: (seen.append(a.shape[0]),
+                                                   real(a, c, chunk))[1]
+        try:
+            got, _ = Q._nearest(x, cb)
+        finally:
+            Q._brute_force = real
+        if n < Q._LATTICE_MIN_ROWS["cuda"]:
+            assert sum(seen) == 0, f"n={n}: {sum(seen)} rows went to the scan"
+        else:
+            # Above the floor the decoder runs first and the handful of rows it
+            # cannot settle fall below `_ANALYTIC_MIN_ROWS`, so a few DO reach
+            # the scan and should -- that is the fallback working, not the gap.
+            assert sum(seen) < n // 10, (
+                f"n={n}: {sum(seen)} rows scanned, far more than the decoder "
+                "should be leaving behind")
+
+        differ = int((got != ref).sum())
+        # float32 ties can break either way, about one row in a million
+        # (`test_float32_disagreements_are_ties_not_errors`), so this asserts
+        # the rate rather than equality.
+        assert differ <= max(1, n // 1000), f"n={n}: {differ} rows disagree"

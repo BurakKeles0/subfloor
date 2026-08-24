@@ -6,16 +6,18 @@ anything is committed.  This checks it -- and the answer is not the one the
 question expected, because the sweep is not the first thing that stops working.
 
 Everything here rests on constants measured ON THIS MACHINE, not on peak
-figures.  Four terms are charged, each from its own measured curve:
+figures.  Five terms are charged, each from its own measured curve:
 
   calibration  two passes over every block, per point: gather the Hessians,
                then re-run so the next block sees the compressed output
+  compensate   `prune.forward_compensate`, a sweep the length of `n_in`
   codebook     the nearest-codeword search and the scale sweep in front of it
   rotation     `q @ H_t @ q.T`, once per tile
   cholesky     the per-tile sub-Hessian factorization, O(k^3) per tile
 
-The last three were the whole model until 2026-08-24; calibration is new and was
-worth 28 days of M1 at the configuration the code shipped with.
+The last three were the whole model until 2026-08-24.  The first two were added
+that day and were worth 28 days and 1.6 days of M1 -- both found by asking what
+was not on the list, neither by anything failing.
 
 That order is historical, not current.  The factorization LOOKS like it should
 dominate -- it is the only cubic term -- and for a while the model said it did.
@@ -27,8 +29,8 @@ The model describes the pipeline as it now runs: feedback confined to width-512
 blocks, the sweep chunked across tiles, the scale fit's 24 candidates evaluated
 in one search call -- all three bit-identical to what they replace -- and the
 calibration Hessians accumulated on the block's own device rather than copied to
-the CPU, which is 25x on a term that had never been charged.  M1 is 13.4 days;
-without the calibration fix the same grid would be 40.
+the CPU, which is 25x on a term that had never been charged.  M1 is 15.0 days;
+without the calibration fix the same grid would be 41.
 
 What is left is no longer `fit_scale`.  It was 83% of a tile and is 28%, so the
 saving from dropping the per-tile fit fell from several-fold to 1.4 days, and
@@ -36,7 +38,8 @@ with it the cost case for `per_layer` and for sampling -- both already rejected
 on quality.  The largest term is now `q @ H_t @ q.T`, which is computed as a
 dense GEMM against a matrix that is a Kronecker product of a Hadamard and a
 small orthogonal factor (`rotation.structured_orthogonal`).  That is a
-structural cost, not a launch-bound one, and it is the next thing to measure.
+structural cost, not a launch-bound one, and it has been measured
+(`rotation.rotate_hessian`, 5.52x grid-weighted) but is not on by default.
 
 The corrections, in order, because each one is a way this file was wrong:
 
@@ -69,6 +72,14 @@ The corrections, in order, because each one is a way this file was wrong:
      40.  See `CALIBRATION_TIMINGS`, and note what let it hide for six versions:
      nothing had ever run the full driver, because `experiments/m1_run.py` does
      not exist.
+
+  7. it charged NO COMPENSATION either.  `run_config` calls `prune` before
+     anything on the list, and `TILE_TIMINGS` starts at
+     `ldlq_quantize_blocks`, so `forward_compensate` -- a Python loop the
+     length of `n_in` whose every iteration touches the whole remaining width
+     -- was priced nowhere.  40.7 s per block, 0.362 h per point, 1.58 days of
+     M1.  See `COMPENSATE_TIMINGS`, and note that this one was found by looking
+     for what was missing rather than by anything failing.
 
 And one thing that was not a modelling error but a measurement that did not
 hold: two of the three `cuda_f32` tile timings recorded on 2026-08-24 do not
@@ -321,6 +332,34 @@ CALIBRATION_TOKENS = 128 * 4096
 #: sensitive to it; say so rather than quietly scale it.
 CALIBRATION_TIMINGS = {
     "cuda_f32": (16384, 2048, 0.91, 0.25),
+}
+
+#: (n_out, n_in, exact seconds, seconds at block=512) for ONE
+#: `prune.forward_compensate`, measured on this machine at Llama-2-7B's shapes.
+#:
+#: THE MODEL'S SEVENTH ERROR, AND THE THIRD IN A ROW THAT IS AN OMISSION.
+#: `m1_gates.run_config` calls `prune` before anything this file charges, and
+#: `TILE_TIMINGS` starts at `ldlq_quantize_blocks` -- so the compensation sweep,
+#: a Python loop the length of `n_in` whose every iteration touches the whole
+#: remaining width, was priced nowhere.  It is 40.7 s per block, 0.362 h per
+#: point, 1.58 days of M1.  Like calibration it does not depend on the tile
+#: size, so it is another flat per-point term and it shifts the design
+#: economics the same way.
+#:
+#: The second column is what `compensate_block=512` costs instead.  It is 6.63x
+#: on the term and NOT bit-identical (float32 epsilon, 2.7e-06 to 4.8e-06), so
+#: it is priced here and left off by default.
+#:
+#: Note what nearly happened.  Blocking was measured once at (512, 2048) and
+#: (512, 4096), read 0.87-1.06x, and went into `docs/STATUS.md` section 7.2 as
+#: "no gain, do not try again".  Those widths are launch-bound; the real ones
+#: are bandwidth-bound and blocking is up to 9.9x there.  A rejection measured
+#: in the wrong regime is worse than no measurement, because it stops the next
+#: person looking.
+COMPENSATE_TIMINGS = {
+    "cuda_f32": ((4096, 4096, 2.431, 0.665),
+                 (11008, 4096, 6.345, 0.820),
+                 (4096, 11008, 18.260, 1.837)),
 }
 
 TILES = (1, 2, 4, 8, 16, 32, Tl.MAX_TILE)
@@ -596,11 +635,42 @@ def calibration_seconds(rates: dict, setup: str, *,
     return (stats_s + fwd_s) * (tokens / ref_tokens) * n_blocks
 
 
+def compensate_seconds(rates: dict, setup: str, *, inventory=LLAMA2_7B,
+                       n_blocks: int = N_BLOCKS,
+                       compensate_block: int | None = None) -> float:
+    """One point's forward compensation, over every linear in every block.
+
+    Like calibration this is flat in the tile size -- the sweep is over `n_in`
+    and the mask does not change its length -- so it is another per-POINT term,
+    and per-point terms are what decide which designs are cheap.
+
+    Requires an exact (n_out, n_in) match and returns 0.0 for anything
+    unmeasured, rather than interpolating.  Five of this model's seven errors
+    were terms it did not know about; a plausible-looking guess is how the
+    sixth would have been missed as well.
+    """
+    entry = rates["setups"][setup].get("compensate_timings") \
+        or COMPENSATE_TIMINGS.get(setup)
+    if not entry:
+        return 0.0
+    table = {(n_out, n_in): (exact, blocked)
+             for n_out, n_in, exact, blocked in entry}
+    total = 0.0
+    for n_out, n_in, count in inventory:
+        measured = table.get((n_out, n_in))
+        if measured is None:
+            return 0.0
+        total += count * (measured[0] if compensate_block is None
+                          else measured[1])
+    return total * n_blocks
+
+
 def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
                batched: bool = False, scale_fit: bool = True,
                hessian_block: int | None = DEFAULT_HESSIAN_BLOCK,
                inventory=LLAMA2_7B, n_blocks: int = N_BLOCKS,
-               calibration_tokens: int = CALIBRATION_TOKENS) -> dict:
+               calibration_tokens: int = CALIBRATION_TOKENS,
+               compensate_block: int | None = None) -> dict:
     """One full compression pass over Llama-2-7B at one tile size.
 
     Timing comes from the measured per-tile fit, not from flops over kernel
@@ -642,6 +712,9 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
     seconds = chol_seconds + rot_seconds + cb_seconds
     cal_seconds = calibration_seconds(rates, setup, tokens=calibration_tokens,
                                       n_blocks=n_blocks)
+    comp_seconds = compensate_seconds(rates, setup, inventory=inventory,
+                                      n_blocks=n_blocks,
+                                      compensate_block=compensate_block)
     return {
         "tile_size": tile_size, "setup": setup, "batched": batched,
         "scale_fit": scale_fit,
@@ -652,11 +725,13 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
         "codebook_seconds_per_vector": per_vector,   # last layer's
         "compress_seconds": seconds,
         "calibration_seconds": cal_seconds,
+        "compensate_seconds": comp_seconds,
         "eval_seconds": EVAL_SECONDS,
         # A point is what `m1_run.py` will actually do: gather the statistics,
-        # compress, evaluate.  `compress_seconds` was standing in for all three
-        # until 2026-08-24 and the difference was 28 days of M1.
-        "point_seconds": seconds + cal_seconds + EVAL_SECONDS,
+        # prune with compensation, compress, evaluate.  `compress_seconds` was
+        # standing in for all four until 2026-08-24, and the two terms added
+        # that day were worth 28 days and 1.6 days of M1 respectively.
+        "point_seconds": seconds + cal_seconds + comp_seconds + EVAL_SECONDS,
         "peak_hessian_bytes": peak,
         "peak_hessian_bytes_streamed": peak_streamed,
     }

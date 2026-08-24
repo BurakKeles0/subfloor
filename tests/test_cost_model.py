@@ -184,7 +184,8 @@ def test_a_point_charges_the_calibration_it_actually_does():
     c = CM.model_cost(4, 1.5, rates, "cuda_f32")
     assert c["calibration_seconds"] == pytest.approx(cal)
     assert c["point_seconds"] == pytest.approx(
-        c["compress_seconds"] + cal + c["eval_seconds"])
+        c["compress_seconds"] + cal + c["compensate_seconds"]
+        + c["eval_seconds"])
 
     # Linear in both, because it is one pass over the tokens per block.
     assert CM.calibration_seconds(rates, "cuda_f32", tokens=2 * CM.CALIBRATION_TOKENS)         == pytest.approx(2 * cal)
@@ -194,6 +195,55 @@ def test_a_point_charges_the_calibration_it_actually_does():
     # designs: cost now follows the number of POINTS, not which tiles they use.
     for t in (1, 16, Tl.MAX_TILE):
         assert CM.model_cost(t, 1.5, rates, "cuda_f32")["calibration_seconds"]             == pytest.approx(cal)
+
+
+def test_a_point_charges_the_compensation_sweep_too():
+    """The seventh error, and the third omission in a row.
+
+    `run_config` calls `prune` before anything the model used to charge, and
+    `TILE_TIMINGS` starts at `ldlq_quantize_blocks`, so `forward_compensate` --
+    a Python loop the length of `n_in` whose every iteration touches the whole
+    remaining width -- was priced nowhere.  40.7 s per block, 0.362 h per
+    point, 1.58 days of M1.
+    """
+    import json
+    from pathlib import Path
+    rates_file = Path(__file__).resolve().parent.parent / "results" / "m0_rates.json"
+    if not rates_file.exists():
+        pytest.skip("no measured rates on this machine")
+    rates = json.loads(rates_file.read_text(encoding="utf-8"))
+    if "cuda_f32" not in rates["setups"]:
+        pytest.skip("no cuda rates measured on this machine")
+
+    exact = CM.compensate_seconds(rates, "cuda_f32")
+    blocked = CM.compensate_seconds(rates, "cuda_f32", compensate_block=512)
+    assert exact > 0 and blocked > 0
+    # Blocking is the whole reason the second column exists; if it ever stopped
+    # paying, `prune(compensate_block=...)` would be carrying a quality cost for
+    # nothing.
+    assert exact / blocked > 3.0
+
+    # Flat in the tile size, like calibration -- that is what re-orders the
+    # designs, since cost then follows the number of POINTS.
+    for t in (1, 16, Tl.MAX_TILE):
+        assert CM.model_cost(t, 1.5, rates, "cuda_f32")["compensate_seconds"]             == pytest.approx(exact)
+    assert CM.model_cost(4, 1.5, rates, "cuda_f32",
+                         compensate_block=512)["compensate_seconds"]         == pytest.approx(blocked)
+
+
+def test_a_layer_shape_nobody_measured_is_charged_nothing():
+    """No interpolation.  Five of seven errors were terms the model did not know
+    about, and a plausible number for an unmeasured shape is how the next one
+    would hide."""
+    rates = {"setups": {"fake": {"compensate_timings": ((4096, 4096, 1.0, 0.2),)}}}
+    assert CM.compensate_seconds(rates, "fake", inventory=((4096, 4096, 1),),
+                                 n_blocks=1) == pytest.approx(1.0)
+    # One shape missing from the table zeroes the whole term rather than
+    # guessing at it, and the caller sees an obviously wrong 0 instead of a
+    # plausibly wrong number.
+    assert CM.compensate_seconds(rates, "fake",
+                                 inventory=((4096, 4096, 1), (999, 999, 1)),
+                                 n_blocks=1) == 0.0
 
 
 def test_an_unmeasured_setup_is_charged_nothing_rather_than_a_guess():

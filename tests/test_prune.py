@@ -195,3 +195,86 @@ def test_prune_then_compact_then_rotate(fixture):
 
     assert torch.equal(C.scatter(rotated) != 0, r.mask.expand())
     assert C.scatter(rotated).shape == W.shape
+
+
+# --------------------------------------------------------------------------- #
+# BLOCKING THE COMPENSATION SWEEP
+# --------------------------------------------------------------------------- #
+# `forward_compensate`'s inner update touches the whole remaining width every
+# iteration, which is O(n_out * n_in^2) of traffic.  Deferring each group's
+# errors to one matmul is what GPTQ and SparseGPT both do.
+#
+# It was measured once at (512, 2048) and (512, 4096), read 0.87-1.06x, and was
+# recorded as "no gain".  Those widths are launch-bound.  At the shapes a 7B
+# model actually has it is bandwidth-bound and blocking is 3.65x / 7.74x /
+# 9.94x.  A rejection measured in the wrong regime is worse than no measurement,
+# so the correction is worth a test as well as a note.
+
+def test_the_default_compensation_is_still_exactly_what_it_was():
+    """`block=None` must not merely agree -- it must be the SAME arithmetic.
+
+    Every quality number in this project was taken under it, so a change here
+    would silently move the baseline that `docs/STATUS.md` compares against.
+    """
+    torch.manual_seed(0)
+    n_out, n_in = 24, 96
+    W = torch.randn((n_out, n_in), dtype=DT)
+    keep = torch.rand((n_out, n_in)) > 0.4
+    A = torch.randn((n_in + 16, n_in), dtype=DT)
+    Hinv = S.damped_hessian_inverse(A.T @ A / A.shape[0], 0.01)
+
+    ref = P.forward_compensate(W, keep, Hinv)
+    # A single block covering everything defers nothing, so it must be bit
+    # identical, and so must a block of one -- the two degenerate ends.
+    assert torch.equal(ref, P.forward_compensate(W, keep, Hinv, block=n_in))
+    assert torch.equal(ref, P.forward_compensate(W, keep, Hinv, block=1))
+    assert torch.equal(ref, P.forward_compensate(W, keep, Hinv, block=n_in * 4))
+
+
+@pytest.mark.parametrize("block", [7, 16, 32])
+def test_blocking_defers_only_what_no_longer_influences_the_sweep(block):
+    """Inside a group the sequential dependency is untouched; only columns past
+    it are deferred, and those cannot affect any decision still to be made.  So
+    the answer moves by the reassociation and nothing else."""
+    torch.manual_seed(1)
+    n_out, n_in = 24, 96
+    W = torch.randn((n_out, n_in), dtype=DT)
+    keep = torch.rand((n_out, n_in)) > 0.4
+    A = torch.randn((n_in + 16, n_in), dtype=DT)
+    Hinv = S.damped_hessian_inverse(A.T @ A / A.shape[0], 0.01)
+
+    ref = P.forward_compensate(W, keep, Hinv)
+    got = P.forward_compensate(W, keep, Hinv, block=block)
+    rel = float((ref - got).abs().max() / ref.abs().max())
+    assert rel < 1e-13, f"block={block}: {rel:.2e} is more than reassociation"
+    # The dropped weights are dropped whatever the blocking: compensation moves
+    # the survivors, never the mask.
+    assert torch.equal(got[~keep], torch.zeros_like(got[~keep]))
+
+
+def test_the_block_width_is_validated():
+    W = torch.randn((4, 8), dtype=DT)
+    keep = torch.ones((4, 8), dtype=torch.bool)
+    Hinv = torch.eye(8, dtype=DT)
+    with pytest.raises(ValueError, match="block must be positive"):
+        P.forward_compensate(W, keep, Hinv, block=0)
+
+
+def test_prune_passes_the_block_width_through():
+    """`compensate_block` has to reach `forward_compensate`, and `None` has to
+    keep meaning the exact sweep."""
+    torch.manual_seed(2)
+    n_out, n_in = 16, 64
+    W = torch.randn((n_out, n_in), dtype=DT)
+    A = torch.randn((n_in + 16, n_in), dtype=DT)
+    H = A.T @ A / A.shape[0]
+
+    kw = dict(axis="B", tile_size=4, density=0.5, metric="wanda",
+              H=H, compensate=True, act_norm=torch.diagonal(H).sqrt())
+    ref = P.prune(W, **kw)
+    same = P.prune(W, compensate_block=None, **kw)
+    blocked = P.prune(W, compensate_block=16, **kw)
+
+    assert torch.equal(ref.W, same.W)
+    assert torch.equal(ref.mask.expand(), blocked.mask.expand())   # mask first
+    assert float((ref.W - blocked.W).abs().max() / ref.W.abs().max()) < 1e-13

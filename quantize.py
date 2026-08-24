@@ -190,6 +190,27 @@ _LATTICE_MIN_ROWS = {"cpu": 64, "cuda": 1024}
 #: inside `fit_scale` for nothing.
 _ANALYTIC_MIN_ROWS = 384
 
+#: Rows below which a scan beats going STRAIGHT to `nearest_e8p_analytic`,
+#: without the lattice decoder in front.
+#:
+#: A different question from `_ANALYTIC_MIN_ROWS`, which prices the analytic
+#: form against a scan for rows the decoder has ALREADY failed on -- there its
+#: fixed cost is marginal, because the decode is paid either way.  Reached
+#: directly it has to cover that cost itself, so the crossover could only be
+#: found by measuring, and it comes out LOWER rather than higher: the decoder's
+#: own fixed cost was in the comparison.
+#:
+#: Measured on this machine, analytic against scan, three input scales:
+#:      n=128   0.41x  0.63x  0.41x    scan wins
+#:      n=192   0.68x  1.23x  1.20x    mixed
+#:      n=256   0.99x  1.21x  1.68x    break-even to 1.7x
+#:      n=384   1.41x  2.13x  2.46x
+#:      n=512   2.04x  1.61x  3.33x
+#:      n=816   2.68x  5.19x  6.04x
+#: 256 rather than 192 because 192 still loses on one of the three and the
+#: whole point of this constant is that it never costs anything to cross.
+_ANALYTIC_DIRECT_MIN_ROWS = 256
+
 
 def _device_key(device: torch.device | str) -> str:
     """Canonical cache key for `device`.
@@ -590,6 +611,23 @@ def _nearest(x: Tensor, codebook: Tensor, chunk: int = 4096,
         return idx, codebook[idx]
 
     floor_rows = _LATTICE_MIN_ROWS.get(x.device.type, 64)
+    if is_canonical_codebook(codebook) and floor_rows > x.shape[0] >= \
+            _ANALYTIC_DIRECT_MIN_ROWS:
+        # Too few rows for the lattice decoder to be worth its fixed cost, but
+        # enough for the analytic form to beat a scan.  That window went to the
+        # scan until 2026-08-24 because `_ANALYTIC_MIN_ROWS` was only ever read
+        # INSIDE the decoder's gate, so a row count between the two thresholds
+        # could not reach the analytic search at all.
+        #
+        # It is not a corner: the LDLQ sweep hands `_nearest`
+        # `chunk * lines_per_tile` rows, which is 512 at T=1 and T=2 and 816 at
+        # T=4 -- the whole fine end of the grid, where the tile counts are
+        # largest.  Ten of the twenty-one layer-by-tile cells at B=1.5 landed in
+        # it.  Same shape as the `_on_device` bug: a gate calibrated for one
+        # algorithm silently excluding the better one that arrived later, and
+        # the symptom is not a wrong answer but a slow one.
+        return nearest_e8p_analytic(x)
+
     if x.shape[0] >= floor_rows and is_canonical_codebook(codebook):
         idx, code, exact = nearest_e8p(x)
         if bool(exact.all()):

@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-24 · HEAD `383a64a` · Testler: **580 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-24 · HEAD `8c56f1e` · Testler: **599 geçiyor, 6 atlanıyor**
 
 ---
 
@@ -312,11 +312,13 @@ değiştirmiyor — yalnızca sınanabilir hâle getiriyor.
 Eval'in kendisi **238 s** — ihmal edilebilir. Maliyet ızgaranın **ortasında**
 tepe yapıyor: `n_tiles = n_out/T` düşerken `d` (dolayısıyla `k`) yükseliyor.
 
-**M1 (3 bütçe × 7 tile × 5 çekiliş): 13.4 gün** — kalibrasyon dâhil (§6.10).
+**M1 (3 bütçe × 7 tile × 5 çekiliş): 15.0 gün** — kalibrasyon ve telafi
+dâhil (§6.10, §6.11).
 **`τ` süpürmesi: 3.9 gün** (spec 25 *saat* diyordu).
 
 Yukarıdaki tablo yalnız **sıkıştırmayı** gösteriyor; her noktaya ayrıca
-**0.33 saat kalibrasyon** ve 238 s eval biniyor.
+**0.33 saat kalibrasyon**, **0.36 saat ileri telafi** ve 238 s eval biniyor —
+üçü de tile boyutundan bağımsız.
 
 > **Baskın terim el değiştirdi ve artık codebook değil.** T=2 ve T=4'te en büyük
 > kalem **rotasyon** (1.72h ve 1.92h, noktanın ~%54'ü). Sıradaki iş §6.8.
@@ -340,10 +342,13 @@ olan bir kaldıraç kalmadı.
 | 7 | **GPU %28 meşgul** | Boştanın %80'i çekirdek fırlatma | Triton füzyonu. 29 → **17 gün** |
 | 8 | **Fit sabit bedeli 24 kez ödüyordu** | 1,280 vektör 41.3 ms, 5,888 vektör 43.4 ms | Adaylar tek aramada. 17 → **12 gün** (§6.7), iki iyimser ölçüm geri çekilerek |
 
-### 6.3 Maliyet modelinin beş hatası
+### 6.3 Maliyet modelinin yedi hatası
 
 İlk üçü iyimser, dördüncüsü **kötümser** — ve o en çok zarar veren oldu, çünkü
 bu sayı M1'in koşulup koşulmayacağını söyleyen sayı. Beşincisi yine iyimser.
+Altıncı ve yedinci (§6.10, §6.11b) **hiç yazılmamış terimler** — ve yedinin
+beşi bu sınıftan. Yani bu modelde asıl soru "oran doğru mu" değil, **"listede
+ne yok"**.
 
 1. **`fit_scale` hiç yoktu** — 6× az. `ldlq_quantize` quantize etmeden önce 24
    aday ölçeği tile'ın tamamı üzerinde tarıyor.
@@ -681,14 +686,107 @@ belirliyor. Tasarım G (2 tile × 5 çekiliş = 10 nokta) Tasarım F'ten (7 nokt
 
 | senaryo | M1 | Tasarım F |
 |---|---|---|
-| modelin söylediği (kalibrasyon yok) | 11.98 g | 15.6 saat |
-| **gerçek kod, düzeltmeden önce** | **39.8 g** | **60.1 saat** |
-| Hessian GPU'da (bu değişiklik) | **13.4 g** | 17.3 saat |
-| + fp16 + kron | **~7.1 g** | ~10.4 saat |
+| modelin söylediği (iki terim de yok) | 11.98 g | 15.6 saat |
+| **gerçek kod, iki düzeltmeden önce** | **~38–40 g** | **~57–60 saat** |
+| + Hessian GPU'da (§6.10) | **15.0 g** | 20.4 saat |
+| + telafi bloklanmış (§6.11c, varsayılan kapalı) | 13.7 g | 18.2 saat |
+| + fp16 + kron (varsayılan kapalı) | **7.7 g** | 11.3 saat |
+
+"Önce" satırı aralık, çünkü aynı ölçümün iki koşusu 19.65 s ve 22.37 s verdi —
+bu makinede %14 koşudan koşuya. Kod artık öyle yapmadığı için kesinleştirmeye
+değmez; kaydedilmesi gereken şey aralığın kendisi.
 
 **Neyin altı sürüm boyunca saklanmasına izin verdiği kayda değer:** tam
 sürücüyü kimse koşmadı, çünkü `m1_run.py` yok. §8.1'in kritik yol olmasının
 sebebi yalnızca "veri yok" değil — **ölçülmeyen maliyet de orada birikiyor.**
+
+---
+
+### 6.11 İki kapı, bir eksik terim, ve kendi kaydımın düzeltilmesi
+
+**a) `_nearest` ızgaranın 21 hücresinin 10'unda 65,536 kodsözcüğünü tarıyordu.**
+
+Hızlı yol tek bir kapıyla açılıyordu — `_LATTICE_MIN_ROWS` (cuda'da 1024) — ve
+analitik aramanın **kendi** eşiği (`_ANALYTIC_MIN_ROWS = 384`) yalnız o kapının
+*içinde* okunuyordu. Yani **384 ≤ satır < 1024 aralığı analitik yola hiç
+ulaşamıyordu.**
+
+Köşe durum değil: LDLQ süpürmesi `_nearest`'e `chunk × lines_per_tile` satır
+veriyor — T=1 ve T=2'de 512, T=4'te 816. Tam ızgaranın ince ucu, tile sayısının
+en büyük olduğu yer.
+
+Ölçülen doğrudan-yol krossoveri **256**, 384 değil — çünkü 384 *geri düşme*
+yolunun eşiği ve orada kafes çözücünün bedeli zaten ödenmiş:
+
+| n | 0.05 | 0.6 | 6.0 |
+|---|---|---|---|
+| 128 | 0.41× | 0.63× | 0.41× |
+| 256 | 0.99× | 1.21× | 1.68× |
+| 512 | 2.04× | 1.61× | 3.33× |
+| 816 | 2.68× | 5.19× | 6.04× |
+
+Kapı açılınca **taramaya sıfır satır** düşüyor, ve ızgaranın gerçek
+şekillerinde süpürme:
+
+| hücre | satır | önce | sonra | |
+|---|---|---|---|---|
+| T=1 4096×4096 | 512 | 0.332 s | 0.163 s | **2.04×** |
+| T=2 4096×4096 | 512 | 0.682 s | 0.294 s | **2.32×** |
+| T=4 4096×4096 | 816 | 1.337 s | 0.382 s | **3.50×** |
+| T=8 4096×11008 | 560 | 2.701 s | 1.101 s | **2.45×** |
+
+> **Sınıfı tanıdık: `_on_device` ile aynı.** Bir algoritma için kalibre edilmiş
+> bir kapı, sonradan gelen daha iyisini sessizce dışarıda bırakıyor, ve belirti
+> yanlış cevap değil yavaş cevap. Bu yüzden testler **yolu** izliyor: tarama
+> ile analitik zaten yapı gereği aynı cevabı veriyor — boşluğun fark
+> edilmemesinin sebebi de o.
+
+**Kesinlik.** Analitik arama exact; float32'de milyonda bir gerçek berabere
+başka türlü bozulabiliyor (§6.4'te zaten kabul edilmiş bir takas). Uçtan uca
+dört tile'ın üçü bit-birebir aynı kaldı, T=16'da katman hatası **5.8e-5**
+oynadı — Kapı B'nin görebildiğinin **550 katı altında**.
+
+**b) Maliyet modelinin yedinci hatası: ileri telafi hiç yazılmamış.**
+
+`run_config` her şeyden önce `prune`'u çağırıyor, `TILE_TIMINGS` ise
+`ldlq_quantize_blocks`'tan başlıyor. Arada `forward_compensate` var — `n_in`
+uzunluğunda bir Python döngüsü, ve her yinelemesi kalan bütün genişliğe
+dokunuyor. Ölçüldü: blok başına **40.7 s**, nokta başına **0.362 saat**,
+M1'de **1.58 gün**. Kalibrasyon gibi tile boyutundan bağımsız.
+
+**c) Ve "bloklamak kazandırmıyor" kaydım yanlıştı.**
+
+§7.2'ye "0.90× / 0.87× / 1.06× — kazanç yok" diye yazmıştım. O ölçümü yalnız
+(512, 2048) ve (512, 4096)'da yapmışım — **fırlatma bağımlı** rejimde, ve orada
+bloklama gerçekten hiçbir şey kaldırmıyor. Gerçek katman genişlikleri **bant
+genişliği bağımlı**:
+
+| n_out × n_in | kesin | blok=512 | |
+|---|---|---|---|
+| 4096 × 4096 | 2431 ms | 665 ms | **3.65×** |
+| 11008 × 4096 | 6345 ms | 820 ms | **7.74×** |
+| 4096 × 11008 | 18260 ms | 1837 ms | **9.94×** |
+
+Terimin tamamında **6.63×** (0.362 → 0.055 h/nokta). Bit-birebir **değil**
+(ertelenen kuyruk tek matmul, 2.7e-6…4.8e-6), o yüzden `compensate_block`
+eklendi ve **varsayılan `None`** — kesin düzen.
+
+> **Ders, hızdan daha değerli:** *yanlış rejimde ölçülmüş bir ret, hiç ölçmemekten
+> kötüdür* — çünkü bir sonrakinin bakmasını durdurur. Bu kayıt beni sekiz gün
+> boyunca yanlış yerde tuttu.
+
+**Bugünkü dağılım** (B=1.5, 7 tile toplamı):
+
+| terim | süre | pay |
+|---|---|---|
+| codebook | 7.51 h | 36.8% |
+| rotasyon | 6.48 h | 31.8% |
+| **telafi** | **2.53 h** | **12.4%** |
+| kalibrasyon | 2.31 h | 11.3% |
+| cholesky | 1.10 h | 5.4% |
+| eval | 0.46 h | 2.3% |
+
+**M1 = 15.0 gün.** Telafi yazılınca 13.4'ten çıktı; bloklanırsa 13.4'e döner.
 
 ---
 
@@ -719,7 +817,7 @@ ikinci kez denemek demek.
 | **Yalnız kafes alt sınırıyla dal-sınır** | 1.03–1.10× | Kafes sonsuz, küçük α'da sınır zayıf — tam da pahalı uçta |
 | **Birleşik alt sınırla dal-sınır** | 1.21–1.77×, kesin | Reddedilmedi, **alınmadı**: analitik arama (§6.4) getirisini büyük ölçüde sildi |
 | **Fit'i TILE'LAR ARASINDA toplamak** | 2.16× | Alınmadı: bit-birebir **değil** (indirgeme sırası). Aday ekseninde toplamakla karıştırılmasın — o **alındı** ve bit-birebir (§6.7) |
-| **`forward_compensate`'i GPTQ gibi bloklamak** | 0.90× / 0.87× / 1.06× | Kazanç yok. Hipotez `O(n_out·n_in²)` bant genişliğiydi; yanlış — sütun başına 0.145 ms ve rank-1 başına 4 MB ile bu **Python döngüsü** bağımlı, bloklama iç döngüyü kaldırmıyor |
+| ~~**`forward_compensate`'i GPTQ gibi bloklamak**~~ → **bu kayıt YANLIŞTI** | (512,2048) ve (512,4096)'da 0.87–1.06× | Ölçüm doğru, **rejim yanlıştı**. O genişlikler fırlatma bağımlı. Gerçek katmanlarda (4096×4096, 11008×4096, 4096×11008) bant genişliği bağımlı ve bloklama **3.65× / 7.74× / 9.94×**. Terimde 6.63×. §6.11c |
 | **Blok başına CPU↔GPU aktarımı** | nokta başına ~220 s | Saatlere karşı ihmal edilebilir |
 | **İki kaydırmayı tek çözümde yığmak** | 1.9–2.2× | Alınmadı: Triton füzyonu aynı kazancı zaten topluyor |
 
@@ -892,6 +990,7 @@ yok. §8.1'in checkpoint'i bu yüzden kritik yolda.
 | `experiments/m0_rotation_value.py` | rotasyon gerçek katmanda kazandırıyor mu; blok genişliği süpürmesi |
 | `experiments/m0_scale_fit.py` | ölçek uydurmayı ucuzlatmanın kalite bedeli |
 | `experiments/m0_precision_levers.py` | fp16 / kron / TF32, tek tek ve sekiz kombinasyonda |
+| `experiments/m0_pass_breakdown.py` | bir geçişin fazları — modelin yazmadıklarını bulmak için |
 
 **Belgeler:** `docs/spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı** — iki kutu kaldı, artık maliyet engeli yok) ·
@@ -951,6 +1050,7 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `de8a5ec` | **Kronecker kongrüansı gerçek katmanda ölçüldü** (§6.8). Sentetik ölçüm iki mertebe yanılmıştı; hattın kolunda etki lehte, M1 11.98 → 8.17 g. Varsayılan kapalı |
 | `383a64a` | **Üç hassasiyet kaldıracı, tek tek ve kombine** (§6.9). TF32 **hattı kırıyor** — §3.3'ün açık kalemi kapandı. `fp16+kron` bağımsız, birlikte M1 11.98 → **6.63 g** |
 | `8c56f1e` | **Kalibrasyon Hessian'ı GPU'da** (25×) ve maliyet modelinin **altıncı hatası** (§6.10). `m1_run.py` bugün 40 gün sürerdi, 13.4 değil |
+| *(bu değişiklik)* | **`_nearest`'in ikinci kapısı** (§6.11a, süpürmede 2.0–3.5×) ve **yedinci eksik terim** (§6.11b). Ayrıca §7.2'deki bir ret **yanlış rejimde ölçülmüş** çıktı (§6.11c) |
 
 ---
 
