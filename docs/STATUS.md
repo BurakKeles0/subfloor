@@ -792,7 +792,7 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `cc3e0f4` | **Triton kuruldu**, iki elementwise zincir füzyonlandı. 29 → 17 gün |
 | `8f5f59f` | Bu belge yeniden yazıldı: yapılan / yapılmayan / reddedilen ayrıldı |
 | `1efa971` | **Ölçek adayları tek aramada** (§6.7); maliyet modelinin **beşinci hatası** ve iki geri çekilen ölçüm (§6.3). 17 → 12 gün, ve baskın terim codebook'tan **rotasyona** geçti |
-| *(bu değişiklik)* | **`_on_device` tuzağı kapatıldı** (§10). Üç oturumdur belgede duran, kodda durmayan hata; dört ölçümü bozmuştu |
+| `0a19f90` | **`_on_device` tuzağı kapatıldı** (§10). Üç oturumdur belgede duran, kodda durmayan hata; dört ölçümü bozmuştu |
 
 ---
 
