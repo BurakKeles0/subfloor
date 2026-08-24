@@ -657,17 +657,155 @@ def test_auto_chunk_is_bounded_by_memory_and_by_saturation():
     confined = Q.auto_chunk(1000, lines, k, item, hessian_block=512)
     full = Q.auto_chunk(1000, lines, k, item, hessian_block=None)
     assert full == 4                       # k^2 * 4 = 250 MiB, four in a GiB
-    assert confined == 64                  # k*512 * 4 = 16 MiB, so saturation binds
+    assert confined == 67                  # k*512 * 4 = 15 MiB, so memory binds
     assert confined > 8 * full
+
+    # Which ceiling binds moved when `CHUNK_TARGET_ROWS` went 1024 -> 2048: this
+    # width used to be held by saturation at 64 and is now held by memory at 67,
+    # which is exactly why the row target could not rescue it on its own and
+    # `_ANALYTIC_MIN_ROWS` had to move as well.
+    assert -(-Q.CHUNK_TARGET_ROWS // lines) > confined
 
     # Saturation caps it even when memory would allow more.
     assert Q.auto_chunk(10_000, 4096, 1024, item, hessian_block=512) == 1
-    assert Q.auto_chunk(10_000, 16, 512, item, hessian_block=512) == 64
+    assert Q.auto_chunk(10_000, 16, 512, item, hessian_block=512) == 128
 
     # Never more tiles than exist, never fewer than one.
     assert Q.auto_chunk(3, 16, 512, item, hessian_block=512) == 3
     assert Q.auto_chunk(1000, 1, 8192, item, hessian_block=None,
                         budget_bytes=1) == 1
+
+
+def test_the_three_constants_keep_the_sweep_off_the_scan():
+    """One inequality, and nothing stated it until it had been false for months.
+
+        CHUNK_TARGET_ROWS * DECODER_MISS_FRACTION  >  _ANALYTIC_MIN_ROWS
+
+    `auto_chunk` aims the sweep at the first number of rows, the decoder hands
+    on the middle fraction of them, and the leftover takes the analytic path
+    only if it clears the last.  At 1024, 0.349 and 384 that read 357 > 384 --
+    false -- so every group of the sweep fell through to a 65536-codeword scan,
+    in eight of the grid's twenty-one cells, for as long as the analytic search
+    had existed.  Nothing failed; it was merely slow.
+
+    Asserted here rather than left to a comment because the three constants live
+    apart, were each tuned alone, and each has a perfectly good reason for its
+    own value.  Only together are they wrong.
+    """
+    leftover = Q.CHUNK_TARGET_ROWS * Q.DECODER_MISS_FRACTION
+    assert leftover > Q._ANALYTIC_MIN_ROWS, (
+        f"a sweep chunk of {Q.CHUNK_TARGET_ROWS} rows leaves {leftover:.0f} "
+        f"unsettled, under the {Q._ANALYTIC_MIN_ROWS}-row analytic threshold, "
+        f"so every group falls through to a full scan"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda")
+def test_the_decoder_miss_fraction_is_what_the_constants_assume():
+    """`DECODER_MISS_FRACTION` is load-bearing -- the test above divides by it --
+    so it is measured here rather than trusted.  It came out at 34.9% at every
+    shape tried, which is why it is written as a constant at all: it is a
+    property of how much of R^8 the codebook's norm ball covers, not of a tile.
+    """
+    g = torch.Generator().manual_seed(0)
+    for k in (512, 1024, 2048):
+        x = torch.randn((4096, k), generator=g, dtype=DT).cuda().reshape(-1, 8)
+        cb = Q._on_device(DT, str(x.device))
+        alpha = Q.fit_scale(x[:8192], cb)
+        missed = float((~Q.nearest_e8p(x / alpha)[2]).to(DT).mean())
+        assert missed == pytest.approx(Q.DECODER_MISS_FRACTION, abs=0.06), (
+            f"k={k}: decoder misses {missed:.1%}, constant says "
+            f"{Q.DECODER_MISS_FRACTION:.1%}"
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda")
+def test_the_sweep_does_not_fall_through_to_the_scan():
+    """The path test, at the row count `auto_chunk` actually produces.
+
+    Watching the ANSWER could not see this: the scan and the analytic form agree
+    by construction, which is precisely why it survived.  So count the rows that
+    reach `_brute_force` -- with the old threshold this shape sent one call per
+    group, hundreds of them.
+    """
+    lines, k, n_tiles = 16, 512, 128
+    chunk = Q.auto_chunk(n_tiles, lines, k, 4, 512)
+    rows = chunk * lines
+    assert rows >= Q._LATTICE_MIN_ROWS["cuda"], (
+        "shape no longer reaches the decoder, so this test proves nothing"
+    )
+    # And it has to clear the threshold by more than the miss fraction wobbles.
+    # At 1024 rows this shape leaves 313-319 unsettled -- 30.6%, not the 34.9%
+    # the wide layers give -- and three of sixty-four groups fell through by
+    # single digits.  The grid's own cells sit at 2048 rows for the same reason
+    # this one now does.
+    assert rows * Q.DECODER_MISS_FRACTION > 1.5 * Q._ANALYTIC_MIN_ROWS
+
+    g = torch.Generator().manual_seed(0)
+    blocks = torch.randn((n_tiles, lines, k), generator=g, dtype=DT).cuda()
+    a = torch.randn((k, k), generator=g, dtype=DT)
+    H = ((a @ a.T) / k + torch.eye(k, dtype=DT)).cuda()
+    assert Q.is_canonical_codebook(Q._on_device(blocks.dtype, str(blocks.device)))
+
+    seen = []
+    real = Q._brute_force
+    try:
+        Q._brute_force = lambda x, cb, chunk=4096: (
+            seen.append(x.shape[0]), real(x, cb, chunk))[1]
+        Q.ldlq_quantize_blocks(blocks, lambda t: H, hessian_block=512,
+                               chunk=chunk)
+    finally:
+        Q._brute_force = real
+
+    groups = (n_tiles // chunk) * (k // Q.E8P_DIM)
+    assert sum(seen) == 0, (
+        f"{sum(seen)} rows in {len(seen)} calls reached the scan across "
+        f"{groups} groups"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda")
+def test_the_threshold_decides_where_memory_caps_the_chunk():
+    """The cell `CHUNK_TARGET_ROWS` cannot rescue, and the only thing that
+    justifies `_ANALYTIC_MIN_ROWS = 320` over 384.
+
+    Where the row target binds, the chunk reaches 2048 rows and the leftover
+    clears either threshold -- so the test above passes at 384 too, and on its
+    own would let the threshold silently regress.  What it cannot cover is
+    `down_proj`: k=7912 caps the chunk at 67 tiles on MEMORY, the sweep gets
+    1072 rows, and the leftover lands between the two thresholds.  This
+    reproduces that geometry at a width small enough to test.
+    """
+    lines, k, chunk, n_tiles = 16, 512, 67, 134
+    rows = chunk * lines
+    assert rows > Q._LATTICE_MIN_ROWS["cuda"]
+    assert rows < Q.CHUNK_TARGET_ROWS, "the row target would reach this; wrong cell"
+
+    g = torch.Generator().manual_seed(0)
+    blocks = torch.randn((n_tiles, lines, k), generator=g, dtype=DT).cuda()
+    a = torch.randn((k, k), generator=g, dtype=DT)
+    H = ((a @ a.T) / k + torch.eye(k, dtype=DT)).cuda()
+
+    def scanned(threshold: int) -> int:
+        seen = []
+        real_bf, real_thr = Q._brute_force, Q._ANALYTIC_MIN_ROWS
+        Q._ANALYTIC_MIN_ROWS = threshold
+        Q._brute_force = lambda x, cb, c=4096: (
+            seen.append(x.shape[0]), real_bf(x, cb, c))[1]
+        try:
+            Q.ldlq_quantize_blocks(blocks, lambda t: H, hessian_block=512,
+                                   chunk=chunk)
+        finally:
+            Q._brute_force, Q._ANALYTIC_MIN_ROWS = real_bf, real_thr
+        return sum(seen)
+
+    old, new = scanned(384), scanned(Q._ANALYTIC_MIN_ROWS)
+    # Measured 42,392 rows against 310 -- a group or two legitimately misses by
+    # too little to be worth the analytic form, so this is a ratio and not zero.
+    assert old > 20 * max(new, 1), (
+        f"threshold makes no difference here ({old} rows against {new}), so this "
+        f"shape no longer covers the memory-capped cell"
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -179,16 +179,93 @@ _LEVELS = 3
 #: matters less than it did -- but it still decides which path a fit takes.
 _LATTICE_MIN_ROWS = {"cpu": 64, "cuda": 1024}
 
+#: Fraction of its rows `nearest_e8p` cannot settle, so they need a second pass.
+#:
+#: Measured 34.9% at every shape tried -- k=2560/2944/3072, tile counts from 8
+#: to 256 -- which makes it a property of how much of R^8 the codebook's norm
+#: ball covers rather than of any particular tile.  Not exactly constant, and
+#: the exception is on the record because it bit a test: at k=512, a width the
+#: grid never runs, it is 30.6%.  So treat 0.349 as the typical value with the
+#: observed range 31-35%, and leave the inequality below margin rather than
+#: equality -- at 2048 rows even 31% clears the threshold twice over.
+#:
+#: It describes the SWEEP, which is what reads it: by then `fit_scale` has
+#: matched the scale to the codebook.  The small-alpha steps INSIDE the fit are
+#: a different regime entirely and miss on up to 99% of rows
+#: (`docs/STATUS.md` section 6.4).
+#:
+#: Written down because three constants have to satisfy one inequality and
+#: nothing said so until they had already violated it for months:
+#:
+#:      CHUNK_TARGET_ROWS * DECODER_MISS_FRACTION  >  _ANALYTIC_MIN_ROWS
+#:
+#: Left to right: how many rows `auto_chunk` aims the sweep at, how many of them
+#: the decoder hands on, and whether that leftover is big enough to take the
+#: analytic path instead of a 65536-codeword scan.  With 1024, 0.349 and 384 it
+#: read 357 > 384, which is false, so every group of the sweep scanned.
+#: `tests/test_quantize.py` now asserts the inequality directly.
+DECODER_MISS_FRACTION = 0.349
+
 #: Unsettled rows below which a scan beats `nearest_e8p_analytic`.
 #:
 #: The analytic form does real work proportional to its input but has a fixed
 #: cost of roughly a millisecond -- a dozen kernel launches against the 256
 #: source patterns -- so on a handful of rows the scan, which is launch-bound
-#: at that size too but launches less, gets there first.  Measured crossover on
-#: this machine is a few hundred rows.  It matters: a heavy-tailed tile at
-#: T=4 misses on very few rows and would otherwise pay the fixed cost 24 times
-#: inside `fit_scale` for nothing.
-_ANALYTIC_MIN_ROWS = 384
+#: at that size too but launches less, gets there first.  It matters in both
+#: directions: a heavy-tailed tile at T=4 misses on very few rows and would
+#: otherwise pay the fixed cost 24 times inside `fit_scale` for nothing.
+#:
+#: 384 WAS TOO HIGH, AND THE COST OF THAT WAS STRUCTURAL RATHER THAN MARGINAL.
+#: The decoder leaves about 34.9% of its rows unsettled (`DECODER_MISS_FRACTION`,
+#: and see there for the range) and `auto_chunk` aimed the sweep at 1024 rows.  That
+#: puts the leftover set at 357, just under this threshold, so EVERY group of
+#: the sweep fell through to a 65536-codeword scan.  Eight of the twenty-one
+#: layer-by-tile cells at B=1.5 land there, because the saturation ceiling is
+#: `ceil(1024 / lines)` and `lines` divides 1024 at T=8, 16 and 32.  Counted on
+#: a REAL layer -- Llama-2-7B block 0 `o_proj`, 2048 rows, B=1.5 -- one call per
+#: group of the sweep, every time:
+#:
+#:      T=8    581 calls   184,915 rows scanned
+#:      T=16   623 calls   193,184 rows
+#:      T=32   645 calls   196,712 rows
+#:
+#: and zero under the constants below.
+#:
+#: Re-measured on the leftover set, where the decode is already paid either way,
+#: at three input scales -- and the answer is NOT the first row count where the
+#: analytic form wins.  It is the first where it wins at every scale:
+#:
+#:      rows    a=0.05   a=0.6   a=6.0
+#:       192     0.74x   0.90x   0.66x
+#:       224     0.77x   1.31x   0.76x
+#:       256     0.93x   1.42x   1.42x
+#:       320     1.65x   1.78x   1.61x   <- first row that wins everywhere
+#:       384     2.11x   1.31x   1.85x
+#:
+#: Measured at a=0.6 alone, 192 looked like the crossover and would have been
+#: 1.13x there while losing at both other scales -- the same trap
+#: `_ANALYTIC_DIRECT_MIN_ROWS` records ("256 rather than 192 because 192 still
+#: loses on one of the three").  A threshold has to be somewhere it never costs
+#: anything to cross.
+#:
+#: A shape whose leftover falls under 320 drops to the scan exactly as it does
+#: today, so a thin margin is a lost gain and never a regression.
+#:
+#: WHICH CELLS THIS STILL DECIDES, now that `CHUNK_TARGET_ROWS` is 2048.  Where
+#: the row target binds, the leftover is 715 and clears either threshold; this
+#: constant only matters where MEMORY binds first and the chunk cannot reach the
+#: target.  That is `down_proj` -- k=7912, capped at 67 tiles, 1072 rows, 374
+#: left over -- which is the single most expensive cell in the grid.  Measured
+#: there with the row target already raised, moving this threshold alone took it
+#: from 1.07x to 1.13x.  That is the whole reason both constants had to move:
+#: one fixes the cells the row target reaches, the other the cell it cannot.
+#:
+#: Not to be unified with `_ANALYTIC_DIRECT_MIN_ROWS` (256) even though both
+#: price the same comparison -- analytic against a scan on N rows, with the
+#: decode paid on neither side or both.  The gap is measurement margin, and
+#: closing it upward would push the T=4 `down_proj` cell, which hands the sweep
+#: 308 rows, off the analytic path it currently takes.
+_ANALYTIC_MIN_ROWS = 320
 
 #: Rows below which a scan beats going STRAIGHT to `nearest_e8p_analytic`,
 #: without the lattice decoder in front.
@@ -934,10 +1011,37 @@ def _ldlq_sweep(W: Tensor, factors: list[Tensor], parts, alpha: Tensor,
 #: the activations all want room too.
 CHUNK_BUDGET_BYTES = 1 << 30
 
-#: Rows past which `_nearest` stops getting faster.  Measured on this machine
-#: the sweep gains 12x going from 4 rows to 256 and 3% more from 256 to 1024, so
-#: there is nothing to buy above roughly this and the memory is better left free.
-CHUNK_TARGET_ROWS = 1024
+#: Rows past which `_nearest` stops getting faster.
+#:
+#: 1024 WAS STALE, AND STALE IN THE WORST PLACE.  It was measured before the
+#: analytic search, before `fit_scale` batched its candidates and before Triton,
+#: and it priced SATURATION only -- it never priced which search path the row
+#: count selects.  Re-measured at the grid's real shapes and tile counts, with
+#: the 1024 arm as the base:
+#:
+#:      shape (n_tiles)       1024    2048    3072    4096    8192   binds
+#:      T=8  k=2816 (512)    1.00x   1.16x   1.17x   1.17x   1.19x   memory
+#:      T=16 k=2944 (256)    1.00x   1.37x   1.33x   1.35x   1.35x   memory
+#:      T=32 k=3008 (128)    1.00x   1.49x   1.53x   1.96x   1.91x   tiles
+#:      T=16 k=7912 (256)    1.00x   1.08x   1.04x   1.05x   1.07x   memory
+#:      total                1.00x   1.20x   1.19x   1.23x   1.24x
+#:
+#: 2048 rather than more because the curve is flat past it: 1.20 against 1.24 at
+#: four times the target, inside the 2-5% these timings spread, and what little
+#: is left comes from one cell where the TILE COUNT binds -- T=32 fitting a
+#: whole layer in one chunk, which is not a row-target effect at all.  Past 2048
+#: three of the four shapes are held by `CHUNK_BUDGET_BYTES` anyway, so raising
+#: it further mostly moves the control to the memory ceiling without moving the
+#: clock.  Peak allocation over the sweep reached 1.7-3.7 GiB, on a card with 8
+#: that also has to hold the layer and its activations.
+#:
+#: Note what the old value cost beyond saturation.  `auto_chunk`'s ceiling is
+#: `ceil(target / lines)`, so at T=8, 16 and 32 -- where `lines` divides 1024 --
+#: it landed on EXACTLY 1024 rows, whose 34.9% leftover (357) sat just under the
+#: old `_ANALYTIC_MIN_ROWS`, and every group of the sweep fell through to a
+#: 65536-codeword scan.  Eight of twenty-one cells.  The two constants have to
+#: be read together, and `tests/test_quantize.py` now asserts the inequality.
+CHUNK_TARGET_ROWS = 2048
 
 
 def auto_chunk(n_tiles: int, lines_per_tile: int, k: int, itemsize: int,

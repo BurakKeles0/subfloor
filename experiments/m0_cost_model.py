@@ -237,6 +237,21 @@ SCALE_FIT_MULTIPLIER = 1.39
 #: multiply: Triton's gain WAS the launch overhead, and batching the candidates
 #: removes the same overhead a level up.  Two fixes for one waste share it;
 #: they do not compound.  The model must never be handed both factors.
+#: STALE AS OF 2026-08-25, DELIBERATELY NOT PATCHED.  `quantize` moved two
+#: constants that decide which search path the LDLQ sweep takes
+#: (`_ANALYTIC_MIN_ROWS` 384 -> 320, `CHUNK_TARGET_ROWS` 1024 -> 2048), and
+#: measured at the grid's real shapes and real tile counts the tile gets faster:
+#:
+#:      T=8  k=2816   1.17x        T=32 k=3008   1.55x
+#:      T=16 k=2944   1.38x        T=16 k=7912   1.15x     weighted 1.25x
+#:
+#: So `m1_cost` now reports an UPPER BOUND -- roughly 4% high, about 14.4 days
+#: against the 15.0 it prints.  The factors are not applied here because these
+#: rows never recorded the `n_tiles` they were measured with, and `n_tiles` is
+#: what `auto_chunk` turns into a row count, which is the very thing that
+#: changed.  Multiplying a number whose regime is unknown by a factor measured
+#: in a known one is how this model got five of its seven errors.  The fix is to
+#: re-measure the three rows WITH their tile counts recorded, not to patch them.
 TILE_TIMINGS = {
     "cpu_f64": ((2560, 4, 1.741), (2944, 16, 8.721), (3072, 128, 95.83)),
     "cuda_f32": ((2560, 4, 0.0142), (2944, 16, 0.0404), (3072, 128, 0.2811)),

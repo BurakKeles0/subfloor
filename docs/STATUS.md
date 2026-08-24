@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-25 · HEAD `a3d5a05` · Testler: **604 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-25 · HEAD `PENDING` · Testler: **619 geçiyor, 6 atlanıyor**
 > Bu oturumun ölçüm dersleri **§14**'te — hız kazançlarından daha taşınabilir.
 
 ---
@@ -326,7 +326,8 @@ kalibrasyon %11.3, cholesky %5.4, eval %2.3.
 Maliyet ızgaranın **ortasında** tepe yapıyor: `n_tiles = n_out/T` düşerken
 `d` (dolayısıyla `k`) yükseliyor.
 
-**M1 (3 bütçe × 7 tile × 5 çekiliş): 15.0 gün.**
+**M1 (3 bütçe × 7 tile × 5 çekiliş): 15.0 gün** — 08-25'ten beri bir **üst
+sınır**, çünkü `TILE_TIMINGS` sabit değişikliğinden önce ölçüldü (§6.13).
 **`τ` süpürmesi: 4.5 gün** (spec 25 *saat* diyordu).
 **Tasarım F (ilk gerçek U eğrisi): 20.4 saat.**
 
@@ -877,6 +878,103 @@ Kanıt, uçtan uca: gerçek Llama blokları → `sequential_calibrate(device="cu
 
 ---
 
+### 6.13 Üç sabit, tek eşitsizlik, ızgaranın ortası
+
+08-25, ikinci bulgu. Üç sabit birbirinden habersiz ayarlanmış ve aralarında
+**hiçbir yerde yazılmayan** bir eşitsizlik varmış:
+
+```
+CHUNK_TARGET_ROWS * DECODER_MISS_FRACTION  >  _ANALYTIC_MIN_ROWS
+```
+
+Soldan sağa: `auto_chunk` süpürmeyi kaç satıra nişanlıyor, çözücü bunların ne
+kadarını devrediyor, ve o artık analitik yola geçecek kadar büyük mü. Ölçülen
+üçüncü sayı çözücünün **%34.9**'u çözemediği (üç şekilde de aynı — yapısal).
+
+```
+1024 × 0.349 = 357  >  384   →  YANLIŞ
+```
+
+Yani süpürmenin **her grubu** 65,536 kodsözcüğünü tarıyordu.
+
+**Ve bu ızgaranın köşesi değil, ortası.** `auto_chunk`'ın doyum tavanı
+`ceil(hedef / lines)`, yani `lines` 1024'ü böldüğü her yerde chunk **tam 1024
+satıra** oturuyor — B=1.5'te 21 hücrenin **sekizi**:
+
+| hücreler | satır | yol |
+|---|---|---|
+| T=1, 2, 4 ve T=8'de `down_proj` | 192–816 | doğrudan analitik, temiz |
+| **T=8, 16, 32 — sekiz hücre** | **1024** | çözücü + **TAM TARAMA** |
+| T=max | 4096–11008 | çözücü + analitik, temiz |
+
+Gerçek katmanda sayıldı (blok 0 `o_proj`, 2048 satır, B=1.5) — grup başına bir
+çağrı, her seferinde:
+
+| T | tarama çağrısı | taranan satır | düzeltmeden sonra |
+|---|---|---|---|
+| 8 | 581 | 184,915 | **0** |
+| 16 | 623 | 193,184 | **0** |
+| 32 | 645 | 196,712 | **0** |
+
+**İki sabit birden oynadı, çünkü hiçbiri tek başına yetmiyor.** Satır hedefini
+büyütmek eriştiği hücreleri kurtarıyor; `down_proj`'a erişemiyor — orada k=7912
+chunk'ı **bellekten** 67 tile'a kapatıyor ve satır 1072'de kalıyor. Eşiği
+düşürmek de yalnız o hücrede kayda değer.
+
+**Eşik ölçülürken bir tuzak daha çıktı.** Tek ölçekte (a=0.6) krossover 192
+görünüyor ve orada 1.13×. Üç ölçekte bakınca 192 diğer ikisinde **kaybediyor**;
+her ölçekte kazanan ilk değer **320**. Mevcut `_ANALYTIC_DIRECT_MIN_ROWS`'un
+kendi notu aynı şeyi söylüyordu ("256, 192 değil — 192 üçünden birinde
+kaybediyor") ve yine de aynı tuzağa düştüm.
+
+| satır | a=0.05 | a=0.6 | a=6.0 |
+|---|---|---|---|
+| 192 | 0.74× | 0.90× | 0.66× |
+| 256 | 0.93× | 1.42× | 1.42× |
+| **320** | **1.65×** | **1.78×** | **1.61×** |
+
+**Satır hedefi de bayattı.** `CHUNK_TARGET_ROWS`'un docstring'i "256'dan 1024'e
+%3, üstünde alacak bir şey yok" diyordu — analitik aramadan, toplu fit'ten ve
+Triton'dan **önce** ölçülmüş, ve yalnız **doyumu** fiyatlıyordu, satır sayısının
+hangi arama **yolunu** seçtiğini değil. Gerçek şekillerde ve gerçek tile
+sayılarıyla yeniden ölçüldü; plato **2048**'de (toplam 1.20× / 1.24×, aradaki
+fark bu ölçümlerin %2–5 yayılımının içinde), ve ötesinde üç şekilde zaten
+`CHUNK_BUDGET_BYTES` bağlıyor.
+
+**Hız — gerçek şekiller, gerçek tile sayıları, tek süreçte dönüşümlü, boş kart:**
+
+| şekil | eski 384/1024 | yeni 320/2048 | | taranan satır |
+|---|---|---|---|---|
+| T=8 k=2816 | 8208 ms | 6992 ms | 1.17× | 479,415 → 0 |
+| T=16 k=2944 | 6559 ms | 4750 ms | **1.38×** | 505,066 → 0 |
+| T=32 k=3008 | 5662 ms | 3658 ms | **1.55×** | 510,812 → 0 |
+| T=16 k=7912 (`down`) | 14439 ms | 12577 ms | 1.15× | 1,329,201 → 0 |
+| **toplam** | 34.9 s | 28.0 s | **1.25×** | |
+
+Yayılımlar %1–10. İki uçtaki 1.15–1.17×'in sebebi aynı: orada **bellek**
+bağlıyor, satır hedefi erişemiyor — `down_proj` 67 tile'da, T=8 195'te kapanıyor.
+
+**Kalite bedeli — gerçek katmanda, ve neredeyse yok.** T=8 ve T=16 **bit-birebir**
+aynı; T=32'de bağıl hata **−0.00002%** (ve lehte). Kapı B'nin ayırabildiği
+%3.2'nin 160,000 katı altında. §6.11a aynı takası 5.8e-5 ile almıştı; bu ondan
+da küçük.
+
+> **Maliyet modeli GÜNCELLENMEDİ, ve bu bilinçli.** `TILE_TIMINGS` bu
+> değişiklikten önce ölçüldü, yani **M1 = 15.0 gün artık bir üst sınır** —
+> yukarıdaki oranlar taşınırsa etkilenen hücrelerde ~%4, kabaca 14.4 gün.
+> Uydurulmadı çünkü `TILE_TIMINGS`'in provenance'ı hangi `n_tiles` ile
+> ölçüldüğünü **hiç yazmıyor**, ve chunk oradan geliyor: satırları o sayı
+> belirliyor. Yani doğru iş o üç satırı `n_tiles` kaydederek yeniden ölçmek,
+> ölçüm boşluğunu bir çarpanla doldurmak değil. Sıradaki turun işi.
+
+> **Mikro-benchmark yine fazla vaat etti.** 353 satırlık artık kümede analitik,
+> taramaya karşı izole ölçümde **2.03×**. Aynı taramaları süpürmeden kaldırmak
+> **1.04×** ediyor — tarama, peşinden gelen üçgen çözüm ve geri besleme
+> matmul'üyle örtüşüyor, yani izole maliyetinin çoğu yerinde zaten gizli. §6.3'ün
+> kuralı bir kez daha, ve bu sefer **sildiğin** çekirdek için.
+
+---
+
 ## 7. Denenip **reddedilenler** — tekrar denenmesin
 
 Bu bölüm kasıtlı olarak uzun. Bir fikrin denenip elendiğini kaydetmemek, onu
@@ -1025,6 +1123,10 @@ ayrık terimlere biniyor ve ayrık-null'a göre %99 birleşiyorlar (§6.9).
   `T=max` için sert kısıt, hâlâ yalnızca ima edilmiş
 - **Eval maliyeti** — 238 s yalnız WikiText-2; C4 ve 5 zero-shot görev hiç
   ölçülmedi ve ön-kayıt §4 ikisini de şart koşuyor
+- **`TILE_TIMINGS`'i `n_tiles` kaydederek yeniden ölç** — üç satır da 08-25'in
+  sabit değişikliğinden önce alındı, yani M1 = 15.0 gün artık **üst sınır**
+  (~%4 yüksek). Provenance `n_tiles`'ı hiç yazmıyor ve chunk oradan geliyor,
+  o yüzden çarpanla yamamak değil yeniden ölçmek gerekiyor (§6.13)
 
 ---
 
@@ -1077,7 +1179,8 @@ yok. §8.1'in checkpoint'i bu yüzden kritik yolda.
 | **Inductor CPU'da `cl` (MSVC) istiyor** | CUDA derleniyor, CPU derlenemiyor. `quantize._shift_kernel` cihaz/dtype başına sondalıyor ve eager'a düşüyor — sessiz, çünkü iki yol birebir aynı |
 | **`TILESPARSE_NO_COMPILE=1`** | Derlemeyi kapatır; derli/derlisiz karşılaştırma ve toolchain sorunları için |
 | **Mutlak süreler koşular arasında karşılaştırılamaz** | Aynı ölçüm iki koşuda %14–37 oynadı, bazen tanımlanabilir bir sebep olmadan. **Yalnız tek süreçte dönüşümlü A/B geçerli.** Bu oturumda bir kez +%37 okuyup değişikliğe yordum; makineymiş |
-| **GPU çekişmesi fırlatma kaldıraçlarını GİZLER** | Başka bir iş kartı doldurunca darboğaz GPU'ya geçiyor ve silmeye çalıştığın gecikme zaten gizleniyor — optimizasyon **1.00× okuyor**. Dönüşümlü A/B bunu düzeltmez; hız fazından önce `nvidia-smi` ile kontrol et |
+| **GPU çekişmesi fırlatma kaldıraçlarını GİZLER** | Başka bir iş kartı doldurunca darboğaz GPU'ya geçiyor ve silmeye çalıştığın gecikme zaten gizleniyor — optimizasyon **1.00× okuyor**. Dönüşümlü A/B bunu düzeltmez; hız fazından önce `bench_guard.require_quiet_gpu()` çağır |
+| ~~**`nvidia-smi`'nin `utilization.gpu`'suna bak**~~ → **düzeltildi 08-25** | Bu makinede o sayı **yükle ters korele**: boş kartta %42, kendi yükümüzde %25. Sebebi WDDM — kart ekranı da sürüyor, ve listelenen "compute" süreçleri Windows kabuğu, Edge WebView ve **Claude uygulamasının kendisi**. `mem_get_info` daha kötü: **kör**, 3 GiB tutan yabancı süreci hiç görmüyor. Çalışan tek gösterge `clocks.sm` (boşta %42, yabancı yükte %89). Ölçülüp `experiments/bench_guard.py`'ye yazıldı |
 | **TF32 hattı kırıyor** | `allow_tf32=True` ile döndürülmüş alt-Hessian Cholesky'den geçmiyor: sönümleme payının %85'i gidiyor. Açma (§6.9) |
 | **`sequential_calibrate` varsayılanı GPU'da float64** | Yani 1/64 hız: blok başına 29.9 s'ye karşı 0.9 s, ve yerine geçtiği CPU float64'ten (19.7 s) bile yavaş. Maliyet modeli `cuda_f32`'yi fiyatlıyor; varsayılanla koşmak **M1'i 15 günden 51'e** çıkarır. Sürücü `dtype=torch.float32` geçmeli — varsayılan bilerek değiştirilmedi (§6.12) |
 | **CPU'da koşan bir test cihaz varsayılanını sınayamaz** | `.cpu()` zaten CPU'daysa no-op, CPU `block_kwargs` CPU bloğun yanında zaten doğru. Bu oturumlarda **üç kez** vurdu; sonuncusunda tek bir yolda beş kusur biriktirdi (§6.12). Cihaza dokunan her değişikliğin CUDA işaretli bir testi olmalı, ve test **parçanın değil çağıranın** üstünde |
@@ -1113,6 +1216,8 @@ yok. §8.1'in checkpoint'i bu yüzden kritik yolda.
 | `experiments/m0_scale_fit.py` | ölçek uydurmayı ucuzlatmanın kalite bedeli |
 | `experiments/m0_precision_levers.py` | fp16 / kron / TF32, tek tek ve sekiz kombinasyonda |
 | `experiments/m0_pass_breakdown.py` | bir geçişin fazları — modelin yazmadıklarını bulmak için |
+| `experiments/bench_guard.py` | kartın ölçülecek kadar boş olduğunu **fırlatarak** doğrular; dönüşümlü A/B ve yayılım raporu |
+| `experiments/m0_chunk_rows.py` | `auto_chunk`'ın satır hedefi ile arama eşiğinin etkileşimi — yol sayımı + zaman |
 
 **Belgeler:** `docs/spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı** — iki kutu kaldı, artık maliyet engeli yok) ·
@@ -1124,7 +1229,7 @@ tam model sürücüsü + checkpoint · `experiments/tau_sweep.py` — `τ` yüze
 İkisi de `sequential_calibrate` + `streamed_perplexity` dikişini kullanacak.
 
 ```bash
-python -m pytest tests/ -q                         # 604 test, ~2 dk
+python -m pytest tests/ -q                         # 619 test, ~2 dk
 HF_HUB_DISABLE_XET=1 python experiments/m0_dense_ppl.py --seqlens 2048 4096 --device cuda
 HF_HUB_DISABLE_XET=1 python -u experiments/m0_rotation_value.py \
     --tiles 4 16 max --seqs 16 --rows 512 --solve-device cuda --solve-dtype float32
@@ -1221,14 +1326,22 @@ sessizce yanlıştı ve ikisini önce yanlış teşhis ettim. Dördünün de ort
 | **Yanlış rejimde ölçülmüş ret** | "Kazanç yok, tekrar deneme" | Ölçümü gerçek genişliklerde tekrarlayınca: **9.94×**. Kayıt beni sekiz gün yanlış yerde tuttu |
 | **Cevabı sınayan test** | Test yeşil, hata duruyor | Yolu saymaya geçince. Aynı oturumda **üç kez** oldu |
 | **Hiç koşulmamış bir kompozisyon** | Her parça yeşil, birleşimleri çalışmıyor | 08-25: `sequential_calibrate` + `run_config` **beş** kusur taşıyordu ve parça testlerinin hepsi geçiyordu (§6.12) |
+| **Değiştirdiğin yolu geçmeyen ölçüm** | Kalite farkı **tam sıfır** — inandırıcı ve boş | 08-25: yönlendirme değişiminin bedelini 512 satırlık bir katmanda ölçtüm; o katman ölü bandın altında kalıyor, yani iki kolda da **sıfır tarama** oldu ve %0.0000 hiçbir şey kanıtlamadı (§6.13) |
 
 ### 14.2 Kurallar
 
 - **Kıyaslama yazarken `assert quantize.is_canonical_codebook(cb)`.** Hızlı
   yolun açık olduğunu iddia et, varsayma. Bu yüzden dışa açıldı.
-- **Hız fazından önce GPU'nun boş olduğunu doğrula.** Çekişme yalnız gürültü
-  eklemiyor — darboğazı karta taşıyıp *tam da silmeye çalıştığın gecikmeyi*
-  gizliyor, ve sonuç 1.00× diye okunuyor.
+- **Hız fazından önce GPU'nun boş olduğunu doğrula — ama `utilization.gpu` ile
+  DEĞİL.** Çekişme yalnız gürültü eklemiyor; darboğazı karta taşıyıp *tam da
+  silmeye çalıştığın gecikmeyi* gizliyor, ve sonuç 1.00× diye okunuyor. Ama bu
+  kural 08-25'e kadar **yanlış göstergeyi** işaret ediyordu ve bir kez yanlış
+  karar verdirdi: bu makinede `utilization.gpu` boş kartta **%42**, yabancı
+  yükte %99, kendi yükümüzde %25 okuyor. `torch.cuda.mem_get_info` ise **kör** —
+  3 GiB tutan yabancı bir süreç onu **bir bayt** oynatmıyor (WDDM çağıran
+  bağlamın bütçesini veriyor). Çalışan tek gösterge **`clocks.sm`**: boşta
+  %42, yabancı yükte %89. Artık elle bakılmıyor —
+  `experiments/bench_guard.require_quiet_gpu()` **fırlatıyor**.
 - **Yalnız tek süreçte dönüşümlü A/B.** Bu makinede aynı ölçüm koşudan koşuya
   %14–37 oynuyor.
 - **Bir reddi kaydederken hangi rejimde ölçüldüğünü yaz.** Yanlış rejimde
@@ -1246,6 +1359,12 @@ sessizce yanlıştı ve ikisini önce yanlış teşhis ettim. Dördünün de ort
 - **Koşulmamış bir kompozisyon çalışmıyor sayılır.** Bu projede iki kez böyle
   oldu: maliyet modelinin iki eksik terimi de, dikişin beş kusuru da, "her parça
   yeşil ama zinciri kimse koşmadı" durumundan çıktı.
+- **Yalnız test değil, ÖLÇÜM de yolu izlesin.** "Test cevabı değil yolu
+  izlesin" kuralının ölçüm hâli, ve 08-25'te bunu unuttum: bir değişikliğin
+  kalite bedelini, değişikliğin hiç tetiklenmediği bir şekilde ölçtüm ve tertemiz
+  bir %0.0000 aldım. Bir A/B'de **önce iki kolun gerçekten farklı yollardan
+  geçtiğini say**, sonra sayılara bak. Burada sayılacak şey `_brute_force`'a
+  düşen satırdı; sıfır/sıfırdı.
 
 ### 14.3 Ve modele dair olan
 
