@@ -1050,7 +1050,7 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `de8a5ec` | **Kronecker kongrüansı gerçek katmanda ölçüldü** (§6.8). Sentetik ölçüm iki mertebe yanılmıştı; hattın kolunda etki lehte, M1 11.98 → 8.17 g. Varsayılan kapalı |
 | `383a64a` | **Üç hassasiyet kaldıracı, tek tek ve kombine** (§6.9). TF32 **hattı kırıyor** — §3.3'ün açık kalemi kapandı. `fp16+kron` bağımsız, birlikte M1 11.98 → **6.63 g** |
 | `8c56f1e` | **Kalibrasyon Hessian'ı GPU'da** (25×) ve maliyet modelinin **altıncı hatası** (§6.10). `m1_run.py` bugün 40 gün sürerdi, 13.4 değil |
-| *(bu değişiklik)* | **`_nearest`'in ikinci kapısı** (§6.11a, süpürmede 2.0–3.5×) ve **yedinci eksik terim** (§6.11b). Ayrıca §7.2'deki bir ret **yanlış rejimde ölçülmüş** çıktı (§6.11c) |
+| `98c0413` | **`_nearest`'in ikinci kapısı** (§6.11a, süpürmede 2.0–3.5×) ve **yedinci eksik terim** (§6.11b). Ayrıca §7.2'deki bir ret **yanlış rejimde ölçülmüş** çıktı (§6.11c) |
 
 ---
 
