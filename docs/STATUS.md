@@ -893,7 +893,7 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `1efa971` | **Ölçek adayları tek aramada** (§6.7); maliyet modelinin **beşinci hatası** ve iki geri çekilen ölçüm (§6.3). 17 → 12 gün, ve baskın terim codebook'tan **rotasyona** geçti |
 | `0a19f90` | **`_on_device` tuzağı kapatıldı** (§10). Üç oturumdur belgede duran, kodda durmayan hata; dört ölçümü bozmuştu |
 | `de8a5ec` | **Kronecker kongrüansı gerçek katmanda ölçüldü** (§6.8). Sentetik ölçüm iki mertebe yanılmıştı; hattın kolunda etki lehte, M1 11.98 → 8.17 g. Varsayılan kapalı |
-| *(bu değişiklik)* | **Üç hassasiyet kaldıracı, tek tek ve kombine** (§6.9). TF32 **hattı kırıyor** — §3.3'ün açık kalemi kapandı. `fp16+kron` bağımsız, birlikte M1 11.98 → **6.63 g** |
+| `383a64a` | **Üç hassasiyet kaldıracı, tek tek ve kombine** (§6.9). TF32 **hattı kırıyor** — §3.3'ün açık kalemi kapandı. `fp16+kron` bağımsız, birlikte M1 11.98 → **6.63 g** |
 
 ---
 
