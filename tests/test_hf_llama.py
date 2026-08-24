@@ -230,3 +230,132 @@ def test_to_device_leaves_values_unchanged():
     moved = HF.to_device(kwargs, "cpu")
     assert torch.equal(moved["a"], kwargs["a"])
     assert torch.equal(moved["b"][0], kwargs["b"][0])
+
+
+# --------------------------------------------------------------------------- #
+# The driver on a device -- the path `experiments/m1_run.py` has to take
+#
+# Five defects sat here at once and the 599-test suite saw none of them, because
+# every one of them is a no-op on the CPU: `.cpu()` on a CPU tensor, a CPU
+# `block_kwargs` beside a CPU block, a rebind that happens to be harmless when
+# nothing moves.  `docs/STATUS.md` section 14.1 already recorded this blind spot
+# from two earlier fixes; it caught the next two as well.  So these tests watch
+# WHERE things are, not whether an answer came back.
+# --------------------------------------------------------------------------- #
+
+def _model(seed: int):
+    return HF.tiny_llama(vocab_size=VOCAB, hidden_size=64, intermediate_size=128,
+                         num_hidden_layers=2, num_attention_heads=4,
+                         num_key_value_heads=2, dtype=DT, seed=seed)
+
+
+def test_sequential_calibrate_advances_the_callers_input_list():
+    """`inputs` is documented as updated IN PLACE, and section 8.1's checkpoint
+    has to save exactly that list to resume from.  Passing `device` rebound the
+    local name instead, so the caller kept block 0's activations for the whole
+    run -- indistinguishable from a correct run until someone resumed from it.
+
+    Runs on the CPU: `device="cpu"` moves nothing but still takes the branch.
+    """
+    def walk(device):
+        m = _model(11)
+        inputs, kwargs = HF.capture_block_inputs(m.model, _ids(2))
+        held = list(inputs)
+        start = held[0].clone()
+        Cal.sequential_calibrate(m.blocks, held, lambda i, n, p: p.W,
+                                 block_kwargs=kwargs, dtype=torch.float64,
+                                 device=device)
+        return start, held
+
+    start, held = walk("cpu")
+    assert not torch.equal(held[0], start), (
+        "caller's list still holds block 0's inputs; a checkpoint taken from it "
+        "would resume the run at the wrong depth"
+    )
+    _, reference = walk(None)
+    assert torch.allclose(held[0], reference[0], atol=1e-5), (
+        "the device branch advanced the list somewhere else than the plain walk"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda")
+def test_sequential_calibrate_moves_block_kwargs_onto_the_device():
+    """`block_kwargs` carries the rotary embeddings, and they were never moved.
+    The block died inside `apply_rotary_pos_emb` -- on the exact call a
+    full-model driver has to make.
+
+    Watches what the block RECEIVES rather than whether the walk finished: a
+    version that crashes and a version that quietly ran on the wrong device are
+    different bugs and this separates them.
+    """
+    m = _model(13)
+    inputs, kwargs = HF.capture_block_inputs(m.model, _ids(2))
+
+    seen: list[str] = []
+
+    def spy(_mod, _args, kw):
+        cos, sin = kw["position_embeddings"]
+        seen.append(f"{cos.device.type}/{sin.device.type}")
+
+    handle = m.blocks[0].register_forward_pre_hook(spy, with_kwargs=True)
+    try:
+        Cal.sequential_calibrate(m.blocks, list(inputs), lambda i, n, p: p.W,
+                                 block_kwargs=kwargs, device="cuda",
+                                 dtype=torch.float32)
+    finally:
+        handle.remove()
+
+    assert seen, "block 0 never ran"
+    assert set(seen) == {"cuda/cuda"}, f"rotary reached the block on {set(seen)}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda")
+def test_sequential_calibrate_hands_compress_fn_a_single_device_problem():
+    """W was pinned to the CPU while H followed the block, and no argument could
+    reconcile them -- so this seam could not hand the pipeline a GPU problem at
+    all.  `run_config` reads W and H inside single expressions, so a split
+    problem is not slow, it is unusable.
+    """
+    m = _model(17)
+    inputs, kwargs = HF.capture_block_inputs(m.model, _ids(2))
+
+    placements = set()
+
+    def compress(i, name, p):
+        placements.add((p.W.device.type, p.H.device.type, p.act_norm.device.type,
+                        p.W.dtype, p.H.dtype))
+        return p.W
+
+    Cal.sequential_calibrate(m.blocks, list(inputs), compress,
+                             block_kwargs=kwargs, device="cuda",
+                             dtype=torch.float32)
+    assert placements == {("cuda", "cuda", "cuda",
+                           torch.float32, torch.float32)}, placements
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda")
+def test_the_pipeline_runs_through_the_seam_on_cuda():
+    """The skeleton of `experiments/m1_run.py`: real Llama blocks -> the driver
+    -> `run_config` -> compressed weights back into the model, on the card.
+
+    This is the test that would have caught all five defects at once, and the
+    reason none of them was caught is that nothing ever ran this composition --
+    the same gap `docs/STATUS.md` section 14.3 blames for two missing cost terms.
+    """
+    import m1_gates as G
+
+    m = _model(19)
+    inputs, kwargs = HF.capture_block_inputs(m.model, _ids(2))
+
+    def compress(i, name, p):
+        r = G.run_config(p, budget_bits=1.5, tile_size=4, return_weight=True)
+        assert "W_hat" in r, f"{name}: {r.get('skipped')}"
+        return r["W_hat"]
+
+    records = Cal.sequential_calibrate(m.blocks, list(inputs), compress,
+                                       block_kwargs=kwargs, device="cuda",
+                                       dtype=torch.float32)
+    assert len(records) == 14
+    # Lossy at 1.5 bits, so every layer has to move -- a zero here would mean
+    # the fallback weight went back in and nothing was actually compressed.
+    assert all(0.0 < r["rel_output_error"] < 1.0 for r in records)

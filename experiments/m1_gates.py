@@ -135,10 +135,19 @@ def run_config(
     scale: str | float = "per_tile",
     seed: int = 0,
     vq_bits: float = E8P_BITS,
+    return_weight: bool = False,
 ) -> dict:
     """Prune -> compact -> rotate -> quantize, in that order, and measure.
 
     The order is the invariant (plan H1) and `prune` enforces it.
+
+    `return_weight=True` puts the compressed W under `"W_hat"`.  Off by default
+    because the grid runs thousands of configs and keeping a weight per record
+    would hold the whole sweep in memory; on, it is what lets this function be
+    used as `calibrate.sequential_calibrate`'s `compress_fn`, which has to
+    RETURN a weight.  Without it the two halves of the seam do not connect and
+    a full-model driver cannot be a thin adapter over them -- which is half of
+    why `experiments/m1_run.py` (`docs/STATUS.md` section 8.1) does not exist.
 
     `ldlq=True` rounds against each tile's sub-Hessian, rotated into the same
     basis as its block.  Without it the rotation costs inference time and buys
@@ -249,7 +258,7 @@ def run_config(
         scheme, realized, None, pruned.mask.n_idx,
         tile_size=tile_size, vq_bits=vq_bits,
     )
-    return {
+    out = {
         "budget_bits": budget_bits,
         "bits_realized": bits,
         "offset": bits - budget_bits,
@@ -287,6 +296,9 @@ def run_config(
             tile_size=tile_size if scheme == "tile" else 1, vq_bits=vq_bits,
         ),
     }
+    if return_weight:
+        out["W_hat"] = W_hat
+    return out
 
 
 def dense_wall(problem: LayerProblem, seed: int = 0) -> dict:

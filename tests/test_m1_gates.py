@@ -231,6 +231,32 @@ def test_run_config_skips_unreachable_budgets(problem):
     assert r["skipped"]
 
 
+def test_run_config_can_hand_back_the_compressed_weight(problem):
+    """`calibrate.sequential_calibrate`'s `compress_fn` has to RETURN a weight,
+    and `run_config` computed one and dropped it -- so the two halves of the
+    seam could not be connected at all, which is half of why
+    `experiments/m1_run.py` does not exist (`docs/STATUS.md` section 8.1).
+
+    Off by default on purpose: the grid runs thousands of configs and a weight
+    per record would hold the whole sweep in memory.
+    """
+    plain = M.run_config(problem, budget_bits=1.5, tile_size=16, seed=0)
+    assert "W_hat" not in plain
+
+    with_w = M.run_config(problem, budget_bits=1.5, tile_size=16, seed=0,
+                          return_weight=True)
+    W_hat = with_w["W_hat"]
+    assert W_hat.shape == problem.W.shape
+    assert W_hat.device == problem.W.device
+
+    # It has to be the weight the record was MEASURED on, not a second pass:
+    # a re-derived weight would be the thing this test cannot see going stale.
+    assert problem.output_error(W_hat) == pytest.approx(
+        with_w["rel_output_error"], rel=1e-12)
+    assert with_w["rel_output_error"] == pytest.approx(
+        plain["rel_output_error"], rel=1e-12)
+
+
 def test_compensation_helps_until_the_quantizer_takes_it_back(big_problem):
     """A FINDING with a direct consequence for the milestone plan.
 

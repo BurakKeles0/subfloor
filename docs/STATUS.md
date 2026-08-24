@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-24 · HEAD `a775b0c` · Testler: **599 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-25 · HEAD `PENDING` · Testler: **604 geçiyor, 6 atlanıyor**
 > Bu oturumun ölçüm dersleri **§14**'te — hız kazançlarından daha taşınabilir.
 
 ---
@@ -82,6 +82,7 @@ düşerken B ayakta kalabilir, ve o durumda çerçeve daralır, proje durmaz.
 | **Toplu süpürmenin tile-tile'a denkliği** | İki cihaz, iki dtype, iki ölçek politikası, chunk 2'den tile sayısının 4 katına |
 | **Akıtılan alt-Hessian'ın yığılmışa denkliği** | Bit-birebir aynı çıktı |
 | **Maliyet modelinin kendini doğrulaması** | Hiç uydurulmadığı bir genişlikte (k=7912) gerçek tile süresini 16 satırda %11.9 içinde tahmin ediyor. 4 satırda %39.8 sapıyor — **fazla** yazarak, yani 12 gün bir üst sınır (§6.3) |
+| **§8.1 dikişinin GPU'da uçtan uca koştuğu** | Gerçek Llama blokları → `sequential_calibrate` → `run_config` → sıkıştırılmış ağırlıklar → `streamed_perplexity`, hepsi cuda'da. 08-25'e kadar **koşmuyordu** ve bunu hiçbir test görmüyordu (§6.12) |
 
 ### 3.2 Varsayım — doğrulanmadı
 
@@ -829,6 +830,53 @@ eklendi ve **varsayılan `None`** — kesin düzen.
 
 ---
 
+### 6.12 Dikiş GPU'da hiç koşmamış — bir yolda beş kusur
+
+08-25. §8.1'i yazmadan önce onun **kullanacağı dikişe** bakıldı:
+`sequential_calibrate` → `run_config`. `sequential_calibrate(device="cuda")` —
+`m1_run.py`'nin yapmak zorunda olduğu tam çağrı — **çalışmıyordu**, ve arkasında
+üst üste beş kusur vardı:
+
+| # | kusur | belirtisi |
+|---|---|---|
+| 1 | `block_kwargs` cihaza hiç taşınmıyordu | rotary CPU'da kalıyor, blok `apply_rotary_pos_emb` içinde ölüyor |
+| 2 | `LayerProblem`'in W'si CPU'ya sabitlenmiş, H bloğu izliyor | cihaz uyuşmazlığı — **ve hiçbir argüman uzlaştırmıyordu** |
+| 3 | `dtype` varsayılanı GPU'da float64 | 1/64 hız: blok başına 29.9 s'ye karşı 0.9 s |
+| 4 | `inputs` liste sözleşmesi `device` verilince bozuluyor | çağıranın listesi blok 0'da donuyor |
+| 5 | `run_config` `W_hat`'ı hesaplayıp atıyor | `compress_fn` ağırlık döndürmek zorunda — iki yarı **bağlanamıyordu** |
+
+**Beşi de 599 testin kör noktasında**, ve hepsi aynı sebeple: CPU'da bunların
+hiçbiri bir şey yapmıyor. `.cpu()` zaten CPU'daysa no-op, CPU `block_kwargs`
+CPU bloğun yanında zaten doğru, hiçbir şey taşınmıyorsa yeniden bağlama zararsız.
+
+> **Bu kör nokta §14.1'de zaten kayıtlıydı** — iki önceki düzeltmeden. Yine
+> vurdu, ve bu kez tam da hızlandırma commit'inin (`8c56f1e`) kendisinde:
+> o commit dokunduğu **parçaya** CUDA testi ekledi (`collect_block_statistics`),
+> onu **çağıran sürücüye** eklemedi.
+
+**3'ün fiyatı ölçülmedi, hesaplandı** — modelin kendi kayıtlı oranıyla:
+
+| | M1 |
+|---|---|
+| modelin fiyatladığı (`cuda_f32`) | **15.0 gün** |
+| kodun varsayılanının ürettiği (`cuda_f64`) | **51.0 gün** |
+
+25× kazanç gerçek ama **çağıranın `dtype=torch.float32` yazmasına bağlı**.
+Varsayılan yine de float64 bırakıldı: float32 kolunun 5.06e-06'sının ölçüldüğü
+referans o, ve bu sürücüden geçen **hiçbir kalite sayısı henüz yok** — ucuz kolu
+seçmek koşacak olanın kararı, bir yan etki değil. Docstring'e ve §10'a yazıldı.
+
+**Şimdi kapalı, ve testler cevabı değil yolu izliyor** (§14.2): blok 0'a bir
+pre-hook takıp rotary'nin *hangi cihazda geldiğini* sayan bir test, `compress_fn`
+içinde W/H/act_norm yerleşimini kümeye toplayan bir test, ve dikişin tamamını
+koşan bir uçtan uca test. Beşi de HEAD'e karşı **kırmızı** olduğu gösterilerek
+kabul edildi.
+
+Kanıt, uçtan uca: gerçek Llama blokları → `sequential_calibrate(device="cuda")`
+→ `run_config(return_weight=True)` → ağırlıklar modele geri → `streamed_perplexity`.
+
+---
+
 ## 7. Denenip **reddedilenler** — tekrar denenmesin
 
 Bu bölüm kasıtlı olarak uzun. Bir fikrin denenip elendiğini kaydetmemek, onu
@@ -882,6 +930,17 @@ ikinci kez denemek demek.
 `eval.streamed.streamed_perplexity` (mevcut) arasını bağlayacak; `compress_fn`
 içinde `m1_gates.run_config`'in hattı çağrılacak. `hf_llama.load_llama` ve
 `capture_block_inputs` hazır.
+
+> **08-25: dikiş artık gerçekten bağlanıyor.** Yukarıdaki paragraf "mevcut"
+> diyerek **fazlasını vaat ediyordu** — `sequential_calibrate(device="cuda")` çalışmıyordu,
+> `run_config` ağırlık döndürmüyordu, ve arada beş kusur vardı (§6.12).
+> Şimdi ikisi de test altında ve zincir uçtan uca koşuyor. Yani `m1_run.py`
+> gerçekten ince bir adaptör olabilir; kalanı **checkpoint** ve **sürücünün
+> kendi argümanları**.
+
+Sürücünün geçirmesi gereken iki argüman, ikisi de varsayılan değil:
+`dtype=torch.float32` (yoksa M1 15 değil 51 gün — §6.12) ve
+`return_weight=True`.
 
 **Kesintiye dayanıklılık bunun parçası, sonradan eklenen bir şey değil.**
 15 saatlik bir koşu dizüstünde kesilir. Kayıt birimi blok (nokta başına 32);
@@ -987,11 +1046,13 @@ ama manşeti zayıflatır.
 ölçüldü. Gerçeği ilk M1 bütçesinden gelecek; ön-kayıt §7.4'ün uyarlanabilir
 kontrolü bunun için var.
 
-**Maliyet artık birincil risk değil ama sıfır da değil.** 12 gün hâlâ uzun, ve
+**Maliyet artık birincil risk değil ama sıfır da değil.** 15 gün hâlâ uzun, ve
 bütün süreler **bu makineye ve Triton'lu bir kuruluma** ait. Başka donanımda
-eğriler yeniden ölçülmeli. Model **beş** kez yanıldı, ve 08-24'te iki ölçümü de
+eğriler yeniden ölçülmeli. Model **yedi** kez yanıldı, ve 08-24'te iki ölçümü de
 geri çekildi (§6.3) — yani bu sayının belirsizliği modelin kendi hata payından
-değil, ölçümlerin tekrarlanabilirliğinden geliyor.
+değil, ölçümlerin tekrarlanabilirliğinden geliyor. Ve 08-25 bir sınır daha
+gösterdi: model, kodun **varsayılanlarıyla** koşulduğunda ne olacağını yazmıyor
+(§6.12'de 15 güne karşı 51).
 
 **Kesinti.** 15 saatlik bir koşu bile dizüstünde kesilir ve şu an devam etme
 yok. §8.1'in checkpoint'i bu yüzden kritik yolda.
@@ -1018,6 +1079,8 @@ yok. §8.1'in checkpoint'i bu yüzden kritik yolda.
 | **Mutlak süreler koşular arasında karşılaştırılamaz** | Aynı ölçüm iki koşuda %14–37 oynadı, bazen tanımlanabilir bir sebep olmadan. **Yalnız tek süreçte dönüşümlü A/B geçerli.** Bu oturumda bir kez +%37 okuyup değişikliğe yordum; makineymiş |
 | **GPU çekişmesi fırlatma kaldıraçlarını GİZLER** | Başka bir iş kartı doldurunca darboğaz GPU'ya geçiyor ve silmeye çalıştığın gecikme zaten gizleniyor — optimizasyon **1.00× okuyor**. Dönüşümlü A/B bunu düzeltmez; hız fazından önce `nvidia-smi` ile kontrol et |
 | **TF32 hattı kırıyor** | `allow_tf32=True` ile döndürülmüş alt-Hessian Cholesky'den geçmiyor: sönümleme payının %85'i gidiyor. Açma (§6.9) |
+| **`sequential_calibrate` varsayılanı GPU'da float64** | Yani 1/64 hız: blok başına 29.9 s'ye karşı 0.9 s, ve yerine geçtiği CPU float64'ten (19.7 s) bile yavaş. Maliyet modeli `cuda_f32`'yi fiyatlıyor; varsayılanla koşmak **M1'i 15 günden 51'e** çıkarır. Sürücü `dtype=torch.float32` geçmeli — varsayılan bilerek değiştirilmedi (§6.12) |
+| **CPU'da koşan bir test cihaz varsayılanını sınayamaz** | `.cpu()` zaten CPU'daysa no-op, CPU `block_kwargs` CPU bloğun yanında zaten doğru. Bu oturumlarda **üç kez** vurdu; sonuncusunda tek bir yolda beş kusur biriktirdi (§6.12). Cihaza dokunan her değişikliğin CUDA işaretli bir testi olmalı, ve test **parçanın değil çağıranın** üstünde |
 
 **Donanım:** RTX 5060 Laptop, 8 GB VRAM, sm_120 (Blackwell → cu128+;
 `torch 2.12.0+cu130` kurulu). 23.7 GiB RAM, 16 torch thread'i.
@@ -1036,7 +1099,7 @@ yok. §8.1'in checkpoint'i bu yüzden kritik yolda.
 | `compact.py` | survivor'ları tile başına yoğun bloklara topla |
 | `rotation.py` | maske-koruyan rotasyon, blok-köşegen varyant |
 | `quantize.py` | E8P codebook, kafes çözücü, **analitik arama**, LDLQ, ölçek politikası, füzyon çekirdekleri |
-| `calibrate.py` | sıralı kalibrasyon, `LayerProblem` (**dikiş yeri**), `sequential_calibrate` (**sürücü — henüz yalnız testlerden çağrılıyor**), Hessian biriktirici (cihazda) |
+| `calibrate.py` | sıralı kalibrasyon, `LayerProblem` (**dikiş yeri**), `sequential_calibrate` (**sürücü — henüz yalnız testlerden çağrılıyor**; GPU'da `dtype=torch.float32` geçilmeli, §6.12), Hessian biriktirici (cihazda) |
 | `hf_llama.py` | HF adaptörü — blok 0 girdilerini yakalar; `to_device` |
 | `eval/perplexity.py` | ppl + protokol koruması + yayımlanmış sayı tablosu |
 | `eval/streamed.py` | katman-akışlı ppl |
@@ -1061,7 +1124,7 @@ tam model sürücüsü + checkpoint · `experiments/tau_sweep.py` — `τ` yüze
 İkisi de `sequential_calibrate` + `streamed_perplexity` dikişini kullanacak.
 
 ```bash
-python -m pytest tests/ -q                         # 547 test, ~90 s
+python -m pytest tests/ -q                         # 604 test, ~2 dk
 HF_HUB_DISABLE_XET=1 python experiments/m0_dense_ppl.py --seqlens 2048 4096 --device cuda
 HF_HUB_DISABLE_XET=1 python -u experiments/m0_rotation_value.py \
     --tiles 4 16 max --seqs 16 --rows 512 --solve-device cuda --solve-dtype float32
@@ -1129,7 +1192,7 @@ Bu projede en pahalı hata sınıfı **sessizce yanlış bir sayı üretmek**. B
 - Doğrulanmamış şeyler açıkça "varsayım" diye işaretlenir
 - Bir hipotez ölçümden **önce** yazılır
 - Hız iddiaları **uçtan uca** ölçülür, çekirdek mikro-benchmark'ıyla değil —
-  maliyet modeli tam olarak bu yüzden dört kez yanıldı
+  maliyet modeli tam olarak bu yüzden yedi kez yanıldı
 - Bir optimizasyonun kabul kriteri **çıktının değişmemesi**; değişiyorsa
   değişimin ne olduğu ölçülür ve karar tablosuna yazılır
 - Aleyhe bulgular da kaydedilir (eşleştirme kazancı 1.16×, ayrılabilirlik
@@ -1156,6 +1219,7 @@ sessizce yanlıştı ve ikisini önce yanlış teşhis ettim. Dördünün de ort
 | **Mutlak süreleri koşular arası kıyaslamak** | Değişiklik **+%37** okuyor | Tek süreçte dönüşümlü A/B: −%0.8. Makineymiş |
 | **Yanlış rejimde ölçülmüş ret** | "Kazanç yok, tekrar deneme" | Ölçümü gerçek genişliklerde tekrarlayınca: **9.94×**. Kayıt beni sekiz gün yanlış yerde tuttu |
 | **Cevabı sınayan test** | Test yeşil, hata duruyor | Yolu saymaya geçince. Aynı oturumda **üç kez** oldu |
+| **Hiç koşulmamış bir kompozisyon** | Her parça yeşil, birleşimleri çalışmıyor | 08-25: `sequential_calibrate` + `run_config` **beş** kusur taşıyordu ve parça testlerinin hepsi geçiyordu (§6.12) |
 
 ### 14.2 Kurallar
 
@@ -1174,6 +1238,13 @@ sessizce yanlıştı ve ikisini önce yanlış teşhis ettim. Dördünün de ort
   gösterilmeden kabul etme. Bu oturumda ilk yazdığım testler üç kez gerçek
   hataları kaçırdı: tek çekiliş kullandıkları için, CPU'da `.to("cpu")` no-op
   olduğu için, ve cevabı sınadıkları için.
+- **Parçayı değil ÇAĞIRANI test et.** Bir düzeltmenin dokunduğu fonksiyona test
+  yazmak yetmiyor: `8c56f1e` `collect_block_statistics`'e CUDA testi ekledi ve
+  onu çağıran `sequential_calibrate` üç kusurla kaldı (§6.12). Kusurun yaşadığı
+  yer parça değil, **kompozisyon**.
+- **Koşulmamış bir kompozisyon çalışmıyor sayılır.** Bu projede iki kez böyle
+  oldu: maliyet modelinin iki eksik terimi de, dikişin beş kusuru da, "her parça
+  yeşil ama zinciri kimse koşmadı" durumundan çıktı.
 
 ### 14.3 Ve modele dair olan
 
@@ -1185,3 +1256,10 @@ arandığı için bulundu — ve ikisi birden M1'i 12 günden ~40'a çıkardı.
 Neyin saklanmalarına izin verdiği de kayda değer: **tam sürücüyü kimse
 koşmadı.** §8.1 yalnız "gerçek veri yok" diye kritik yolda değil; **ölçülmeyen
 maliyet de orada birikiyor.**
+
+08-25'te aynı boşluktan ikinci bir şey çıktı, ve bu sefer maliyet değil
+**çalışmayan kod**: sürücünün kullanacağı dikiş GPU'da hiç koşmamıştı ve tek bir
+yolda beş kusur biriktirmişti (§6.12). Yani "kimse koşmadı" bu projede iki ayrı
+şey üretti — **eksik terim** ve **kırık zincir** — ve ikisi de aynı yerde
+duruyordu. Kural buradan çıkıyor: bir kompozisyonun test edilmemiş olması, onun
+çalıştığına dair kanıtın *yokluğu* değil, **çalışmadığına dair beklenti**.

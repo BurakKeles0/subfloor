@@ -302,8 +302,31 @@ def sequential_calibrate(
     Hessians would describe a model that no longer exists.
 
     `compress_fn(block_index, name, problem) -> new_weight` is where the pipeline
-    plugs in.  `inputs` is a list of batches and is updated in place, so peak
-    memory is one block plus the activations.
+    plugs in.  `inputs` is a list of batches and is updated IN PLACE, so peak
+    memory is one block plus the activations -- and so a run that checkpoints
+    can snapshot that list to resume from (`docs/STATUS.md` section 8.1).
+
+    `device` moves the whole walk: the block, the batches, `block_kwargs`, and
+    the `LayerProblem` handed to `compress_fn`.  All four have to agree, and
+    until 2026-08-25 two of them did not.  `block_kwargs` was never moved at
+    all, so the rotary embeddings stayed behind and the block died inside
+    `apply_rotary_pos_emb`; and the problem's W was pinned to the CPU while its
+    Hessian followed the block, which no argument could reconcile -- so this
+    seam could not hand the pipeline a GPU problem at all, though `run_config`
+    runs on one perfectly well.  Nothing caught either: every test ran on the
+    CPU, where `.cpu()` and a CPU `block_kwargs` are both no-ops.  That is the
+    blind spot `docs/STATUS.md` section 14.1 records, hit again by the commit
+    that moved the accumulator onto the card.
+
+    `dtype` is the problem's dtype AND the accumulator's, and on a GPU that
+    choice is expensive: float64 runs at roughly 1/64 rate here, 29.9 s per
+    block against 0.9 s in float32 -- slower even than the CPU float64 it
+    replaced (19.7 s).  `experiments/m0_cost_model.py` prices the `cuda_f32`
+    arm, so a full-model run wants `dtype=torch.float32`; leaving the default
+    in place is 36 days of M1 (15.0 -> 51.0).  The default stays float64
+    anyway, because it is the reference the float32 arm's 5.06e-06 is measured
+    against and nothing has yet been measured THROUGH this driver -- picking
+    the cheaper arm is a decision for whoever runs it, not a side effect.
 
     Returns one record per compressed layer.
     """
@@ -312,11 +335,24 @@ def sequential_calibrate(
     if not inputs:
         raise ValueError("no calibration batches")
 
+    if device is not None:
+        # Imported here rather than at module scope, the way
+        # `load_calibration_tokens` treats `datasets`: the walk is generic but
+        # the structure is the adapter's.  `to_device` recurses because the
+        # rotary entry is a TUPLE of tensors, so a flat comprehension over
+        # `block_kwargs` moves half of it and the failure surfaces several
+        # frames into transformers.
+        from hf_llama import to_device
+        block_kwargs = to_device(block_kwargs or {}, device)
+
     records: list[dict] = []
     for i, block in enumerate(blocks):
         if device is not None:
             block.to(device)
-            inputs = [b.to(device) for b in inputs]
+            # `inputs[:] =`, not `inputs =`.  Rebinding leaves the CALLER's
+            # list frozen at block 0's activations, and that list is what a
+            # checkpoint has to save to resume mid-run.
+            inputs[:] = [b.to(device) for b in inputs]
 
         accs = collect_block_statistics(
             block, inputs, block_kwargs=block_kwargs, dtype=dtype,
@@ -327,8 +363,13 @@ def sequential_calibrate(
         for name, acc in accs.items():
             mod = linears[name]
             W = mod.weight.data
+            # W follows H, wherever the accumulator put it.  `run_config` reads
+            # the two inside single expressions -- `prune` scores W against H,
+            # `output_error` contracts E with H -- so a problem split across
+            # devices is not slow, it is unusable.
+            W_ref = W.to(device=acc.H.device, dtype=dtype)
             problem = LayerProblem.from_statistics(
-                W.to(dtype).cpu(), acc.H, acc.act_norm,
+                W_ref, acc.H, acc.act_norm,
                 name=f"blocks.{i}.{name}", n_tokens=acc.n_tokens,
             )
             if progress:
@@ -347,7 +388,8 @@ def sequential_calibrate(
                 "n_in": problem.n_in,
                 "n_out": problem.n_out,
                 "n_tokens": acc.n_tokens,
-                "rel_output_error": problem.output_error(new_W.to(dtype).cpu()),
+                "rel_output_error": problem.output_error(
+                    new_W.to(device=acc.H.device, dtype=dtype)),
             })
 
         # Only now: the next block must see the COMPRESSED output.
@@ -357,7 +399,7 @@ def sequential_calibrate(
 
         if device is not None:
             block.to("cpu")
-            inputs = [b.to("cpu") for b in inputs]
+            inputs[:] = [b.to("cpu") for b in inputs]
 
     return records
 
