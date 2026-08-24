@@ -361,3 +361,58 @@ def test_inference_overhead_follows_the_block_width(block):
     got = R.index_axis_overhead_ratio(16, 0.7188, 4096, block=block)
     assert got == pytest.approx(math.log2(block) / 16, rel=1e-12)
     assert got < R.index_axis_overhead_ratio(16, 0.7188, 4096)
+
+
+# --------------------------------------------------------------------------- #
+# THE ROTATION'S KRONECKER STRUCTURE
+# --------------------------------------------------------------------------- #
+# `structured_orthogonal` builds kron(RHT(p), O(m)).  The pipeline then forms
+# `Q H Q^T` densely, at 2 k^3, when the same quantity costs 2 k^2 (p + m)
+# contracted against the factors -- 19x fewer operations at k = 2944 = 128 * 23.
+#
+# The factorization has to be EXACT, not merely orthogonal-and-similar: a
+# different valid rotation would give a different answer everywhere downstream
+# and nothing would flag it.  That is what the first test is for.
+
+@pytest.mark.parametrize("n", [64, 96, 23, 2944, 3072])
+def test_kronecker_factors_reconstruct_the_rotation_exactly(n):
+    for seed in (0, 3):
+        A, B = R.kronecker_factors(n, seed, DT)
+        q = R.structured_orthogonal(n, seed, DT)
+        if A is not None and B is not None:
+            # The seeding is the trap: structured_orthogonal gives the odd
+            # factor `seed + 1`, but only when both factors are present.
+            assert torch.equal(torch.kron(A.contiguous(), B.contiguous()), q)
+        else:
+            assert torch.equal(A if A is not None else B, q)
+
+
+@pytest.mark.parametrize("n", [64, 96, 2944])
+def test_rotate_hessian_agrees_with_the_dense_congruence(n):
+    H = torch.randn((n, n), dtype=DT)
+    H = H @ H.T / n
+    q = R.structured_orthogonal(n, 1, DT)
+    dense = R.rotate_hessian(H, q)
+    factored = R.rotate_hessian(H, factors=R.kronecker_factors(n, 1, DT))
+    # Not bit-identical -- a different association order -- but the same
+    # quantity, so in float64 they may only differ at the epsilon of the
+    # magnitudes involved.
+    assert float((dense - factored).abs().max() / dense.abs().max()) < 1e-13
+
+
+def test_rotate_hessian_validates_what_it_is_given():
+    H = torch.randn((32, 32), dtype=DT)
+    with pytest.raises(ValueError, match="either Q or factors"):
+        R.rotate_hessian(H)
+    A, B = R.kronecker_factors(16, 0, DT)
+    with pytest.raises(ValueError, match="do not span"):
+        R.rotate_hessian(H, factors=(A, B))
+
+
+def test_a_power_of_two_has_no_odd_factor_to_peel_off():
+    """Where the structure buys nothing, and the code says so rather than
+    pretending: at n = 2^a the odd factor is 1, `B` is None, and the contraction
+    degenerates to applying the Hadamard densely twice.  Measured 1.00x.  Only a
+    fast Hadamard transform would help there, and this is not one."""
+    A, B = R.kronecker_factors(64, 0, DT)
+    assert B is None and A.shape == (64, 64)

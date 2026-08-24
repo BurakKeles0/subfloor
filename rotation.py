@@ -126,6 +126,80 @@ def structured_orthogonal(
     )
 
 
+def kronecker_factors(
+    n: int,
+    seed: int = 0,
+    dtype: torch.dtype = torch.float64,
+    device: torch.device | str = "cpu",
+) -> tuple[Tensor | None, Tensor | None]:
+    """(A, B) with `kron(A, B)` EXACTLY `structured_orthogonal(n, seed, ...)`.
+
+    Either may be `None` when its factor is trivial: `B` for a power of two,
+    `A` for an odd n.  Mirrors `structured_orthogonal`'s seeding, including the
+    `seed + 1` it gives the odd factor only when both factors are present --
+    getting that wrong would produce a valid rotation that is not THE rotation,
+    and every downstream number would be quietly about a different matrix.
+    """
+    if n < 1:
+        raise ValueError(f"n must be positive, got {n}")
+    device = torch.device(device)
+    a = (n & -n).bit_length() - 1
+    p, m = 1 << a, n >> a
+    if m == 1:
+        return randomized_hadamard(p, seed, dtype, device), None
+    if p == 1:
+        return None, random_orthogonal(m, seed, dtype, device)
+    return (randomized_hadamard(p, seed, dtype, device),
+            random_orthogonal(m, seed + 1, dtype, device))
+
+
+def rotate_hessian(H: Tensor, Q: Tensor | None = None, *,
+                   factors: tuple[Tensor | None, Tensor | None] | None = None
+                   ) -> Tensor:
+    """`Q H Q^T` -- a tile's sub-Hessian moved into the rotated basis.
+
+    With `factors` this contracts against the Kronecker factors instead of
+    forming the product densely.  Same quantity, different arithmetic: the dense
+    form costs `2 k^3`, this costs `2 k^2 (p + m)`, so at k=2944 = 128*23 it is
+    2944/151 = 19x fewer operations.
+
+    Which matters twice over.  It is the largest term in a pass since the scale
+    fit stopped being one, AND it is the more ACCURATE of the two in float32:
+    the dense form accumulates k terms per output element and this one
+    accumulates p then m, so against a float64 reference it is 2.3x closer at
+    k=2944 and 2.9x at k=7912.  It gains nothing at a pure power of two, where
+    `B` is None and there is no odd factor to peel off -- a fast Hadamard
+    transform is what that case would need, and this is not one.
+
+    Not bit-identical to the dense form, which is why it is a caller's choice
+    rather than the default (`experiments/m0_rotation_value.py`).
+    """
+    if factors is None:
+        if Q is None:
+            raise ValueError("pass either Q or factors")
+        return Q @ H @ Q.transpose(-1, -2)
+
+    A, B = factors
+    n = H.shape[-1]
+    p = A.shape[0] if A is not None else 1
+    m = B.shape[0] if B is not None else 1
+    if p * m != n:
+        raise ValueError(
+            f"factors are {p}x{p} and {m}x{m}, which do not span {n} coordinates"
+        )
+    # Axes of X are (p-row, m-row, p-col, m-col); each contraction rewrites one.
+    X = H.reshape(p, m, p, m)
+    if A is not None:
+        X = torch.einsum("xa,abcd->xbcd", A, X)
+    if B is not None:
+        X = torch.einsum("yb,abcd->aycd", B, X)
+    if A is not None:
+        X = torch.einsum("zc,abcd->abzd", A, X)
+    if B is not None:
+        X = torch.einsum("wd,abcd->abcw", B, X)
+    return X.reshape(n, n)
+
+
 def block_partition(n: int, block: int) -> list[tuple[int, int]]:
     """Split `n` coordinates into consecutive chunks of at most `block`.
 

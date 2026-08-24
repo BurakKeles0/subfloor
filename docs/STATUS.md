@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-24 · HEAD `1efa971` · Testler: **552 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-24 · HEAD `0a19f90` · Testler: **564 geçiyor, 6 atlanıyor**
 
 ---
 
@@ -71,6 +71,7 @@ düşerken B ayakta kalabilir, ve o durumda çerçeve daralır, proje durmaz.
 | **Kapı B'nin istatistiksel gücü** | 600 denemelik simülasyon, **gerçek `gate_b` çağrılarak**. 5 çekiliş 2.29 σ saptıyor; ölçülen etki 6.7 σ |
 | **Transfer sapması** | `Δ = Q + τ` tahmin edicisi gerçek hattın yanında koşuldu. `T=1` kimlik kontrolü **tam sıfır**; sapma çekiliş gürültüsünü **12.3×** aşıyor |
 | **Rotasyonun değeri (gerçek katman)** | `o_proj`, gerçek ağırlıklar + 32,768 gerçek token: **−70.1% ortalama** (§5.1) |
+| **Kronecker kongrüansının kalite bedeli (gerçek katman)** | Aynı kurulum, `full` kolu birinci turu 7.0e-07 ile üretiyor. Hattın kolunda −0.03…−0.31%, tam genişlik geri beslemede +0.5…+1.9% (§6.8) |
 | **Blok genişliğinin etkisi** | 51 kol, 5 genişlik × 3 aile × 3 tile (§5.7) |
 | **Kafes çözücünün taramaya denkliği** | `nearest_e8p` ile kaba kuvvet, dört ölçekte birebir aynı indeks |
 | **Analitik aramanın taramaya denkliği** | float64'te bir milyon vektörde **sıfır** uyuşmazlık; 65,536 kodsözcüğünün hepsi kendine çözülüyor (§6.4) |
@@ -137,6 +138,7 @@ kalite etkisi**, **`fit_scale`'in doğru hedefe uydurulması**.
 | **Süpürme tile'lar arasında toplu** (`chunk="auto"`) | 08-23 | Süpürme %99.6 boşta duruyordu. Süpürmede 5–12×, çıktı bit-birebir aynı |
 | **Ölçek örneklemesi reddedildi** | 08-23 | Ortalama bedeli küçük ama tohumdan tohuma **15.8 puan** oynuyor — Kapı B'nin ayırmaya çalıştığı 0.31 σ'yı boğar (§5.8) |
 | fp16 arama **eklendi, varsayılan kapalı** | 08-23 | 1.3–1.7×, bedel ≤%1 ve **belirlenimci**. Kaliteyi ölçülebilir biçimde değiştirdiği için varsayılan olması bir karar gerektirir |
+| **Kronecker kongrüansı eklendi, varsayılan kapalı** | 08-24 | Gerçek katmanda `H512` kolunda −0.03…−0.31% (lehte), rotasyon terimi 5.52×, M1 11.98 → 8.17 g. Bit-birebir olmadığı için açmak ayrı bir karar (§6.8) |
 | **Analitik en-yakın-kodsözcüğü** taramanın yerine | 08-23 | Kodsözcüğü uzayının yapısı aramayı çözüyor. Uçtan uca 1.3–4.0×, float64'te kesin (§6.4) |
 | **Triton kuruldu, iki zincir füzyonlandı** | 08-24 | GPU %28.4 meşguldü; boşta geçenin %80'i fırlatma. Uçtan uca 1.64–1.87×, çıktı birebir aynı (§6.5) |
 | Maliyet modelinin varsayılanı **hattın koştuğu konfigürasyon** | 08-24 | Kimsenin koşmadığı bir konfigürasyonu fiyatlamak, iyimser bir sabitle aynı hata — yalnız ters yöne bakıyor |
@@ -515,28 +517,62 @@ ortak indirgemek (40 float32 çekilişinde argmin aynı), berabereyi `<=` ile
 bozmak, Python float yerine tensör ile bölmek, her adayı %0.1 oynatmak. İlk üçü
 kimse "taşıyıcı" diye savunmasın diye kaydedildi.
 
-### 6.8 Sıradaki kaldıraç: rotasyonun yapısı kullanılmıyor
+### 6.8 Rotasyonun Kronecker yapısı — gerçek katmanda ölçüldü
 
-`tile_hessian_stream` `q @ H @ q.T`'yi **yoğun GEMM** olarak yapıyor. Oysa `q`
-`kron(RHT(p), O(m))` (`rotation.structured_orthogonal`). Kronecker yapısını
-uygulayınca (ölçüldü):
+`tile_hessian_stream` `q @ H @ q.T`'yi yoğun GEMM olarak yapıyordu, oysa `q`
+`kron(RHT(p), O(m))` (`rotation.structured_orthogonal`). Çarpanlara kasılınca
+maliyet `2k³`'ten `2k²(p+m)`'e iniyor.
 
-| k | çarpanlar | yoğun | yapısal | |
+**Kalite — gerçek Llama-2-7B blok 0 `o_proj`, 512 satır, 32,768 gerçek token,
+B=1.5** (`m0_rotation_value.py --families K`). `full` kolu birinci turu
+**7.0e-07** sapmayla yeniden üretiyor, yani koşu geçerli:
+
+| çift | T=4 | T=16 | T=max |
+|---|---|---|---|
+| `full` → `fullK` (tam genişlik geri besleme) | **+1.85%** | +0.94% | +0.53% |
+| **`H512` → `H512K` (hattın koştuğu kol)** | **−0.31%** | **−0.03%** | **−0.15%** |
+
+> **Sentetik ölçüm iki mertebe yanıldı — §5.1'in aynı deseni.** Sentetik
+> Hessian'larda etki %0.003 ve işareti rastgeleydi. Gerçek katmanda tam
+> genişlik geri beslemeyle **%0.5–1.9**, ve **sistematik** (üç tile'da da aynı
+> işaret). Yani "sentetikte önemsiz" bu projede bir kanıt değil.
+
+**Ama hattın koştuğu kolda tersine dönüyor.** `hessian_block=512` ile fark
+−0.03% … −0.31%, yani ölçülemeyecek kadar küçük ve **lehte**. Mekanizma §5.7 ile
+tutarlı: geri besleme 512'lik bloklara kapatılınca faktorizasyon k×k değil
+512×512, ve rotasyonun yuvarlama farkını büyüten şey o koşullanma. Uzun menzilli
+bağlantıları atmak düzenlileştirdiği gibi hata yayılımını da bastırıyor.
+
+Kapı B'nin ayırabildiği fark hata seviyesinin %3.2'si (§5.6). `H512K` bunun
+**10 katı altında**; ama `fullK`'nın %1.85'i yalnız 1.7 kat altında — tam
+genişlik geri besleme koşulacaksa yeniden ölçülmeli.
+
+**Maliyet — ızgaranın gerçek genişliklerinde ölçüldü**, tile sayısıyla ağırlıklı:
+
+| k | çarpanlar | yoğun | kron | |
 |---|---|---|---|---|
-| 2944 | 128 × 23 | 11.1 ms | 1.7 ms | **6.59×** |
-| 7912 | 8 × 989 | 242.5 ms | 35.8 ms | **6.77×** |
-| 2560 | 512 × 5 | 7.9 ms | 2.9 ms | 2.70× |
-| 3072 | 1024 × 3 | 12.9 ms | 6.7 ms | 1.92× |
-| 4096 | 4096 × 1 | 26.3 ms | 26.4 ms | **1.00×** |
+| 2048 | 2048×1 | 3.51 ms | 3.54 ms | **0.99×** |
+| 2560 | 512×5 | 7.64 ms | 2.87 ms | 2.66× |
+| 2944 | 128×23 | 11.12 ms | 1.82 ms | 6.11× |
+| 5504 | 128×43 | 78.3 ms | 6.06 ms | 12.91× |
+| 7912 | 8×989 | 238.8 ms | 36.3 ms | 6.58× |
+| 8256 | 64×129 | 271.6 ms | 15.7 ms | **17.31×** |
 
-**Bit-birebir değil** (bağıl fark ≤4.9e-6, float32 epsilon düzeyi) — yani fp16
-ve TF32 ile aynı sınıfta, bedeli ölçülüp karar tablosuna yazılmalı.
+Ağırlıklı: **5.52×**. Tam ikinin kuvvetinde hiç kazandırmıyor (`m=1`, çarpanlara
+ayrılacak tek sayı yok) ve k=2048 ızgaranın en kalabalık genişliği — ortalamayı
+aşağı çeken şey o. Orada kazanmak için gerçek bir hızlı Hadamard gerekir.
 
-Tam ikinin kuvvetinde hiçbir şey kazandırmıyor (`m=1`, kron dejenere oluyor);
-orada gerçek bir hızlı Hadamard dönüşümü gerekir — 4096'da yoğun 26.3 ms,
-teorik alt sınır ~1 ms.
+| | şimdi | +kron |
+|---|---|---|
+| **M1** | 11.98 g | **8.17 g** (1.47×) |
+| Tasarım F | 15.56 saat | **10.61 saat** |
+| `τ` süpürmesi | 3.34 g | **2.28 g** |
 
----
+Tahminim 7.8 gündü, ölçülen 8.17 — bu kez %5 iyimserdim.
+
+**Varsayılan kapalı** (`run_config(rotate_kron=False)`): bit-birebir değil, ve
+şimdiye kadarki her kalite sayısı yoğun kongrüansla ölçüldü. Açmak bir karar
+gerektiriyor, fp16 gibi.
 
 ## 7. Denenip **reddedilenler** — tekrar denenmesin
 
@@ -793,6 +829,7 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `8f5f59f` | Bu belge yeniden yazıldı: yapılan / yapılmayan / reddedilen ayrıldı |
 | `1efa971` | **Ölçek adayları tek aramada** (§6.7); maliyet modelinin **beşinci hatası** ve iki geri çekilen ölçüm (§6.3). 17 → 12 gün, ve baskın terim codebook'tan **rotasyona** geçti |
 | `0a19f90` | **`_on_device` tuzağı kapatıldı** (§10). Üç oturumdur belgede duran, kodda durmayan hata; dört ölçümü bozmuştu |
+| *(bu değişiklik)* | **Kronecker kongrüansı gerçek katmanda ölçüldü** (§6.8). Sentetik ölçüm iki mertebe yanılmıştı; hattın kolunda etki lehte, M1 11.98 → 8.17 g. Varsayılan kapalı |
 
 ---
 

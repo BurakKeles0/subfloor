@@ -64,7 +64,8 @@ DEFAULT_TILES = (1, 2, 4, 8, 16, 32, Tl.MAX_TILE)
 # --------------------------------------------------------------------------- #
 
 def tile_hessians(
-    problem: LayerProblem, cw: C.CompactWeights, Q: Tensor | None = None
+    problem: LayerProblem, cw: C.CompactWeights, Q: Tensor | None = None,
+    factors: tuple | None = None,
 ) -> Tensor:
     """Each tile's input sub-Hessian H[S_t, S_t], optionally rotated to match.
 
@@ -76,11 +77,16 @@ def tile_hessians(
     H = problem.H
     S = cw.idx_index                                     # [n_tiles, k]
     Ht = H[S.unsqueeze(-1), S.unsqueeze(1)]              # [n_tiles, k, k]
-    return Ht if Q is None else Q @ Ht @ Q.transpose(-1, -2)
+    if Q is None:
+        return Ht
+    if factors is None:
+        return Q @ Ht @ Q.transpose(-1, -2)
+    return torch.stack([R.rotate_hessian(Ht[t], factors=factors)
+                        for t in range(Ht.shape[0])])
 
 
 def tile_hessian_stream(problem: LayerProblem, cw: C.CompactWeights,
-                        Q: Tensor | None = None):
+                        Q: Tensor | None = None, factors: tuple | None = None):
     """The same thing, one tile at a time.
 
     `tile_hessians` builds every tile's sub-Hessian in a single tensor, which is
@@ -101,7 +107,7 @@ def tile_hessian_stream(problem: LayerProblem, cw: C.CompactWeights,
         # Q is [n_tiles, k, k] when the rotation differs per tile, [k, k] when
         # every tile shares it; both are accepted so the caller need not care.
         q = Q[t] if Q.ndim == 3 else Q
-        return q @ Ht @ q.transpose(-1, -2)
+        return R.rotate_hessian(Ht, q, factors=factors)
 
     return one
 
@@ -116,6 +122,7 @@ def run_config(
     compensate: bool = True,
     rotate_axis: str | None = "index",
     rotate_block: int | None = None,
+    rotate_kron: bool = False,
     hessian_block: int | None = HESSIAN_BLOCK,
     chunk: int | str = "auto",
     scale_sample: int | None = None,
@@ -206,10 +213,20 @@ def run_config(
                                      rotated.blocks.element_size(),
                                      hessian_block)
                        if chunk == "auto" else int(chunk))
+            factors = None
+            if rotate_kron:
+                if rotate_axis != "index" or rotate_block is not None:
+                    raise ValueError(
+                        "rotate_kron applies to the full index-axis rotation; "
+                        "a block-diagonal one is a different matrix"
+                    )
+                factors = R.kronecker_factors(
+                    cw.k, seed, rotated.blocks.dtype, rotated.blocks.device)
             qb = Qz.ldlq_quantize_blocks(
                 rotated.blocks,
                 tile_hessian_stream(
-                    problem, cw, Qm if rotate_axis == "index" else None),
+                    problem, cw, Qm if rotate_axis == "index" else None,
+                    factors=factors),
                 scale=scale,
                 scale_sample=scale_sample,
                 scale_steps=scale_steps,
@@ -250,6 +267,7 @@ def run_config(
         "compensate": compensate,
         "rotate_axis": rotate_axis,
         "rotate_block": rotate_block,
+        "rotate_kron": rotate_kron,
         "hessian_block": hessian_block,
         "chunk": chunk,
         "quantize": quantize,

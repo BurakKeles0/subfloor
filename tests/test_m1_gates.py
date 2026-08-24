@@ -465,3 +465,40 @@ def test_streaming_does_not_change_what_run_config_reports(problem):
     W_hat = C.scatter(R.unrotate(rot.with_blocks(qb.values), Qm, axis="index"))
     assert problem.output_error(W_hat) == pytest.approx(r["rel_output_error"],
                                                         rel=1e-12)
+
+
+# --------------------------------------------------------------------------- #
+# THE ROTATION'S KRONECKER STRUCTURE
+# --------------------------------------------------------------------------- #
+
+def test_rotate_kron_is_the_same_rotation_not_a_different_one(problem):
+    """`rotate_kron` changes the ARITHMETIC of `Q H Q^T`, nothing else.
+
+    So the two arms have to land within float's own error of each other.  They
+    are not bit-identical -- the association order differs -- which is why this
+    is a caller's choice priced in `experiments/m0_rotation_value.py` rather
+    than a default.  What must never happen is a real divergence: that would
+    mean the factors are not the rotation the blocks were rotated by, and no
+    other test would catch it because both answers look reasonable.
+    """
+    for t in (2, 4, Tl.MAX_TILE):
+        dense = M.run_config(problem, budget_bits=1.5, tile_size=t)
+        kron = M.run_config(problem, budget_bits=1.5, tile_size=t,
+                            rotate_kron=True)
+        if "skipped" in dense:
+            continue
+        assert dense["rotate_kron"] is False and kron["rotate_kron"] is True
+        assert kron["rel_output_error"] == pytest.approx(
+            dense["rel_output_error"], rel=1e-6)
+
+
+def test_rotate_kron_refuses_a_rotation_that_is_not_the_kronecker_one(problem):
+    """A block-diagonal rotation is a different matrix, and its factors are per
+    block.  Silently using the full-width factors would rotate the Hessian by
+    something the blocks were never rotated by."""
+    with pytest.raises(ValueError, match="block-diagonal one is a different"):
+        M.run_config(problem, budget_bits=1.5, tile_size=4,
+                     rotate_kron=True, rotate_block=8)
+    with pytest.raises(ValueError, match="full index-axis rotation"):
+        M.run_config(problem, budget_bits=1.5, tile_size=4,
+                     rotate_kron=True, rotate_axis="line")

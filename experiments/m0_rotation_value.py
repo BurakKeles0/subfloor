@@ -173,6 +173,7 @@ class Arm:
     rotate_axis: str | None = "index"
     rotate_block: int | None = None
     hessian_block: int | None = None
+    rotate_kron: bool = False
 
 
 def arms_for(blocks=DEFAULT_BLOCKS, families=("R", "H", "RH")) -> list[Arm]:
@@ -184,6 +185,16 @@ def arms_for(blocks=DEFAULT_BLOCKS, families=("R", "H", "RH")) -> list[Arm]:
     -70% survived" are different questions and one reference cannot answer both.
     """
     out = [Arm("plain", rotate_axis=None), Arm("full")]
+    if "K" in families:
+        # Same rotation, contracted against its Kronecker factors instead of
+        # formed densely (`rotation.rotate_hessian`).  Not a width family, so it
+        # takes no `b`: paired against `full` and against `H512`, the arm the
+        # pipeline actually runs, because the question is whether an arithmetic
+        # that is 19x cheaper and measurably MORE accurate in float32 changes
+        # the answer on a real layer.
+        out.append(Arm("fullK", rotate_kron=True))
+        out.append(Arm("H512", hessian_block=512))
+        out.append(Arm("H512K", hessian_block=512, rotate_kron=True))
     for b in blocks:
         if "R" in families:
             out.append(Arm(f"R{b}", rotate_block=b))
@@ -225,6 +236,7 @@ def compare(problem, *, budget: float = 1.5, tiles=DEFAULT_TILES,
             r = M.run_config(problem, budget_bits=budget, tile_size=t,
                              rotate_axis=arm.rotate_axis,
                              rotate_block=arm.rotate_block,
+                             rotate_kron=arm.rotate_kron,
                              hessian_block=arm.hessian_block, seed=seed)
             if "skipped" in r:
                 measured = {}
@@ -244,6 +256,7 @@ def compare(problem, *, budget: float = 1.5, tiles=DEFAULT_TILES,
                 "tile_size": t,
                 "arm": arm.name,
                 "rotate_block": arm.rotate_block,
+                "rotate_kron": arm.rotate_kron,
                 "hessian_block": arm.hessian_block,
                 "density": r["density_realized"],
                 "k": k,
@@ -334,6 +347,32 @@ def _verdict(out: dict) -> None:
               f"{worst[1]:.2e} at T={worst[0]}{flag}")
 
     print("\n" + "-" * 78)
+    pairs = [("full", "fullK"), ("H512", "H512K")]
+    have = {r["arm"] for r in rows}
+    if any(a in have and b in have for a, b in pairs):
+        print()
+        print("-" * 78)
+        print("  K   same rotation, contracted against its Kronecker factors")
+        print(f"    {'pair':>14} {'T':>5} {'dense':>9} {'kron':>9} {'kron vs dense':>14}")
+        worst = 0.0
+        for a, b in pairs:
+            for t in tiles:
+                da = next((r for r in rows if r["arm"] == a and r["tile_size"] == t), None)
+                kb = next((r for r in rows if r["arm"] == b and r["tile_size"] == t), None)
+                if da is None or kb is None:
+                    continue
+                rel = kb["rel_output_error"] / da["rel_output_error"] - 1.0
+                worst = max(worst, abs(rel))
+                print(f"    {a + '/' + b:>14} {str(t):>5} {da['rel_output_error']:9.5f}"
+                      f" {kb['rel_output_error']:9.5f} {rel * 100:+13.4f}%")
+        # Gate B separates neighbouring tiles at 0.31 sigma, which is 3.2% of
+        # the error level (docs/STATUS.md 5.6 and 5.8).  Far under that is below
+        # what M1 can see at all; approaching it would have to be argued for.
+        verdict = "below" if worst < 0.032 else "NOT below"
+        print()
+        print(f"    worst |change| {worst * 100:.4f}%  against the 3.2% Gate B "
+              f"can resolve -> {verdict} it")
+
     for fam, label in (("H", "feedback confined, rotation full"),
                        ("RH", "both confined")):
         cand = [r for r in rows if r["arm"][:len(fam)] == fam
@@ -375,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--blocks", nargs="*", type=int, default=list(DEFAULT_BLOCKS),
                     help="rotation / feedback widths to sweep")
     ap.add_argument("--families", nargs="*", default=["R", "H", "RH"],
-                    choices=["R", "H", "RH"])
+                    choices=["R", "H", "RH", "K"])
     ap.add_argument("--seqs", type=int, default=16)
     ap.add_argument("--seqlen", type=int, default=2048)
     ap.add_argument("--dataset", default="wikitext2", choices=["wikitext2", "c4"])
