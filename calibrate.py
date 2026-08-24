@@ -264,10 +264,18 @@ def collect_block_statistics(
             accs[_name].update(args[0].detach())
         handles.append(mod.register_forward_hook(hook, with_kwargs=False))
 
+    block_device = next(block.parameters()).device
     try:
         with torch.no_grad():
             for batch in inputs:
-                block(batch, **(block_kwargs or {}))
+                # ONE batch on the device at a time.  The whole calibration set
+                # is 4.0 GiB at the preregistration's 128 x 4096 on a 4096-wide
+                # model, against 31 MiB for a single window -- and it would sit
+                # there beside the Hessians, the block and the compression's own
+                # chunk, on a card with 6.8 GiB usable.  The transfer it costs
+                # was measured at about 220 s per point, which is nothing
+                # against hours (`docs/STATUS.md` section 7.2).
+                block(batch.to(block_device), **(block_kwargs or {}))
     finally:
         for h in handles:
             h.remove()
@@ -363,10 +371,6 @@ def sequential_calibrate(
     for i, block in enumerate(blocks):
         if device is not None:
             block.to(device)
-            # `inputs[:] =`, not `inputs =`.  Rebinding leaves the CALLER's
-            # list frozen at block 0's activations, and that list is what a
-            # checkpoint has to save to resume mid-run.
-            inputs[:] = [b.to(device) for b in inputs]
 
         accs = collect_block_statistics(
             block, inputs, block_kwargs=block_kwargs, dtype=dtype,
@@ -406,14 +410,17 @@ def sequential_calibrate(
                     new_W.to(device=acc.H.device, dtype=dtype)),
             })
 
-        # Only now: the next block must see the COMPRESSED output.
+        # Only now: the next block must see the COMPRESSED output.  Written
+        # back through `inputs[j]`, not into a new list: the caller's list is
+        # the checkpoint unit, and rebinding would leave it frozen at block 0.
+        target = next(block.parameters()).device
         with torch.no_grad():
             for j, batch in enumerate(inputs):
-                inputs[j] = _block_forward(block, batch, block_kwargs)
+                out = _block_forward(block, batch.to(target), block_kwargs)
+                inputs[j] = out.to(batch.device)
 
         if device is not None:
             block.to("cpu")
-            inputs[:] = [b.to("cpu") for b in inputs]
 
         # Only here: the block is final and `inputs` is what block i+1 sees.
         if on_block_done:

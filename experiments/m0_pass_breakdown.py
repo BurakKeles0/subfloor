@@ -173,9 +173,17 @@ def one_tile_size(problem, tile_size, *, budget: float = 1.5, seed: int = 0,
             torch.cuda.synchronize()
         wrapped_seconds = time.perf_counter() - t0
 
-    # The wrappers must not have changed the answer, only the clock.
-    assert wrapped["rel_output_error"] == clean["rel_output_error"], (
-        "wrapping changed the result -- the breakdown is of something else")
+    # The wrappers must not have changed the answer, only the clock.  Reported
+    # with its magnitude rather than as a bare failure: a difference at
+    # float32's epsilon says the pipeline has a non-deterministic reduction and
+    # the guard is too strict, while a large one says the instrumentation is
+    # measuring something else -- and those want opposite responses.
+    if wrapped["rel_output_error"] != clean["rel_output_error"]:
+        c, w = clean["rel_output_error"], wrapped["rel_output_error"]
+        raise AssertionError(
+            f"wrapping changed the result -- the breakdown is of something "
+            f"else.  clean={c!r} wrapped={w!r} relative={abs(w - c) / c:.3e}"
+        )
 
     progress(f"  T={tile_size}: {clean_seconds:.1f}s clean, "
              f"{wrapped_seconds:.1f}s wrapped "
