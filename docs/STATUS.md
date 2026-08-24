@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-24 · HEAD `0a19f90` · Testler: **564 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-24 · HEAD `de8a5ec` · Testler: **573 geçiyor, 6 atlanıyor**
 
 ---
 
@@ -110,8 +110,9 @@ testlerden çağrılıyor. Aynı şey `τ` süpürmesi için de geçerli — mal
 modellenmiş, kodu yazılmamış (§8.3).
 
 Ayrıca hiç ölçülmemiş: **eval'in gerçek maliyeti** (238 s yalnız WikiText-2;
-ön-kayıt §4 C4'ü de şart koşuyor ve 5 zero-shot görev istiyor), **TF32'nin
-kalite etkisi**, **`fit_scale`'in doğru hedefe uydurulması**.
+ön-kayıt §4 C4'ü de şart koşuyor ve 5 zero-shot görev istiyor) ve
+**`fit_scale`'in doğru hedefe uydurulması**. *(TF32 bu listedeydi; 08-24'te
+ölçüldü ve reddedildi — §6.9.)*
 
 ---
 
@@ -574,6 +575,67 @@ Tahminim 7.8 gündü, ölçülen 8.17 — bu kez %5 iyimserdim.
 şimdiye kadarki her kalite sayısı yoğun kongrüansla ölçüldü. Açmak bir karar
 gerektiriyor, fp16 gibi.
 
+### 6.9 Üç hassasiyet kaldıracı, tek tek ve kombine
+
+`m0_precision_levers.py` — 8 kol (2³), gerçek katman, kalite ve hız ayrı
+fazlarda (hız faz'ı boş GPU istiyor, kalite istemiyor).
+
+**Kalite** (gerçek `o_proj`, `-` kolun'a göre; eksi = **daha iyi**):
+
+| kol | T=4 | T=16 | T=max |
+|---|---|---|---|
+| `tf32` | **ÇALIŞMIYOR** | +2.36% | −0.78% |
+| `kron` | −0.31% | −0.03% | −0.15% |
+| `fp16` | −0.34% | +0.90% | −0.07% |
+| `fp16+kron` | −1.54% | +1.26% | +0.11% |
+| `kron+tf32` | **ÇALIŞMIYOR** | **ÇALIŞMIYOR** | +4.80% |
+| `fp16+kron+tf32` | **ÇALIŞMIYOR** | **ÇALIŞMIYOR** | +4.65% |
+
+**Hız** (boş GPU, 4 dönüşümlü geçiş, medyan):
+
+| kol | T=4 | T=16 | T=max | medyan |
+|---|---|---|---|---|
+| `tf32` | ÇALIŞMIYOR | 1.06× | 1.03× | 1.04× |
+| `kron` | 1.18× | 1.11× | 1.02× | 1.11× |
+| `fp16` | 1.09× | 1.16× | 1.22× | 1.16× |
+| **`fp16+kron`** | **1.29×** | **1.30×** | 1.20× | **1.29×** |
+
+> **TF32 ölçülecek bir kalite bedeli değil — hattı kırıyor.** §3.3 onu
+> "hiç ölçülmemiş" diye taşıyordu; ölçüldü ve T=4'te döndürülmüş alt-Hessian
+> Cholesky'den geçmiyor. Kongrüansı tek başına TF32'ye almak hiçbir bloku
+> çökertmiyor ama **sönümleme payının %85'ini yiyor** (kalan 0.154×); maske ve
+> telafi de TF32 altında değişince bir tile payı aşıyor. Çalıştığı yerlerde de
+> en kötü kalite onda: kombine hâlde **+%4.8**, Kapı B'nin ayırabildiği %3.2'yi
+> **aşan tek kol**. Kapandı.
+
+**Bileşim — ve sıfır hipotezi çarpım değil.** Zamanın `a` kesrini kaldıran bir
+kaldıraç `1/(1−a)` verir, ayrık işe binen iki tanesi `1/(1−a−b)` — ki bu
+`1/((1−a)(1−b))` çarpımından **büyük**. Çarpımı beklenti saymak her bağımsız
+çifti sinerjik gösterir ve asıl örtüşmeyi gizler. Doğru null'a göre:
+
+| çift | ayrık olsaydı | ölçülen | |
+|---|---|---|---|
+| `fp16+kron` | 1.30× | 1.29× | **%99 — bağımsız** |
+| `fp16+tf32` | 1.21× | 1.25× | %103 — bağımsız |
+| `kron+tf32` | 1.16× | 1.07× | **%92 — rotasyonu paylaşıyorlar** |
+
+Yani `kron` ve `tf32` aynı terime biniyor, `fp16` ayrı terime. Öngörülmüştü ve
+ölçüm tuttu.
+
+**M1'e etkisi** (model, ölçülen terim oranlarıyla; `o_proj`'un %24'ü rotasyon,
+M1 ortalaması `down_proj` ağırlıklı olduğu için daha büyük):
+
+| kol | M1 | hızlanma | Tasarım F | `τ` |
+|---|---|---|---|---|
+| — | 11.98 g | 1.00× | 15.6 saat | 3.34 g |
+| `fp16` | 10.44 g | 1.15× | 13.6 saat | 2.91 g |
+| `kron` | **8.17 g** | 1.47× | 10.6 saat | 2.28 g |
+| **`fp16+kron`** | **6.63 g** | **1.81×** | **8.6 saat** | 1.85 g |
+
+M1 düzeyinde de ayrık: 1.15 ve 1.47'den ayrık-null 1.82×, ölçülen 1.81×.
+
+---
+
 ## 7. Denenip **reddedilenler** — tekrar denenmesin
 
 Bu bölüm kasıtlı olarak uzun. Bir fikrin denenip elendiğini kaydetmemek, onu
@@ -587,7 +649,7 @@ ikinci kez denemek demek.
 | **Adım azaltma** (`n_steps` 24→6) | +45.6 / +17.8 / +13.6% | Kaliteyi doğrudan bozuyor, ve `n12`'de işaret bile tutarsız |
 | **Katman-başı ölçek** (`per_layer`) | %11, yeniden ölçümde T=4'te **+87.9%** | Küçük `T`'de tile'ların ölçekleri gerçekten farklı |
 | **Rotasyonu daraltmak** (blok-köşegen RHT) | `R8` ≈ rotasyonsuz (−3.3%) | Rotasyonun işi kalın kuyruğu **geniş** yaymak; 8 koordinat içinde norm değişmez |
-| **TF32** | Hessian 1.74×, rotasyon 1.66×, **arama 1.04×** | Mantisi 10 bite düşürüyor ve Hessian LDLQ'nun girdisi — kalite ölçülmeden alınmaz |
+| **TF32** | **hattı kırıyor** | Ölçüldü 08-24 ve iş kalite yüzdesine kalmadı: T=4'te döndürülmüş alt-Hessian Cholesky'den geçmiyor, sönümleme payının %85'i gidiyor. Çalıştığı yerde de +%4.8 ile Kapı B'nin %3.2'sini aşan tek kol (§6.9). **Kapandı** |
 | **fp16 arama** | 1.3–1.7×, bedel ≤%1 | Reddedilmedi, **varsayılan kapalı**: kaliteyi ölçülebilir biçimde değiştirdiği için bir karar gerektirir |
 
 ### 7.2 Mühendislik gerekçesiyle elenenler
@@ -773,6 +835,7 @@ yok. §8.1'in checkpoint'i bu yüzden kritik yolda.
 | `experiments/m0_cost_model.py` | ölçülen eğrilerden gerçek koşu maliyeti |
 | `experiments/m0_rotation_value.py` | rotasyon gerçek katmanda kazandırıyor mu; blok genişliği süpürmesi |
 | `experiments/m0_scale_fit.py` | ölçek uydurmayı ucuzlatmanın kalite bedeli |
+| `experiments/m0_precision_levers.py` | fp16 / kron / TF32, tek tek ve sekiz kombinasyonda |
 
 **Belgeler:** `docs/spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı** — iki kutu kaldı, artık maliyet engeli yok) ·
@@ -830,6 +893,7 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `1efa971` | **Ölçek adayları tek aramada** (§6.7); maliyet modelinin **beşinci hatası** ve iki geri çekilen ölçüm (§6.3). 17 → 12 gün, ve baskın terim codebook'tan **rotasyona** geçti |
 | `0a19f90` | **`_on_device` tuzağı kapatıldı** (§10). Üç oturumdur belgede duran, kodda durmayan hata; dört ölçümü bozmuştu |
 | `de8a5ec` | **Kronecker kongrüansı gerçek katmanda ölçüldü** (§6.8). Sentetik ölçüm iki mertebe yanılmıştı; hattın kolunda etki lehte, M1 11.98 → 8.17 g. Varsayılan kapalı |
+| *(bu değişiklik)* | **Üç hassasiyet kaldıracı, tek tek ve kombine** (§6.9). TF32 **hattı kırıyor** — §3.3'ün açık kalemi kapandı. `fp16+kron` bağımsız, birlikte M1 11.98 → **6.63 g** |
 
 ---
 
