@@ -29,7 +29,7 @@ The model describes the pipeline as it now runs: feedback confined to width-512
 blocks, the sweep chunked across tiles, the scale fit's 24 candidates evaluated
 in one search call -- all three bit-identical to what they replace -- and the
 calibration Hessians accumulated on the block's own device rather than copied to
-the CPU, which is 25x on a term that had never been charged.  M1 is 15.0 days;
+the CPU, which is 25x on a term that had never been charged.  M1 is 14.9 days;
 without the calibration fix the same grid would be 41.
 
 What is left is no longer `fit_scale`.  It was 83% of a tile and is 28%, so the
@@ -81,9 +81,20 @@ The corrections, in order, because each one is a way this file was wrong:
      M1.  See `COMPENSATE_TIMINGS`, and note that this one was found by looking
      for what was missing rather than by anything failing.
 
+  8. it had NO SAMPLE BELOW FOUR LINES, so T=1 and T=2 borrowed the four-line
+     per-weight rate.  They are nothing like it: the constant falls 41x from one
+     line to 4096, and 8x over the first step alone, because `fit_scale`'s fixed
+     cost is amortized over 128 vectors in a one-line tile against 1280 at T=4.
+     The correction does not move M1 much -- the fine end goes up and the coarse
+     end comes down, 15.0 to 14.91 days -- but it moves the SHAPE: this file
+     used to report the grid's cost peaking in the middle, at T=4, and it peaks
+     at the fine end.  Found by fixing provenance rather than by looking for it,
+     which is the third time that has happened here.
+
 And one thing that was not a modelling error but a measurement that did not
 hold: two of the three `cuda_f32` tile timings recorded on 2026-08-24 do not
-reproduce, both optimistically (1.28x and 1.65x).  See `TILE_TIMINGS`.
+reproduce, both optimistically (1.28x and 1.65x).  They have since been replaced
+outright, along with the tile counts they never recorded (`TILE_TIMINGS`).
 
 The through-line is that composing a cost from kernel microbenchmarks does not
 work here.  Where a curve is measured, it is measured at the sizes the code will
@@ -237,24 +248,52 @@ SCALE_FIT_MULTIPLIER = 1.39
 #: multiply: Triton's gain WAS the launch overhead, and batching the candidates
 #: removes the same overhead a level up.  Two fixes for one waste share it;
 #: they do not compound.  The model must never be handed both factors.
-#: STALE AS OF 2026-08-25, DELIBERATELY NOT PATCHED.  `quantize` moved two
-#: constants that decide which search path the LDLQ sweep takes
-#: (`_ANALYTIC_MIN_ROWS` 384 -> 320, `CHUNK_TARGET_ROWS` 1024 -> 2048), and
-#: measured at the grid's real shapes and real tile counts the tile gets faster:
+#: (k, lines, n_tiles, seconds per tile) for `ldlq_quantize_blocks`.
 #:
-#:      T=8  k=2816   1.17x        T=32 k=3008   1.55x
-#:      T=16 k=2944   1.38x        T=16 k=7912   1.15x     weighted 1.25x
+#: THE TILE COUNT IS PART OF THE MEASUREMENT, and leaving it out was a real gap
+#: rather than a missing detail.  `auto_chunk` turns `n_tiles` into a chunk and
+#: the chunk into the row count `_nearest` sees, and the row count decides which
+#: search path runs.  A tile time is therefore only interpretable next to the
+#: tile count it was taken at -- and until 2026-08-25 these rows carried none.
+#: The cost of that surfaced the same day: two constants moved, and the old rows
+#: could not be scaled to the new behaviour because nobody could say what regime
+#: they had been measured in.
 #:
-#: So `m1_cost` now reports an UPPER BOUND -- roughly 4% high, about 14.4 days
-#: against the 15.0 it prints.  The factors are not applied here because these
-#: rows never recorded the `n_tiles` they were measured with, and `n_tiles` is
-#: what `auto_chunk` turns into a row count, which is the very thing that
-#: changed.  Multiplying a number whose regime is unknown by a factor measured
-#: in a known one is how this model got five of its seven errors.  The fix is to
-#: re-measure the three rows WITH their tile counts recorded, not to patch them.
+#: Re-measured by `experiments/m0_tile_timings.py`, which DERIVES the shapes from
+#: `accounting.density_for_budget` rather than choosing them: every cell of the
+#: tile axis at B=1.5 on the 4096x4096 layer, four of every seven linears.
+#:
+#: TWO SAMPLE SHAPES CHANGED, DELIBERATELY:
+#:   * (3072, 128) is retired.  No cell of the grid has 128 lines -- it was a
+#:     probe standing in for the coarse end, and at T=max the real shape is 4096
+#:     lines in ONE tile, a different regime entirely.
+#:   * T=1, 2, 8 and 32 are added.  `codebook_seconds_per_vector` picks the
+#:     nearest measured line count in log space, and with samples only at 4, 16
+#:     and 128 the entire fine end of the grid snapped to a single point.
+#:
+#: THE NEW NUMBERS ARE NOT COMPARABLE TO THE OLD ONES, and saying so is the
+#: lesson.  At the two shapes both tables share the new times are 1.42x and
+#: 2.15x lower; the constant change measured 1.38x at (2944, 16), so the rest is
+#: the old measurement's unknown tile count -- fewer tiles give a smaller chunk
+#: and a higher per-tile cost.  There is no way to separate the two after the
+#: fact, which is precisely why the column now exists.
+#:
+#: `cpu_f64` is NOT re-measured: the pipeline runs cuda/float32 (decision
+#: 2026-08-23) and that row exists only for comparison.  Its tile count is 1 by
+#: construction -- it describes the one-tile-at-a-time arrangement -- so it is
+#: the one place the provenance was never actually missing.
 TILE_TIMINGS = {
-    "cpu_f64": ((2560, 4, 1.741), (2944, 16, 8.721), (3072, 128, 95.83)),
-    "cuda_f32": ((2560, 4, 0.0142), (2944, 16, 0.0404), (3072, 128, 0.2811)),
+    "cpu_f64": ((2560, 4, 1, 1.741), (2944, 16, 1, 8.721),
+                (3072, 128, 1, 95.83)),
+    "cuda_f32": (
+        (1024, 1, 4096, 0.00729346),
+        (2048, 2, 2048, 0.00880856),
+        (2560, 4, 1024, 0.00996955),
+        (2816, 8, 512, 0.0140972),
+        (2944, 16, 256, 0.018819),
+        (3008, 32, 128, 0.0300036),
+        (3072, 4096, 1, 1.9503),
+    ),
 }
 
 #: The `hessian_block` each row of `TILE_TIMINGS` was measured under, or `None`
@@ -593,12 +632,17 @@ def codebook_seconds_per_vector(rates: dict, setup: str,
     time the tile never spent and undercharges the codebook by up to 34%.
 
     The constant is NOT one number.  A tile's line count is its tile size, and
-    per-weight cost falls sharply with it: bigger batches amortize both the
-    codebook load and the lattice decoder's fixed cost, and below a threshold
-    the decoder is not used at all.  On this machine the residual runs 1.72e-5
-    at four lines down to 5.6e-6 at 128.  Charging every tile size the
-    four-line rate would overstate the coarse end threefold, which is precisely
-    the end the granularity question cares about.
+    per-weight cost falls sharply with it: bigger batches amortize the codebook
+    load, the lattice decoder's fixed cost, and above all `fit_scale`'s, since
+    that is fitted once per tile over however many vectors the tile holds.
+    Measured across the whole tile axis it runs 6.36e-06 per weight at one line
+    down to 1.55e-07 at 4096 -- a factor of 41, and 8x over the first step
+    alone.
+
+    Which is why the sample set now covers every line count the grid uses.  With
+    samples only at 4, 16 and 128 the lookup below snapped T=1 and T=2 onto the
+    four-line rate and understated them roughly twofold, and that is the end of
+    the grid where the unstructured baseline lives.
 
     `lines=None` keeps the old conservative behaviour and returns the worst.
     """
@@ -612,7 +656,7 @@ def codebook_seconds_per_vector(rates: dict, setup: str,
     measured_block = rates["setups"][setup].get(
         "tile_timing_block", TILE_TIMING_BLOCK.get(setup))
     fitted = []
-    for k, sample_lines, seconds in samples:
+    for k, sample_lines, _n_tiles, seconds in samples:
         residual = seconds - cholesky_seconds(k, rates, setup,
                                               block=measured_block)
         if residual > 0:

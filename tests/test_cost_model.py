@@ -27,12 +27,16 @@ RATES = {
             "cholesky_flops_per_s": 1e12,
             "codebook_flops_per_s_small": 1e10,
             "codebook_flops_per_s_large": 1e11,
-            # (k, lines, seconds).  Same width, different line counts, and
-            # shaped like the real measurements: per-weight cost FALLS as the
-            # batch grows (2e-6 at ten lines, 1e-6 at a hundred), on top of a
-            # 1.67e-3 s Cholesky.  Numbers chosen so both residuals come out
-            # round and every expectation below is checkable by hand.
-            "tile_timings": ((1000, 10, 2.167e-2), (1000, 100, 1.0167e-1)),
+            # (k, lines, n_tiles, seconds).  Same width, different line
+            # counts, and shaped like the real measurements: per-weight cost
+            # FALLS as the batch grows (2e-6 at ten lines, 1e-6 at a hundred),
+            # on top of a 1.67e-3 s Cholesky.  Numbers chosen so both residuals
+            # come out round and every expectation below is checkable by hand.
+            # The tile count rides along because a tile time means nothing
+            # without it: `auto_chunk` turns it into the row count that decides
+            # which search path `_nearest` takes.
+            "tile_timings": ((1000, 10, 64, 2.167e-2),
+                             (1000, 100, 64, 1.0167e-1)),
         }
     },
 }
@@ -145,7 +149,7 @@ def test_timing_comes_from_the_measured_tile_fit():
     fake = RATES["setups"]["fake"]
     chol = CM.CHOL_FLOPS_PER_K3 * 1000 ** 3 / fake["cholesky_flops_per_s"]
     residuals = {lines: (sec - chol) / (lines * k)
-                 for k, lines, sec in fake["tile_timings"]}
+                 for k, lines, _n, sec in fake["tile_timings"]}
 
     # exact line counts pick their own sample
     for lines, want in residuals.items():
@@ -275,7 +279,7 @@ def test_the_cholesky_is_subtracted_at_the_width_it_was_measured_under():
     got = CM.codebook_seconds_per_vector(blocked, "fake", 10)
     assert got > full, "subtracting less Cholesky must charge the codebook more"
 
-    k, lines, sec = RATES["setups"]["fake"]["tile_timings"][0]
+    k, lines, _n, sec = RATES["setups"]["fake"]["tile_timings"][0]
     want = (sec - CM.cholesky_seconds(k, blocked, "fake", block=250)) / (lines * k)
     assert got == pytest.approx(want)
 
@@ -298,7 +302,7 @@ def test_the_per_weight_constant_falls_with_the_line_count():
     """Bigger tiles amortize the codebook load and the decoder's fixed cost.
     If this ever inverted, the model would be reading its samples backwards."""
     fake = RATES["setups"]["fake"]
-    counts = sorted(lines for _, lines, _ in fake["tile_timings"])
+    counts = sorted(lines for _, lines, _, _ in fake["tile_timings"])
     values = [CM.codebook_seconds_per_vector(RATES, "fake", n) for n in counts]
     assert values == sorted(values, reverse=True)
 
@@ -606,6 +610,23 @@ def test_no_single_term_dominates_the_pass_any_more():
     docstring was already claiming -- no term runs away from the others -- plus
     a check on WHICH one leads, so the next person reads the answer instead of
     inheriting mine.
+
+    2026-08-25: AND THE REPLACEMENT EXPIRED TOO, which is worth more than the
+    number it was guarding.  `TILE_TIMINGS` was re-measured with the tile counts
+    recorded, and with a sample below four lines for the first time.  At T=1 the
+    codebook term is 2.86h against 0.46 of rotation and 0.34 of Cholesky -- 3.6x
+    the other two together.  So "nothing is the wall" was itself a fact with an
+    expiry date: it held while the fine end was priced off the four-line rate,
+    and the fine end is not like the four-line rate at all.
+
+    The wall at T=1 is `fit_scale`'s per-tile fixed cost.  A one-line tile gives
+    it 128 vectors to amortize over; a T=4 tile gives it 1280.  T=1 is also the
+    unstructured baseline the whole thesis compares against, so this is not a
+    corner of the grid to wave at.
+
+    What is asserted now is the shape rather than a slogan: the middle and
+    coarse end are balanced, the fine end is not, and the fine end's leader is
+    the codebook.
     """
     import json
     from pathlib import Path
@@ -616,9 +637,10 @@ def test_no_single_term_dominates_the_pass_any_more():
     if "cuda_f32" not in rates["setups"]:
         pytest.skip("no cuda rates measured on this machine")
 
-    # No term runs away from the rest.  Stated on the terms themselves rather
-    # than on any one of them, so it survives the lead changing hands again.
-    for tile in (1, 4, 16):
+    # From T=4 outward no term runs away from the rest.  Stated on the terms
+    # themselves rather than on any one of them, so it survives the lead
+    # changing hands again -- which it has done three times.
+    for tile in (4, 16):
         c = CM.model_cost(tile, 1.5, rates, "cuda_f32")
         terms = {k: c[k + "_seconds"]
                  for k in ("codebook", "rotation", "cholesky")}
@@ -628,6 +650,17 @@ def test_no_single_term_dominates_the_pass_any_more():
             f"{top} has run away from the other terms at T={tile}; the model "
             "was rebuilt around no single wall, so this means one is back"
         )
+
+    # And at the fine end one HAS come back.  Pinned as a measured fact, with
+    # its cause, so the next person reads it instead of inheriting the slogan.
+    fine = CM.model_cost(1, 1.5, rates, "cuda_f32")
+    others = fine["rotation_seconds"] + fine["cholesky_seconds"]
+    assert fine["codebook_seconds"] > 3 * others, (
+        "the codebook no longer dominates at T=1; it was 3.6x the rotation and "
+        "Cholesky together as of 2026-08-25, driven by `fit_scale`'s fixed cost "
+        "over a one-line tile's 128 vectors -- if that has changed, the fine "
+        "end of the grid has a different cost story and section 6.1 is stale"
+    )
 
     # Which term leads is a measured fact and it has changed twice.  Pinning it
     # is the point: the ROTATION is now the largest at the grid's expensive
