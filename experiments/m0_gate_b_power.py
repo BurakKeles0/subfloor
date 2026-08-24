@@ -257,7 +257,11 @@ def measure_noise(*, n_draws: int = 8, n_out: int = 128, n_in: int = 256,
         problem = redraw_activations(
             n_out, n_in, n_samples, data_seed=s if axis == "calibration" else 0)
         for t in tiles:
+            # Pinned to the pre-2026-08-25 pipeline (the three levers off):
+            # the sigma this script measures is what Gate B's power rests on.
             r = M.run_config(problem, budget_bits=budget, tile_size=t,
+                             rotate_kron=False, search_dtype=None,
+                             compensate_block=None,
                              seed=0 if axis == "calibration" else s)
             by_tile[t].append(None if "skipped" in r else r["rel_output_error"])
             if progress:

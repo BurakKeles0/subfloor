@@ -58,6 +58,51 @@ HESSIAN_BLOCK = 512
 DEFAULT_BUDGETS = (1.75, 1.60, 1.50)
 DEFAULT_TILES = (1, 2, 4, 8, 16, 32, Tl.MAX_TILE)
 
+# --------------------------------------------------------------------------- #
+# What the pipeline runs with (user decision, 2026-08-25)
+#
+# All three were measured, tested and left OFF on 2026-08-24 because every
+# quality number to that point had been taken without them.  They are on now,
+# and together they take M1 from 15.0 days to 7.5.  The comparability that costs
+# is not being waved at: the shakedown run measures the same configuration both
+# ways once, so every later number can be tied back to the M0 baseline through a
+# MEASURED offset instead of an assumption.
+#
+# Named here rather than written into the parameter defaults for a reason.
+# `run_config` is two things at once -- the pipeline, and the harness the M0
+# experiments study it with -- and those want different defaults.  A constant
+# the pipeline reads, with the resolved value written into every record, lets
+# both be true without either being silent.
+#
+# TF32 is NOT here and is not a fourth lever: it breaks the pipeline outright
+# (rotated sub-Hessian fails Cholesky, 85% of the damping margin gone, section
+# 6.9).
+# --------------------------------------------------------------------------- #
+
+#: Contract the sub-Hessian rotation against its Kronecker factors instead of
+#: forming it densely.  5.52x on the rotation term; on a real layer the quality
+#: moves -0.03..-0.31%, i.e. in our favour (section 6.8).
+PIPELINE_ROTATE_KRON = True
+
+#: Search the codebook in fp16.  1.24-1.52x on the codebook term, at most 0.90%
+#: quality (section 6.9).  Verified not to disturb the search routing: the
+#: decoder's miss fraction is the same to within 0.1 pp in fp16 and fp32, so the
+#: inequality section 6.13 rests on still holds.
+PIPELINE_SEARCH_DTYPE = torch.float16
+
+#: Defer each block of the compensation sweep's errors into one matmul.  6.63x
+#: on the term; not bit-identical, but the difference is 2.7e-06..4.8e-06, which
+#: is float32's own epsilon at these sizes (section 6.11c).
+PIPELINE_COMPENSATE_BLOCK = 512
+
+#: "Whatever the pipeline runs with."  A sentinel rather than `None` because
+#: `None` is already a meaningful value for two of the three -- it means "no
+#: cast" for `search_dtype` and "the exact column-by-column sweep" for
+#: `compensate_block` -- and a default that cannot be distinguished from an
+#: explicit request is how a caller loses the ability to ask for the old
+#: behaviour.
+_PIPELINE = object()
+
 
 # --------------------------------------------------------------------------- #
 # One configuration
@@ -122,13 +167,14 @@ def run_config(
     compensate: bool = True,
     rotate_axis: str | None = "index",
     rotate_block: int | None = None,
-    rotate_kron: bool = False,
+    rotate_kron: bool = _PIPELINE,
+    compensate_block: int | None = _PIPELINE,
     hessian_block: int | None = HESSIAN_BLOCK,
     chunk: int | str = "auto",
     scale_sample: int | None = None,
     scale_steps: int = Qz.FIT_STEPS,
     scale_seed: int = 0,
-    search_dtype: torch.dtype | None = None,
+    search_dtype: torch.dtype | None = _PIPELINE,
     quantize: bool = True,
     ldlq: bool = True,
     align: int | None = None,
@@ -187,6 +233,32 @@ def run_config(
     It is not the default, and now has neither a cost case nor a quality one
     (measured 11% worse, 2026-08-23).
     """
+    # The three pipeline levers, resolved before anything reads them, and
+    # written into the record below so a row always says what produced it.
+    kron_explicit = rotate_kron is not _PIPELINE
+    if not kron_explicit:
+        rotate_kron = PIPELINE_ROTATE_KRON
+    if search_dtype is _PIPELINE:
+        search_dtype = PIPELINE_SEARCH_DTYPE
+    if compensate_block is _PIPELINE:
+        compensate_block = PIPELINE_COMPENSATE_BLOCK
+
+    # The Kronecker contraction is of the FULL index-axis rotation; a
+    # block-diagonal or line-axis one is a different matrix.  Asking for it
+    # explicitly there is an error, but inheriting it from the pipeline default
+    # must not turn every block-width arm into a crash -- so it resolves off,
+    # and `rotate_kron_auto_disabled` says that it did.  Silence is what would
+    # be wrong here, not the downgrade.
+    kron_incompatible = rotate_axis != "index" or rotate_block is not None
+    kron_auto_disabled = False
+    if rotate_kron and kron_incompatible:
+        if kron_explicit:
+            raise ValueError(
+                "rotate_kron applies to the full index-axis rotation; "
+                "a block-diagonal one is a different matrix"
+            )
+        rotate_kron, kron_auto_disabled = False, True
+
     if ldlq and quantize and axis != "B":
         raise NotImplementedError(
             "LDLQ is wired for Axis B, where the compacted block's index axis is "
@@ -207,6 +279,7 @@ def run_config(
         metric=metric, act_norm=problem.act_norm,
         H=problem.H if (compensate or metric == "obs_diag") else None,
         compensate=compensate,
+        compensate_block=compensate_block,
         align=(Qz.E8P_DIM if (quantize and ldlq) else 1) if align is None else align,
     )
 
@@ -224,11 +297,6 @@ def run_config(
                        if chunk == "auto" else int(chunk))
             factors = None
             if rotate_kron:
-                if rotate_axis != "index" or rotate_block is not None:
-                    raise ValueError(
-                        "rotate_kron applies to the full index-axis rotation; "
-                        "a block-diagonal one is a different matrix"
-                    )
                 factors = R.kronecker_factors(
                     cw.k, seed, rotated.blocks.dtype, rotated.blocks.device)
             qb = Qz.ldlq_quantize_blocks(
@@ -277,6 +345,8 @@ def run_config(
         "rotate_axis": rotate_axis,
         "rotate_block": rotate_block,
         "rotate_kron": rotate_kron,
+        "rotate_kron_auto_disabled": kron_auto_disabled,
+        "compensate_block": compensate_block,
         "hessian_block": hessian_block,
         "chunk": chunk,
         "quantize": quantize,

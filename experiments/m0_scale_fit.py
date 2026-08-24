@@ -104,7 +104,12 @@ def compare(problem, *, budget: float = 1.5, tiles=DEFAULT_TILES,
         measured = {}
         for arm in arms:
             t0 = time.time()
+            # Pinned to the pre-2026-08-25 pipeline (the three levers off):
+            # this script's recorded numbers were taken that way, and a default
+            # flip must not silently restate them.
             r = M.run_config(problem, budget_bits=budget, tile_size=t,
+                             rotate_kron=False, search_dtype=None,
+                             compensate_block=None,
                              scale=arm.policy, scale_sample=arm.sample,
                              scale_steps=arm.steps, scale_seed=arm.seed)
             if "skipped" in r:

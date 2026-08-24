@@ -480,7 +480,13 @@ def test_streaming_does_not_change_what_run_config_reports(problem):
     import quantize as Qz
     import rotation as R
 
-    r = M.run_config(problem, budget_bits=1.5, tile_size=4)
+    # Pinned to the levers the hand-built reference below uses.  The pipeline
+    # turns all three on by default (2026-08-25); this test is about the
+    # streamed and stacked sub-Hessians agreeing, so both sides have to sit at
+    # the same configuration or it would be comparing two things at once.
+    r = M.run_config(problem, budget_bits=1.5, tile_size=4,
+                     rotate_kron=False, search_dtype=None,
+                     compensate_block=None)
     pruned = P.prune(problem.W, axis="B", tile_size=4,
                      density=r["density_requested"], metric="wanda",
                      act_norm=problem.act_norm, H=problem.H, compensate=True,
@@ -508,7 +514,8 @@ def test_rotate_kron_is_the_same_rotation_not_a_different_one(problem):
     other test would catch it because both answers look reasonable.
     """
     for t in (2, 4, Tl.MAX_TILE):
-        dense = M.run_config(problem, budget_bits=1.5, tile_size=t)
+        dense = M.run_config(problem, budget_bits=1.5, tile_size=t,
+                             rotate_kron=False)
         kron = M.run_config(problem, budget_bits=1.5, tile_size=t,
                             rotate_kron=True)
         if "skipped" in dense:
@@ -516,6 +523,120 @@ def test_rotate_kron_is_the_same_rotation_not_a_different_one(problem):
         assert dense["rotate_kron"] is False and kron["rotate_kron"] is True
         assert kron["rel_output_error"] == pytest.approx(
             dense["rel_output_error"], rel=1e-6)
+
+
+def test_the_pipeline_levers_are_on_by_default_and_the_record_says_so():
+    """The 2026-08-25 decision, asserted on the PATH rather than on a number.
+
+    All three were measured and left off on 08-24; they are on now and together
+    they take M1 from 15.0 days to 7.5.  A default that does not describe what
+    the pipeline runs is this project's most repeated failure -- the cost model
+    priced one arm while `sequential_calibrate` ran another, and that was worth
+    36 days -- so what the default IS gets a test, not a comment.
+
+    Watching the record alone would not be enough: it could say `float16` while
+    the search ran in float32.  So the levers are counted where they act.
+    """
+    import quantize as Qz
+    import rotation as R
+    import prune as P
+
+    problem = M.synthetic_problem(64, 128, 256)
+    seen = {"kron": 0, "fp16": 0, "block": []}
+
+    real_factors, real_fit, real_compensate = (
+        R.kronecker_factors, Qz.fit_scale, P.forward_compensate)
+
+    def factors(*a, **k):
+        seen["kron"] += 1
+        return real_factors(*a, **k)
+
+    def fit(x, cb, **k):
+        if k.get("search_dtype") == torch.float16:
+            seen["fp16"] += 1
+        return real_fit(x, cb, **k)
+
+    def compensate(W, keep, Hinv, block=None):
+        seen["block"].append(block)
+        return real_compensate(W, keep, Hinv, block=block)
+
+    R.kronecker_factors, Qz.fit_scale, P.forward_compensate = (
+        factors, fit, compensate)
+    try:
+        r = M.run_config(problem, budget_bits=1.5, tile_size=4)
+    finally:
+        R.kronecker_factors, Qz.fit_scale, P.forward_compensate = (
+            real_factors, real_fit, real_compensate)
+
+    # what the record claims
+    assert r["rotate_kron"] is True
+    assert r["search_dtype"] == str(torch.float16)
+    assert r["compensate_block"] == M.PIPELINE_COMPENSATE_BLOCK
+    assert r["rotate_kron_auto_disabled"] is False
+
+    # what actually ran
+    assert seen["kron"] == 1, "the Kronecker factors were never built"
+    assert seen["fp16"] > 0, "the scale fit did not search in fp16"
+    assert seen["block"] == [M.PIPELINE_COMPENSATE_BLOCK], (
+        f"compensation ran with block={seen['block']}, not the pipeline's"
+    )
+
+
+def test_a_lever_the_pipeline_cannot_reach_is_not_a_lever():
+    """`compensate_block` lived in `prune` and `run_config` did not pass it, so
+    the one lever worth 6.63x on its term was unreachable from the driver -- the
+    same shape as `return_weight` the day before.  Asserted by asking for a
+    value the default would never produce.
+    """
+    import prune as P
+
+    problem = M.synthetic_problem(64, 128, 256)
+    seen = []
+    real = P.forward_compensate
+
+    def spy(W, keep, Hinv, block=None):
+        seen.append(block)
+        return real(W, keep, Hinv, block=block)
+
+    P.forward_compensate = spy
+    try:
+        exact = M.run_config(problem, budget_bits=1.5, tile_size=4,
+                             compensate_block=None)
+        narrow = M.run_config(problem, budget_bits=1.5, tile_size=4,
+                              compensate_block=8)
+    finally:
+        P.forward_compensate = real
+
+    assert exact["compensate_block"] is None
+    assert narrow["compensate_block"] == 8
+    assert seen == [None, 8], f"the argument did not reach the sweep: {seen}"
+
+    # Deliberately NOT asserted on the answer, and the reason is worth keeping:
+    # the two runs come out bit-identical here.  Blocking moves the compensated
+    # weights by float32's epsilon, and the quantizer's lattice step is orders
+    # larger, so E8P snaps both to the same codewords.  An answer-watching test
+    # would have passed against a `compensate_block` that went nowhere -- which
+    # is exactly how this lever stayed unreachable in the first place.
+    assert exact["rel_output_error"] == narrow["rel_output_error"]
+
+
+def test_the_pipeline_default_yields_rather_than_crashing_on_a_block_rotation():
+    """`rotate_kron` asked for explicitly on a block-diagonal rotation is an
+    error, and stays one.  INHERITED from the pipeline default it must not be,
+    or every block-width arm in `m0_rotation_value.py` becomes a crash.
+
+    It resolves off and says so.  The distinction is the whole point: a silent
+    downgrade would be the failure this project keeps recording, and a record
+    field is what makes it not silent.
+    """
+    problem = M.synthetic_problem(64, 128, 256)
+    r = M.run_config(problem, budget_bits=1.5, tile_size=4, rotate_block=8)
+    assert r["rotate_kron"] is False
+    assert r["rotate_kron_auto_disabled"] is True
+
+    plain = M.run_config(problem, budget_bits=1.5, tile_size=4, rotate_axis=None)
+    assert plain["rotate_kron"] is False
+    assert plain["rotate_kron_auto_disabled"] is True
 
 
 def test_rotate_kron_refuses_a_rotation_that_is_not_the_kronecker_one(problem):

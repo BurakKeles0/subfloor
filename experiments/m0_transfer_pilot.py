@@ -89,7 +89,11 @@ def point(problem, budget: float, tile_size: int | str, *, seed: int = 0,
     def run(t, quantize):
         # T=1 is asked for at THIS tile's density, so it is a plain
         # unstructured run at d -- not the budget-matched T=1 cell.
+        # Pinned to the pre-2026-08-25 pipeline (the three levers off): the
+        # tolerance rule this script sets was derived that way.
         return M.run_config(problem, budget_bits=budget, tile_size=t,
+                            rotate_kron=False, search_dtype=None,
+                            compensate_block=None,
                             quantize=quantize, ldlq=quantize, align=ALIGN,
                             seed=seed, vq_bits=vq_bits)
 
@@ -101,6 +105,8 @@ def point(problem, budget: float, tile_size: int | str, *, seed: int = 0,
 
     def run_t1(quantize):
         return M.run_config(problem, budget_bits=budget_t1, tile_size=1,
+                            rotate_kron=False, search_dtype=None,
+                            compensate_block=None,
                             quantize=quantize, ldlq=quantize, align=ALIGN,
                             seed=seed, vq_bits=vq_bits)
 

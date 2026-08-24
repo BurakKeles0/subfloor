@@ -237,6 +237,10 @@ def compare(problem, *, budget: float = 1.5, tiles=DEFAULT_TILES,
                              rotate_axis=arm.rotate_axis,
                              rotate_block=arm.rotate_block,
                              rotate_kron=arm.rotate_kron,
+                             # Pinned to the pre-2026-08-25 pipeline: the numbers this
+                             # script recorded were taken with the three levers off,
+                             # and a default flip must not silently restate them.
+                             search_dtype=None, compensate_block=None,
                              hessian_block=arm.hessian_block, seed=seed)
             if "skipped" in r:
                 measured = {}

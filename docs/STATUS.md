@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-25 · HEAD `5b0a4d3` · Testler: **621 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-25 · HEAD `PENDING` · Testler: **624 geçiyor, 6 atlanıyor**
 > Bu oturumun ölçüm dersleri **§14**'te — hız kazançlarından daha taşınabilir.
 
 ---
@@ -144,7 +144,8 @@ Ayrıca hiç ölçülmemiş: **eval'in gerçek maliyeti** (238 s yalnız WikiTex
 | **Ölçek örneklemesi reddedildi** | 08-23 | Ortalama bedeli küçük ama tohumdan tohuma **15.8 puan** oynuyor — Kapı B'nin ayırmaya çalıştığı 0.31 σ'yı boğar (§5.8) |
 | fp16 arama **eklendi, varsayılan kapalı** | 08-23 | 1.3–1.7×, bedel ≤%1 ve **belirlenimci**. Kaliteyi ölçülebilir biçimde değiştirdiği için varsayılan olması bir karar gerektirir |
 | **Kronecker kongrüansı eklendi, varsayılan kapalı** | 08-24 | Gerçek katmanda `H512` kolunda −0.03…−0.31% (lehte), rotasyon terimi **5.52×**. Bit-birebir olmadığı için açmak ayrı bir karar (§6.8, §8.5) |
-| **fp16 arama ve telafi bloklaması da kapalı kaldı** | 08-24 | Kullanıcı kararı: şimdiye kadarki her kalite sayısı üçü de kapalıyken alındı. Üçü birlikte M1 15.0 → 7.5 g (§8.5) |
+| ~~**fp16 arama ve telafi bloklaması da kapalı kaldı**~~ | 08-24 | Kullanıcı kararı: şimdiye kadarki her kalite sayısı üçü de kapalıyken alındı. **08-25'te geçersiz kılındı** — silinmedi, çünkü M0'ın sayıları hâlâ o rejimde |
+| **Üç kaldıraç AÇILDI** | 08-25 | Kullanıcı kararı. `run_config`'in varsayılanı artık kron + fp16 + telafi bloklaması; M1 15.0 → **7.5 g**, Tasarım F 20.1 → 10.6 saat. Kıyaslanabilirlik bedeli **not düşülerek değil ölçülerek** kapatılıyor: sarsma koşusu aynı konfigürasyonu bir kez iki kolda da koşuyor (§8.5) |
 | **TF32 kapandı — kalite yüzdesiyle değil** | 08-24 | Hattı kırıyor: döndürülmüş alt-Hessian Cholesky'den geçmiyor, sönümleme payının %85'i gidiyor. Çalıştığı yerde de %3.2'yi aşan tek kol (§6.9) |
 | **Analitik en-yakın-kodsözcüğü** taramanın yerine | 08-23 | Kodsözcüğü uzayının yapısı aramayı çözüyor. Uçtan uca 1.3–4.0×, float64'te kesin (§6.4) |
 | **Triton kuruldu, iki zincir füzyonlandı** | 08-24 | GPU %28.4 meşguldü; boşta geçenin %80'i fırlatma. Uçtan uca 1.64–1.87×, çıktı birebir aynı (§6.5) |
@@ -1378,7 +1379,7 @@ tam model sürücüsü + checkpoint · `experiments/tau_sweep.py` — `τ` yüze
 İkisi de `sequential_calibrate` + `streamed_perplexity` dikişini kullanacak.
 
 ```bash
-python -m pytest tests/ -q                         # 621 test, ~2.5 dk
+python -m pytest tests/ -q                         # 624 test, ~2.5 dk
 HF_HUB_DISABLE_XET=1 python experiments/m0_dense_ppl.py --seqlens 2048 4096 --device cuda
 HF_HUB_DISABLE_XET=1 python -u experiments/m0_rotation_value.py \
     --tiles 4 16 max --seqs 16 --rows 512 --solve-device cuda --solve-dtype float32
