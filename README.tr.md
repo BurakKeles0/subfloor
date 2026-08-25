@@ -247,7 +247,19 @@ kabul edilmemeli**.
   fiyatlanıyor, ama sürücü aynı yedi katmanı çok daha yavaş koşuyor ve fark
   bellek tavanına dayanmak — 8 GiB kartta sıkıştırma tepesi 5.4 GiB
 - **Axis A için LDLQ** — şu an `NotImplementedError`
-- **Lisans seçilmedi.** Depo yayına açılıyorsa bir lisans dosyası gerekiyor
+
+---
+
+## Lisans
+
+[Apache License 2.0](LICENSE). MIT yerine bunun seçilme sebebi **açık patent
+lisansı**: bu depodaki katkı bir *yöntem*, ve MIT patent konusunda sessiz — bu da
+üçüncü bir taraf komşu bir şeyi patentlerse kodu kullananı korumasız bırakıyor.
+
+Hiçbir üçüncü taraf kodu kopyalanmadı. QuIP#, QTIP, QuaRot, SparseGPT, Wanda,
+GPTQ, VENOM ve OBR makalelerinden yeniden uygulandı — E8P codebook'u
+enumerasyonla, muhasebe özdeşlikten — yani devralınan bir lisans yükümlülüğü
+yok.
 
 ---
 

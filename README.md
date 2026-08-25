@@ -266,7 +266,20 @@ path it changed. As rules: **a test must watch the path, not the answer**, and
   difference is hitting the memory ceiling — compression peaks at 5.4 GiB on an
   8 GiB card
 - **LDLQ for Axis A** — currently `NotImplementedError`
-- **No licence chosen.** A repository that goes public needs one
+
+---
+
+## Licence
+
+[Apache License 2.0](LICENSE). Chosen over MIT for the explicit patent grant:
+this repository's contribution is a *method*, and MIT is silent on patents, which
+leaves anyone using the code unprotected if a third party later claims one
+nearby.
+
+Nothing here is vendored. QuIP#, QTIP, QuaRot, SparseGPT, Wanda, GPTQ, VENOM and
+OBR are all reimplemented from their papers — the E8P codebook by enumeration,
+the accounting from the identity — so no upstream licence obligation is
+inherited.
 
 ---
 
