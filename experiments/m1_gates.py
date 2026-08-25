@@ -127,6 +127,19 @@ PIPELINE_SEARCH_DTYPE = None
 #: is float32's own epsilon at these sizes (section 6.11c).
 PIPELINE_COMPENSATE_BLOCK = 512
 
+#: Fit the chunk's tiles in one pass instead of one apiece
+#: (`quantize.fit_scales`).  OFF, and not yet a rejection -- `docs/STATUS.md`
+#: section 7.2 recorded it as measured-and-not-taken because it "is not
+#: bit-identical", and section 8.6 says that rejection deserves re-pricing now
+#: that the codebook term is 52% of the grid (section 6.18).
+#:
+#: It is the one lever left on that term.  `fit_scale` already batches across
+#: CANDIDATES, which fills a pass at the coarse end and not at the fine end: a
+#: T=1 tile at k=1024 holds 128 vectors, so its 24 candidates are 3,072 rows and
+#: there are 4,096 such tiles in a layer.  T=1 is also the grid's costliest cell
+#: (section 6.14) and the thesis's unstructured baseline.
+PIPELINE_BATCH_FIT = False
+
 #: "Whatever the pipeline runs with."  A sentinel rather than `None` because
 #: `None` is already a meaningful value for two of the three -- it means "no
 #: cast" for `search_dtype` and "the exact column-by-column sweep" for
@@ -207,6 +220,7 @@ def run_config(
     scale_steps: int = Qz.FIT_STEPS,
     scale_seed: int = 0,
     search_dtype: torch.dtype | None = _PIPELINE,
+    batch_fit: bool = _PIPELINE,
     quantize: bool = True,
     ldlq: bool = True,
     align: int | None = None,
@@ -274,6 +288,8 @@ def run_config(
         search_dtype = PIPELINE_SEARCH_DTYPE
     if compensate_block is _PIPELINE:
         compensate_block = PIPELINE_COMPENSATE_BLOCK
+    if batch_fit is _PIPELINE:
+        batch_fit = PIPELINE_BATCH_FIT
 
     # The Kronecker contraction is of the FULL index-axis rotation; a
     # block-diagonal or line-axis one is a different matrix.  Asking for it
@@ -343,6 +359,7 @@ def run_config(
                 search_dtype=search_dtype,
                 hessian_block=hessian_block,
                 chunk=n_chunk,
+                batch_fit=batch_fit,
             )
         else:
             qb = Qz.quantize_blocks(rotated.blocks)
@@ -388,6 +405,7 @@ def run_config(
         "scale_steps": scale_steps,
         "scale_seed": scale_seed,
         "search_dtype": None if search_dtype is None else str(search_dtype),
+        "batch_fit": batch_fit,
         "align": (Qz.E8P_DIM if (quantize and ldlq) else 1) if align is None else align,
         "survivors_per_tile": int(pruned.mask.survivors_per_tile().max()),
         "seed": seed,

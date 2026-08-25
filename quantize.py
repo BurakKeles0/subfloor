@@ -58,6 +58,7 @@ __all__ = [
     "in_e8_plus_quarter",
     "is_canonical_codebook",
     "fit_scale",
+    "fit_scales",
     "FIT_STEPS",
     "quantize_vectors",
     "quantize_blocks",
@@ -836,6 +837,100 @@ def fit_scale(
     return best
 
 
+def fit_scales(
+    x: Tensor, codebook: Tensor, n_steps: int = FIT_STEPS,
+    lo: float = 0.4, hi: float = 2.0,
+    sample: int | None = None, seed_rng: int = 0,
+    search_dtype: torch.dtype | None = None,
+) -> list[float]:
+    """`fit_scale` for a stack of tiles, batched ACROSS them.
+
+    `x` is [n_tiles, n, 8] and the result is one alpha per tile -- the same
+    quantities `fit_scale` returns one call at a time, computed with the tiles'
+    candidate passes packed into shared `_nearest` calls.
+
+    WHY THIS IS A DIFFERENT LEVER FROM THE ONE ALREADY TAKEN.  `fit_scale`
+    batches across CANDIDATES, which fills a pass at the coarse end -- a
+    5,888-vector tile already hands `_nearest` 141,312 rows and is nowhere near
+    launch-bound.  At the FINE end it does not: a T=1 tile at k=1024 holds 128
+    vectors, so all 24 candidates together are 3,072 rows, and there are 4,096
+    such tiles in a layer.  That is 4,096 sequential calls of a size the card
+    finishes before it has filled.  Packing tiles into the same pass is the only
+    thing left that changes it, and the fine end is where the grid is expensive
+    (`docs/STATUS.md` section 6.14: T=1 is the costliest cell, not the cheapest).
+
+    WHAT IS PRESERVED, DELIBERATELY.  Every tile keeps its OWN alpha, its own
+    seed from its own RMS, and its own error reduction over its own [n, 8] --
+    the same terms in the same order as the unbatched form.  `docs/STATUS.md`
+    section 7.2 turned this lever down as "not bit-identical, it reduces every
+    tile's error together", and that describes an implementation which shares
+    the reduction.  This one does not, so whether the output moves at all is a
+    question to measure rather than to assume -- which is the whole reason the
+    rejection was worth re-opening (`experiments/m0_fit_batch.py`).
+
+    Not to be confused with `scale="per_layer"`, which shares one alpha across
+    tiles and was measured 11% worse (2026-08-23).  Sharing the WORK is not
+    sharing the ANSWER.
+
+    `FIT_ROW_BUDGET` still caps a pass, now over (tile, candidate) slots rather
+    than candidates alone.  That is what keeps the peak bounded at the coarse
+    end -- and it is also why the gain lands at the fine end and nowhere else:
+    a coarse tile fills the budget by itself, so there is no room to pack.
+    """
+    if x.ndim != 3:
+        raise ValueError(f"x must be [n_tiles, n, width], got {tuple(x.shape)}")
+    n_tiles, n, width = x.shape
+
+    tiles: list[Tensor] = []
+    for t in range(n_tiles):
+        xt = x[t]
+        if sample is not None and sample < n:
+            # Per tile, exactly as `ldlq_quantize_blocks` seeds it: a shared
+            # subset would correlate the tiles' scales in a way a full fit
+            # never does.
+            g = torch.Generator(device="cpu").manual_seed(seed_rng + t)
+            idx = torch.randperm(n, generator=g)[:sample].to(xt.device)
+            xt = xt[idx]
+        tiles.append(xt)
+    rows = tiles[0].shape[0] if tiles else 0
+
+    rms_c = float(codebook.square().mean().sqrt())
+    steps = torch.linspace(lo, hi, n_steps).tolist()
+    best = [1.0] * n_tiles
+    best_err = [float("inf")] * n_tiles
+    slots: list[tuple[int, float]] = []
+    for t, xt in enumerate(tiles):
+        rms_x = float(xt.square().mean().sqrt())
+        if rms_x == 0.0:
+            continue                      # `fit_scale` returns 1.0 here
+        seed = rms_x / rms_c
+        best[t] = seed
+        slots += [(t, seed * f) for f in steps]
+
+    per_pass = max(1, FIT_ROW_BUDGET // max(rows, 1))
+    for start in range(0, len(slots), per_pass):
+        group = slots[start:start + per_pass]
+        scaled = torch.empty((len(group), rows, width), dtype=x.dtype,
+                             device=x.device)
+        for i, (t, a) in enumerate(group):
+            # Divided by the same Python float the unbatched form used, so the
+            # search sees exactly the same numbers.
+            torch.div(tiles[t], a, out=scaled[i])
+        _, q = _nearest(scaled.reshape(-1, width), codebook,
+                        search_dtype=search_dtype)
+        q = q.reshape(len(group), rows, width)
+        # One reduction per SLOT over its own [rows, width] -- never one across
+        # the group, and never one across the tiles in it.  That is the whole
+        # difference between this and the arrangement section 7.2 rejected.
+        errs = torch.stack([(tiles[group[i][0]] - group[i][1] * q[i])
+                            .square().sum()
+                            for i in range(len(group))]).tolist()
+        for (t, a), err in zip(group, errs):
+            if err < best_err[t]:
+                best[t], best_err[t] = a, err
+    return best
+
+
 def quantize_vectors(
     x: Tensor, scale: float | None = None, dtype: torch.dtype | None = None
 ) -> tuple[Tensor, Tensor, float]:
@@ -1155,6 +1250,7 @@ def ldlq_quantize_blocks(
     search_dtype: torch.dtype | None = None,
     hessian_block: int | None = None,
     chunk: int = 1,
+    batch_fit: bool = False,
 ) -> QuantizedBlocks:
     """`ldlq_quantize` over every tile.
 
@@ -1211,6 +1307,14 @@ def ldlq_quantize_blocks(
 
     `chunk=1` is the default because it is the arrangement every measurement so
     far was taken under.  Larger values must produce bit-identical output.
+
+    `batch_fit=True` fits the chunk's tiles in ONE pass instead of one apiece
+    (`fit_scales`).  Off by default: `docs/STATUS.md` section 7.2 recorded this
+    as measured-and-not-taken on the grounds that it is not bit-identical, and
+    whether that is true of an implementation which keeps each tile's reduction
+    to itself is what `experiments/m0_fit_batch.py` measures.  It is the one
+    lever left on the codebook term, which after the rotation was priced
+    correctly is 52% of the grid (section 6.18).
     """
     if blocks.ndim != 3:
         raise ValueError(f"blocks must be 3-D, got {tuple(blocks.shape)}")
@@ -1261,12 +1365,22 @@ def ldlq_quantize_blocks(
         factors = [torch.stack([f[i] for f in per_tile])
                    for i in range(len(parts))]
 
-        alphas = [tile_scale if tile_scale is not None else
-                  fit_scale(blocks[t].reshape(-1, E8P_DIM), cb,
-                            n_steps=scale_steps, sample=scale_sample,
-                            seed_rng=scale_seed + t,
-                            search_dtype=search_dtype)
-                  for t in members]
+        if tile_scale is not None:
+            alphas = [tile_scale] * len(members)
+        elif batch_fit:
+            # One fit for the whole chunk.  Each tile still gets its own alpha
+            # and its own reduction; what is shared is the `_nearest` call.
+            alphas = fit_scales(
+                blocks[start:start + len(members)].reshape(
+                    len(members), -1, E8P_DIM),
+                cb, n_steps=scale_steps, sample=scale_sample,
+                seed_rng=scale_seed + start, search_dtype=search_dtype)
+        else:
+            alphas = [fit_scale(blocks[t].reshape(-1, E8P_DIM), cb,
+                                n_steps=scale_steps, sample=scale_sample,
+                                seed_rng=scale_seed + t,
+                                search_dtype=search_dtype)
+                      for t in members]
         alpha = torch.tensor(alphas, dtype=blocks.dtype, device=blocks.device)
         sl = slice(start, start + len(alphas))
         values, index = _ldlq_sweep(blocks[sl].clone(), factors, parts,
