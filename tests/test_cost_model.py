@@ -224,20 +224,30 @@ def test_a_point_charges_the_compensation_sweep_too():
     if "cuda_f32" not in rates["setups"]:
         pytest.skip("no cuda rates measured on this machine")
 
-    exact = CM.compensate_seconds(rates, "cuda_f32")
+    exact = CM.compensate_seconds(rates, "cuda_f32", compensate_block=None)
     blocked = CM.compensate_seconds(rates, "cuda_f32", compensate_block=512)
     assert exact > 0 and blocked > 0
     # Blocking is the whole reason the second column exists; if it ever stopped
     # paying, `prune(compensate_block=...)` would be carrying a quality cost for
-    # nothing.
+    # nothing.  Re-measured through a real block on 2026-08-25 and it does pay:
+    # 6.83x on the term against the 6.63x recorded, and 95-105% of that saving
+    # survives into the whole pass (`experiments/m0_lever_audit.py`).
     assert exact / blocked > 3.0
 
     # Flat in the tile size, like calibration -- that is what re-orders the
     # designs, since cost then follows the number of POINTS.
     for t in (1, 16, Tl.MAX_TILE):
-        assert CM.model_cost(t, 1.5, rates, "cuda_f32")["compensate_seconds"]             == pytest.approx(exact)
-    assert CM.model_cost(4, 1.5, rates, "cuda_f32",
-                         compensate_block=512)["compensate_seconds"]         == pytest.approx(blocked)
+        assert CM.model_cost(t, 1.5, rates, "cuda_f32",
+                             compensate_block=None)["compensate_seconds"] == pytest.approx(exact)
+
+    # AND THE DEFAULT IS THE PIPELINE'S, which it was not until 2026-08-25.
+    # `run_config` has blocked the sweep since the levers were turned on, so a
+    # model defaulting to the exact column was pricing a configuration nobody
+    # runs -- by 34 s a block, in the PESSIMISTIC direction, which is why
+    # nothing ever complained about it.
+    assert CM.DEFAULT_COMPENSATE_BLOCK == 512
+    assert CM.model_cost(4, 1.5, rates, "cuda_f32")["compensate_seconds"] == pytest.approx(blocked)
+    assert CM.model_cost(4, 1.5, rates, "cuda_f32")["compensate_block"] == 512
 
 
 def test_a_layer_shape_nobody_measured_is_charged_nothing():
@@ -246,7 +256,8 @@ def test_a_layer_shape_nobody_measured_is_charged_nothing():
     would hide."""
     rates = {"setups": {"fake": {"compensate_timings": ((4096, 4096, 1.0, 0.2),)}}}
     assert CM.compensate_seconds(rates, "fake", inventory=((4096, 4096, 1),),
-                                 n_blocks=1) == pytest.approx(1.0)
+                                 n_blocks=1,
+                                 compensate_block=None) == pytest.approx(1.0)
     # One shape missing from the table zeroes the whole term rather than
     # guessing at it, and the caller sees an obviously wrong 0 instead of a
     # plausibly wrong number.
@@ -709,15 +720,28 @@ def test_no_single_term_dominates_the_pass_any_more():
         "end of the grid has a different cost story and section 6.1 is stale"
     )
 
-    # Which term leads is a measured fact and it has changed twice.  Pinning it
-    # is the point: the ROTATION is now the largest at the grid's expensive
-    # middle, and it is the one term still computed as a dense GEMM against a
-    # matrix that is a Kronecker product (`rotation.structured_orthogonal`).
+    # Which term leads is a measured fact and it has now changed THREE times:
+    # codebook, then rotation on 2026-08-24, then codebook again on 2026-08-25.
+    # The last handover was not the code getting faster -- it was this model
+    # finally charging what the code does.  The rotation led only while it was
+    # billed as a dense GEMM; `run_config` had been contracting it against the
+    # Kronecker factors since the levers were turned on, and once that is priced
+    # the term drops from 1.92h to 0.50h at T=4 and the codebook is back in
+    # front.  A term can lead a cost model for a whole day because the model is
+    # describing arithmetic nobody runs.
     at_four = CM.model_cost(4, 1.5, rates, "cuda_f32")
-    assert at_four["rotation_seconds"] > at_four["codebook_seconds"], (
-        "the codebook has retaken the lead at T=4; the sub-Hessian rotation was "
-        "the largest term as of 2026-08-24 and the next lever was priced on that"
+    assert at_four["rotate_kron"] and at_four["rotate_kron_priced"]
+    assert at_four["codebook_seconds"] > at_four["rotation_seconds"], (
+        "the rotation has retaken the lead at T=4; with the Kronecker "
+        "congruence priced it was 0.50h against the codebook's 0.91h as of "
+        "2026-08-25, so this means either the codebook got cheaper again or the "
+        "Kronecker path stopped being charged"
     )
+    # And the dense arm is still priced, because the levers-off comparison needs
+    # it: a rejection with no number attached is how this project lost eight
+    # days once (`docs/STATUS.md` section 14.2).
+    dense_four = CM.model_cost(4, 1.5, rates, "cuda_f32", rotate_kron=False)
+    assert dense_four["rotation_seconds"] > 3 * at_four["rotation_seconds"]
 
     # The two levers that cost quality used to be comparable -- 8.8 days against
     # 8.3 -- which was the argument for measuring rather than guessing which to
@@ -737,7 +761,117 @@ def test_no_single_term_dominates_the_pass_any_more():
         "the scale fit has grown back into a major cost; it was 83% of a tile "
         "before the candidates were batched and 28% after"
     )
-    assert scale_lever / base < 0.2, (
+    # ASSERTED IN DAYS, NOT AS A SHARE OF THE TOTAL, and the change is the
+    # lesson.  This read `scale_lever / base < 0.2` and went red on 2026-08-25
+    # without the scale fit costing one second more: pricing the two levers took
+    # the base from 15.0 days to 11.7, and the same 2.8 days became 24% of it
+    # instead of 18%.  A ratio against a moving denominator is not a fact about
+    # the thing being measured -- it is a fact about everything else.
+    assert scale_lever < 3.5, (
         "dropping the per-tile scale fit is supposed to be a minor saving now; "
-        "if it is large again the fit is being paid for once per candidate"
+        "it was 2.76 days of M1 on 2026-08-25, and if it is large again the fit "
+        "is being paid for once per candidate"
     )
+
+
+# --------------------------------------------------------------------------- #
+# The Kronecker congruence, once the model could charge it at all
+# --------------------------------------------------------------------------- #
+
+def test_the_model_prices_the_rotation_the_pipeline_actually_runs():
+    """It did not, until 2026-08-25, and nothing was going to notice.
+
+    `run_config` contracts the sub-Hessian rotation against its Kronecker
+    factors by default; `rotation_seconds` billed a dense `2 k^3` regardless.
+    On `down_proj` that is 57.8 s a layer against 11.7 measured -- a five-fold
+    over-charge on what the model called its largest term.
+
+    Pessimistic, which is why it survived: this file has a rule about optimistic
+    defaults and the error came in from the other side.
+    """
+    import m1_gates
+
+    assert CM.DEFAULT_ROTATE_KRON is m1_gates.PIPELINE_ROTATE_KRON
+    assert CM.DEFAULT_COMPENSATE_BLOCK == m1_gates.PIPELINE_COMPENSATE_BLOCK
+
+    rates = {"setups": {"m": {
+        "rot_tile_timings": ((2944, 0.0125, 0.0030),),
+        "rotation_timings": ((2944, 0.0096),),
+    }}}
+    assert CM.rotation_seconds(2944, rates, "m", kron=True) == pytest.approx(0.0030)
+
+    # THE DENSE ARM DELIBERATELY DOES NOT READ THE NEW TABLE.  The two measure
+    # different things -- `rot_tile_timings` includes the gather `H[idx, idx]`
+    # that `tile_hessian_stream` does and `ROT_TIMINGS` does not -- and the old
+    # curve has four widths against the new one's fourteen at one budget.  The
+    # gap between them is worth carrying rather than papering over: at k=2944 it
+    # is 9.6 ms interpolated against 12.5 measured.
+    assert CM.rotation_seconds(2944, rates, "m", kron=False) == pytest.approx(0.0096)
+
+
+def test_an_unmeasured_width_is_charged_dense_and_says_so():
+    """The lookup is by EXACT k, and the alternative was measured to be wrong.
+
+    The ratio is set by how `k` factors and that jumps: 3008 = 64x47 runs 5.14x
+    while 3072 = 1024x3, two per cent wider, runs 1.80x.  The first version of
+    this table had two rows and priced the rest by flop count; at k=1024 -- a
+    pure power of two, where `kronecker_factors` returns `m=1` and the
+    contraction IS the dense product -- it came out 5.4x pessimistic.
+
+    So an unmeasured width falls back to the dense charge, and the fallback is
+    announced rather than folded silently into a number.
+    """
+    rates = {"setups": {"m": {
+        "rot_tile_timings": ((2944, 0.0125, 0.0030),),
+        "rotation_timings": ((2944, 0.0125),),
+    }}}
+    assert CM.prices_kron(rates, "m", 2944) is True
+    assert CM.prices_kron(rates, "m", 3072) is False
+    # Neighbouring width, wildly different factorization: charged dense, not
+    # charged the neighbour's Kronecker time.
+    assert CM.rotation_seconds(3072, rates, "m", kron=True) == pytest.approx(
+        CM.rotation_seconds(3072, rates, "m", kron=False))
+
+    import json
+    from pathlib import Path
+    rates_file = Path(__file__).resolve().parent.parent / "results" / "m0_rates.json"
+    if not rates_file.exists():
+        pytest.skip("no measured rates on this machine")
+    real = json.loads(rates_file.read_text(encoding="utf-8"))
+    if "cuda_f32" not in real["setups"]:
+        pytest.skip("no cuda rates measured on this machine")
+    # B=1.5 is swept end to end; the other two budgets give other densities and
+    # were interrupted, so the model must admit it is guessing there.
+    assert CM.model_cost(16, 1.5, real, "cuda_f32")["rotate_kron_priced"] is True
+    assert CM.model_cost(16, 1.75, real, "cuda_f32")["rotate_kron_priced"] is False
+    assert CM.m1_cost(real, "cuda_f32")["rotate_kron_priced"] is False
+
+
+def test_the_kronecker_form_cannot_help_at_a_power_of_two():
+    """Arithmetic, not a measurement -- and the measurement agrees.
+
+    `structured_orthogonal(k)` is `kron(H_p, O_m)` with `p` the largest power of
+    two dividing `k`.  At a pure power of two `m` is 1, `2 k^2 (p + m)` is
+    `2 k^3` up to one part in `k`, and there is nothing to save.  Two rows of
+    the measured table sit at exactly that: k=1024 reads 1.18x and k=2048 reads
+    0.98x, against 10.88x at k=8256 = 64x129.
+
+    Pinned because pricing this by flop RATE rather than flop COUNT is what put
+    a 5.4x pessimism into the first draft of the table.
+    """
+    for k in (1024, 2048, 4096, 8192):
+        assert CM.kron_flops(k) / (2.0 * k ** 3) == pytest.approx(1.0, rel=1e-3)
+    # And where there is an odd factor, the arithmetic really does collapse.
+    assert CM.kron_flops(2944) / (2.0 * 2944 ** 3) == pytest.approx(151 / 2944,
+                                                                   rel=1e-6)
+
+    measured = dict((k, (d, kr)) for k, d, kr in CM.ROT_TILE_TIMINGS["cuda_f32"])
+    for k in (1024, 2048):
+        dense, kron = measured[k]
+        assert dense / kron < 1.25, (
+            f"k={k} is a power of two and the Kronecker form is claiming a "
+            "speedup there; either the table is wrong or `kronecker_factors` "
+            "has stopped returning m=1"
+        )
+    dense, kron = measured[8256]
+    assert dense / kron > 8.0

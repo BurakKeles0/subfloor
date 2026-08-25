@@ -142,6 +142,25 @@ N_BLOCKS = 32
 #: stops being one, and so is a pessimistic one.
 DEFAULT_HESSIAN_BLOCK = 512
 
+#: The other two things `m1_gates.run_config` does by default, mirrored here for
+#: the same reason `DEFAULT_HESSIAN_BLOCK` is: a model whose default prices a
+#: configuration nobody runs is not a model of anything.
+#:
+#: BOTH WERE WRONG HERE UNTIL 2026-08-25, and both in the PESSIMISTIC direction,
+#: which is why nothing complained.  `rotation_seconds` had no Kronecker path at
+#: all and billed the dense form; `model_cost` defaulted `compensate_block` to
+#: `None`, the exact column-by-column sweep.  Together they made a block read
+#: 180 s where the pipeline as configured is priced at 84 -- and 84 is within
+#: 1.03x of what one measures (`experiments/m0_lever_audit.py`).  The gap
+#: section 6.16 named was NOT in these ratios; correcting them makes it wider,
+#: because the model was accidentally covering context cost with arithmetic it
+#: was over-charging.
+#:
+#: These must track `m1_gates.PIPELINE_ROTATE_KRON` and
+#: `m1_gates.PIPELINE_COMPENSATE_BLOCK`; a test asserts that they do.
+DEFAULT_ROTATE_KRON = True
+DEFAULT_COMPENSATE_BLOCK: int | None = 512
+
 #: Cholesky, cholesky_inverse, cholesky again -- roughly k^3/3 + k^3 + k^3/3.
 CHOL_FLOPS_PER_K3 = 5.0 / 3.0
 
@@ -336,6 +355,61 @@ ROT_TIMINGS = {
                  (4096, 0.025949), (8192, 0.250471)),
     "cpu_f64": ((1024, 0.016567), (2048, 0.102614),
                 (4096, 0.693413), (8192, 5.558341)),
+}
+
+#: (k, dense seconds, Kronecker seconds) for ONE tile's sub-Hessian as the
+#: PIPELINE pays for it.  `experiments/m0_lever_audit.py --rot-sweep`,
+#: 2026-08-25, on a verified-quiet card, at EVERY width the B=1.5 grid uses:
+#: seven tile sizes against each of the two distinct `n_in`.
+#:
+#: NOT the same quantity as `ROT_TIMINGS`, and the difference is deliberate:
+#: these time `m1_gates.tile_hessian_stream`'s callable, so the gather
+#: `H[idx, idx]` is inside them.  The pipeline pays that gather and
+#: `TILE_TIMINGS` does not contain it -- it measures `ldlq_quantize` alone -- so
+#: this is the only place it is charged at all.  It is also why the Kronecker
+#: column is slower here than section 6.8 recorded (3.02 ms against 1.82 at
+#: k=2944): a fixed per-tile cost dilutes the cheap arm far more than the dense
+#: one, and section 6.8's numbers are the arithmetic without it.
+#:
+#: LOOKED UP BY EXACT k, NEVER INTERPOLATED, and that is the point of measuring
+#: fourteen widths instead of two.  The ratio is set by how `k` FACTORS, and
+#: that jumps: 3008 = 64x47 runs 5.14x while 3072 = 1024x3, two per cent wider,
+#: runs 1.80x.  A nearest-k lookup would read the second off the first.  The
+#: first version of this table had two rows and priced k=1024 by flop count; it
+#: came out 5.4x PESSIMISTIC, because 1024 is a pure power of two, `m=1`, and
+#: the contraction degenerates to the dense product -- which section 6.8 had
+#: already measured (0.99x at k=2048) and the extrapolation walked past.
+#:
+#: The measured ends of that behaviour are both in the table and both matter:
+#:      k=2048 = 2048x1    0.98x   nothing to factor, nothing to gain
+#:      k=8256 =   64x129 10.88x
+#: Tile-weighted over the whole B=1.5 grid it is 3.53x, not the 5.52x on record
+#: -- which was section 6.8's weighting of the arithmetic alone.  Per tile size:
+#: 2.00 / 2.49 / 4.60 / 5.00 / 5.12 / 6.42 / 8.68 from T=1 to T=max.
+#:
+#: ONLY B=1.5 IS COVERED.  The other two budgets give other densities and so
+#: other `k`, and their sweep was interrupted by another process arriving on the
+#: card; the partial rows were discarded rather than kept, since `alternating`
+#: samples between repetitions and cannot say which row was still clean.  Cells
+#: outside this table are charged the DENSE form and `model_cost` reports
+#: `rotate_kron_priced=False`.
+ROT_TILE_TIMINGS = {
+    "cuda_f32": (
+        (1024, 0.000817, 0.000691),     # 1024x1    n_in=4096   T=1      1.18x
+        (2048, 0.004036, 0.004129),     # 2048x1    n_in=4096   T=2      0.98x
+        (2560, 0.009021, 0.003934),     # 512x5     n_in=4096   T=4      2.29x
+        (2752, 0.010765, 0.002735),     # 64x43     n_in=11008  T=1      3.94x
+        (2816, 0.010915, 0.003584),     # 256x11    n_in=4096   T=8      3.05x
+        (2944, 0.012511, 0.003019),     # 128x23    n_in=4096   T=16     4.14x
+        (3008, 0.013907, 0.002708),     # 64x47     n_in=4096   T=32     5.14x
+        (3072, 0.014606, 0.008100),     # 1024x3    n_in=4096   T=max    1.80x
+        (5504, 0.083709, 0.010176),     # 128x43    n_in=11008  T=2      8.23x
+        (6880, 0.169357, 0.018285),     # 32x215    n_in=11008  T=4      9.26x
+        (7568, 0.224701, 0.031768),     # 16x473    n_in=11008  T=8      7.07x
+        (7912, 0.258126, 0.045003),     # 8x989     n_in=11008  T=16     5.74x
+        (8080, 0.262615, 0.035800),     # 16x505    n_in=11008  T=32     7.34x
+        (8256, 0.275674, 0.025328),     # 64x129    n_in=11008  T=max   10.88x
+    ),
 }
 
 #: Measured, `experiments/m0_dense_ppl.py`: one streamed WikiText-2 pass at
@@ -580,15 +654,76 @@ def cholesky_seconds(k: int, rates: dict, setup: str,
     return CHOL_FLOPS_PER_K3 * k ** 3 / rate
 
 
-def rotation_seconds(k: int, rates: dict, setup: str) -> float:
-    """Seconds to rotate one tile's sub-Hessian, `2*k^3` at matmul rates.
+def kron_flops(k: int) -> float:
+    """`2 k^2 (p + m)` -- what contracting against the factors really costs.
+
+    `p` is the largest power of two dividing `k` and `m` the odd remainder,
+    mirroring `rotation.kronecker_factors`, because the whole point of that
+    function is that `structured_orthogonal(k)` IS `kron(H_p, O_m)`.  The split
+    is wildly uneven across the grid -- 2944 is 128 x 23 and 7912 is 8 x 989 --
+    which is why this cannot be a power law in `k` the way the dense form is,
+    and why a single "5.52x" cannot describe every width.
+    """
+    a = (k & -k).bit_length() - 1
+    p, m = 1 << a, k >> a
+    return 2.0 * k * k * (p + m)
+
+
+def prices_kron(rates: dict, setup: str, k: int) -> bool:
+    """Is THIS width's Kronecker cost measured, or would it be a guess?
+
+    Per width, not per setup, because the answer varies within one grid: the
+    sweep covers B=1.5 and the other two budgets give other densities and so
+    other `k`.  Exposed so `model_cost` can SAY it charged the dense form when
+    asked for the Kronecker one, instead of quietly charging the wrong
+    arithmetic.  Every silent downgrade in this project has turned into a wrong
+    number that looked right; `m1_gates`' `rotate_kron_auto_disabled` exists for
+    the same reason.
+    """
+    tile = (rates["setups"][setup].get("rot_tile_timings")
+            or ROT_TILE_TIMINGS.get(setup) or ())
+    return any(ref_k == k for ref_k, _dense, _kron in tile)
+
+
+def rotation_seconds(k: int, rates: dict, setup: str, *,
+                     kron: bool = False) -> float:
+    """Seconds to rotate one tile's sub-Hessian, gather included.
 
     Charged whenever the pipeline rotates -- which, after the block-width sweep,
     is always: narrowing the rotation costs quality at every width measured
     (`experiments/m0_rotation_value.py`), so the rotation stays full even when
     the feedback does not.  Returns 0 for setups with no measured curve, so the
     fixtures keep testing the shapes they were written for.
+
+    `kron=True` prices `rotation.rotate_hessian(factors=...)`, which is what
+    `m1_gates.PIPELINE_ROTATE_KRON` turns on and has been the default since
+    2026-08-25.  UNTIL THIS FUNCTION GREW THAT ARGUMENT THE MODEL HAD NO WAY TO
+    CHARGE IT: it billed a dense `2 k^3` whatever the pipeline ran, which on
+    `down_proj` is 57.8 s a layer against the 11.7 measured.  A cost model whose
+    default is a configuration nobody runs is the failure this file's own
+    docstring warns about, and it had it in the pessimistic direction.
+
+    The Kronecker arm is looked up by EXACT width and never interpolated.  Its
+    cost is `2 k^2 (p + m)` and the split is not smooth in `k` -- 3008 = 64x47
+    against 3072 = 1024x3 -- so a nearest-k reading of a width two per cent away
+    can be wrong by a factor of three.  An unmeasured width is charged the dense
+    form and `prices_kron` says so, rather than being given a plausible number.
     """
+    tile = (rates["setups"][setup].get("rot_tile_timings")
+            or ROT_TILE_TIMINGS.get(setup) or ())
+    if kron:
+        for ref_k, _dense_s, kron_s in tile:
+            if ref_k == k:
+                return kron_s
+
+    # The DENSE arm keeps reading `ROT_TIMINGS`, deliberately.  The new table
+    # has two widths against that one's four, and the pipeline does not run the
+    # dense form any more -- so replacing a four-sample curve with a
+    # two-sample one, then extrapolating it down to T=1's narrow tiles, would
+    # trade a measured number for a guess in the arm that matters least.  What
+    # is worth carrying instead is the size of the disagreement, and
+    # `ROT_TILE_TIMINGS` states it: 1.17-1.31x optimistic at real widths,
+    # because `ROT_TIMINGS` does not contain the gather.
     samples = (rates["setups"][setup].get("rotation_timings")
                or ROT_TIMINGS.get(setup))
     if not samples:
@@ -739,12 +874,19 @@ def calibration_seconds(rates: dict, setup: str, *,
 
 def compensate_seconds(rates: dict, setup: str, *, inventory=LLAMA2_7B,
                        n_blocks: int = N_BLOCKS,
-                       compensate_block: int | None = None) -> float:
+                       compensate_block: int | None = DEFAULT_COMPENSATE_BLOCK
+                       ) -> float:
     """One point's forward compensation, over every linear in every block.
 
     Like calibration this is flat in the tile size -- the sweep is over `n_in`
     and the mask does not change its length -- so it is another per-POINT term,
     and per-point terms are what decide which designs are cheap.
+
+    The default is the pipeline's 512, not the exact sweep, since 2026-08-25.
+    The exact column stays reachable and stays priced: it is the arm the levers
+    -off comparison needs, and it was re-measured that day within 5% of the
+    figures recorded here (2.559 / 6.447 / 19.267 s against 2.431 / 6.345 /
+    18.260), which is the reason to trust the table rather than only the ratio.
 
     Requires an exact (n_out, n_in) match and returns 0.0 for anything
     unmeasured, rather than interpolating.  Five of this model's seven errors
@@ -772,7 +914,8 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
                hessian_block: int | None = DEFAULT_HESSIAN_BLOCK,
                inventory=LLAMA2_7B, n_blocks: int = N_BLOCKS,
                calibration_tokens: int = CALIBRATION_TOKENS,
-               compensate_block: int | None = None) -> dict:
+               compensate_block: int | None = DEFAULT_COMPENSATE_BLOCK,
+               rotate_kron: bool = DEFAULT_ROTATE_KRON) -> dict:
     """One full compression pass over Llama-2-7B at one tile size.
 
     Timing comes from the measured per-tile fit, not from flops over kernel
@@ -783,6 +926,7 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
 
     chol = cb = peak = peak_streamed = 0.0
     chol_seconds = cb_seconds = rot_seconds = 0.0
+    kron_priced = True
     for n_out, n_in, count in inventory:
         c = layer_cost(n_out, n_in, tile_size, budget, scale_fit=scale_fit,
                        hessian_block=hessian_block)
@@ -793,7 +937,9 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
         chol_seconds += count * c["n_tiles"] * cholesky_seconds(
             c["k"], rates, setup, block=hessian_block)
         rot_seconds += count * c["n_tiles"] * rotation_seconds(
-            c["k"], rates, setup)
+            c["k"], rates, setup, kron=rotate_kron)
+        if rotate_kron and not prices_kron(rates, setup, c["k"]):
+            kron_priced = False
         # n_tiles * lines * k == n_out * k, and the tile fit is per vector
         per_vector = codebook_seconds_per_vector(rates, setup,
                                                  c["lines_per_tile"])
@@ -824,6 +970,15 @@ def model_cost(tile_size, budget: float, rates: dict, setup: str, *,
     return {
         "tile_size": tile_size, "setup": setup, "batched": batched,
         "scale_fit": scale_fit,
+        "hessian_block": hessian_block,
+        "compensate_block": compensate_block,
+        "rotate_kron": rotate_kron,
+        # False when the Kronecker arithmetic was asked for and the dense one
+        # was charged, because some width in the inventory has no measured
+        # sample.  Stated rather than inferred: the same downgrade in `m1_gates`
+        # carries the same flag, and a silent one is the failure this project
+        # keeps writing down.
+        "rotate_kron_priced": kron_priced,
         "cholesky_flops": chol, "codebook_flops": cb,
         "cholesky_seconds": chol_seconds,
         "rotation_seconds": rot_seconds,
@@ -925,17 +1080,31 @@ def sweep_cost(rates: dict, setup: str, *, budget: float = 1.5,
 def m1_cost(rates: dict, setup: str, *, budgets=(1.75, 1.60, 1.50),
             n_draws: int = 5, tiles=TILES, batched: bool = False,
             scale_fit: bool = True,
-            hessian_block: int | None = DEFAULT_HESSIAN_BLOCK) -> dict:
-    """M1's own grid, for scale: budgets x tiles x draws."""
+            hessian_block: int | None = DEFAULT_HESSIAN_BLOCK,
+            compensate_block: int | None = DEFAULT_COMPENSATE_BLOCK,
+            rotate_kron: bool = DEFAULT_ROTATE_KRON) -> dict:
+    """M1's own grid, for scale: budgets x tiles x draws.
+
+    The two levers are passed rather than left to `model_cost`'s defaults, and
+    reported back, because this is the number `docs/STATUS.md` quotes: a headline
+    that does not carry the configuration it priced is how the model was wrong
+    three times already.
+    """
     total = 0.0
+    priced = True
     for b in budgets:
         for t in tiles:
             c = model_cost(t, b, rates, setup, batched=batched,
-                           scale_fit=scale_fit, hessian_block=hessian_block)
+                           scale_fit=scale_fit, hessian_block=hessian_block,
+                           compensate_block=compensate_block,
+                           rotate_kron=rotate_kron)
             if "skipped" not in c:
                 total += n_draws * c["point_seconds"]
+                priced &= c["rotate_kron_priced"]
     return {"setup": setup, "batched": batched, "scale_fit": scale_fit,
             "hessian_block": hessian_block,
+            "compensate_block": compensate_block,
+            "rotate_kron": rotate_kron, "rotate_kron_priced": priced,
             "n_draws": n_draws, "seconds": total, "hours": total / 3600,
             "days": total / 86400}
 
