@@ -93,13 +93,41 @@ Kaggle kotası: pahalı üç nokta ≈ 9.4 GPU-saat, haftalık 30'un içinde rah
 
 ---
 
+## Önce: kodu buluta nasıl götürürsünüz
+
+Depoda **git remote yok**. İki yol var ve defter ikisini de destekliyor.
+
+**A — zip (yayınlama kararı gerektirmez, önerilen).** Yerelde:
+
+```bash
+git archive --format=zip -o ~/tilesparse-code.zip HEAD
+```
+
+0.4 MB çıkıyor (78 dosya). Sonra:
+
+- **Kaggle**: Datasets → New Dataset → zip'i yükleyin → notebook'a *Add Data* ile
+  ekleyin. Defter `/kaggle/input/**/tilesparse-code.zip` altında kendisi bulur.
+- **Colab**: Drive'a koyun. Defter `MyDrive` altında arar.
+
+**B — uzak depo.** GitHub'a itin ve defterin ilk hücresinde `REPO_URL`'i doldurun.
+Özel depo da olur; o zaman bir token gerekir. Kodun kamuya açılıp açılmayacağı
+sizin kararınız, bu yüzden zip yolu varsayılan.
+
+> Not: çalışma `batch-scale-fit-candidates` dalında, `main`'in 32 commit önünde.
+> `git archive HEAD` bulunduğunuz dalı paketler — istediğiniz bu değilse önce
+> `git checkout main && git merge --ff-only batch-scale-fit-candidates`.
+
+---
+
 ## Kaggle — adım adım
 
 1. Yeni Notebook → Settings → **Accelerator: GPU T4 ×2**, **Internet: On**
-2. İlk hücre:
+2. `cloud/tilesparse_cloud.ipynb`'yi yükleyin, veya ilk hücreyi elle koşturun:
 
 ```python
-!git clone https://github.com/<kullanici>/tilesparse /kaggle/working/tilesparse
+import zipfile, glob
+z = glob.glob('/kaggle/input/**/tilesparse-code.zip', recursive=True)[0]
+zipfile.ZipFile(z).extractall('/kaggle/working/tilesparse')
 %cd /kaggle/working/tilesparse
 !pip install -q -r cloud/requirements.txt
 ```
@@ -139,10 +167,12 @@ bir Dataset'e yazın.
 
 ```python
 from google.colab import drive; drive.mount('/content/drive')
-!git clone https://github.com/<kullanici>/tilesparse /content/tilesparse
+import zipfile, glob
+z = glob.glob('/content/drive/MyDrive/**/tilesparse-code.zip', recursive=True)[0]
+zipfile.ZipFile(z).extractall('/content/tilesparse')
 %cd /content/tilesparse
 !pip install -q -r cloud/requirements.txt
-!python cloud/preflight.py --resume-root /content/drive/MyDrive/tilesparse/resume
+!python cloud/preflight.py --resume-root /content/resume
 ```
 
 **Ucuz noktalar için** checkpoint'i Drive'a yazmayın — yerel diske yazın ve tek
