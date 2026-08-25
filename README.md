@@ -296,4 +296,4 @@ rotation preserves the mask, that the gate does not pass on noise.
 test that calls the thing it is checking proves nothing, so the same numbers are
 reached along two independent routes.
 
-Parts of this work were developed with AI assistance (Claude).
+Parts of this work were developed with AI assistance.

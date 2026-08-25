@@ -276,4 +276,4 @@ rotasyonun maskeyi koruduğu, kapının gürültüde geçmediği.
 değerleri çağıran bir test hiçbir şey kanıtlamaz; bu yüzden aynı sayılara iki
 bağımsız yoldan varılıyor.
 
-Bu çalışmanın bazı bölümleri yapay zekâ desteğiyle geliştirildi (Claude).
+Bu çalışmanın bazı bölümleri yapay zekâ desteğiyle geliştirildi.
