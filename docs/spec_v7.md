@@ -243,7 +243,7 @@ Tek A100 40GB yeterli (7B/13B).
 ## 2. Repo yapısı
 
 ```
-tilesparse/
+subfloor/
 ├── accounting.py     bit bütçeleri, özdeşlik, B*, canlı bant
 ├── scoring.py        §4.3'ün saliency'leri
 ├── tiling.py         tile bölümlemesi, dondurulmuş maske

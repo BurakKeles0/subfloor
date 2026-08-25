@@ -100,13 +100,13 @@ Depoda **git remote yok**. İki yol var ve defter ikisini de destekliyor.
 **A — zip (yayınlama kararı gerektirmez, önerilen).** Yerelde:
 
 ```bash
-git archive --format=zip -o ~/tilesparse-code.zip HEAD
+git archive --format=zip -o ~/subfloor-code.zip HEAD
 ```
 
 0.4 MB çıkıyor (78 dosya). Sonra:
 
 - **Kaggle**: Datasets → New Dataset → zip'i yükleyin → notebook'a *Add Data* ile
-  ekleyin. Defter `/kaggle/input/**/tilesparse-code.zip` altında kendisi bulur.
+  ekleyin. Defter `/kaggle/input/**/subfloor-code.zip` altında kendisi bulur.
 - **Colab**: Drive'a koyun. Defter `MyDrive` altında arar.
 
 **B — uzak depo.** GitHub'a itin ve defterin ilk hücresinde `REPO_URL`'i doldurun.
@@ -122,13 +122,13 @@ sizin kararınız, bu yüzden zip yolu varsayılan.
 ## Kaggle — adım adım
 
 1. Yeni Notebook → Settings → **Accelerator: GPU T4 ×2**, **Internet: On**
-2. `cloud/tilesparse_cloud.ipynb`'yi yükleyin, veya ilk hücreyi elle koşturun:
+2. `cloud/subfloor_cloud.ipynb`'yi yükleyin, veya ilk hücreyi elle koşturun:
 
 ```python
 import zipfile, glob
-z = glob.glob('/kaggle/input/**/tilesparse-code.zip', recursive=True)[0]
-zipfile.ZipFile(z).extractall('/kaggle/working/tilesparse')
-%cd /kaggle/working/tilesparse
+z = glob.glob('/kaggle/input/**/subfloor-code.zip', recursive=True)[0]
+zipfile.ZipFile(z).extractall('/kaggle/working/subfloor')
+%cd /kaggle/working/subfloor
 !pip install -q -r cloud/requirements.txt
 ```
 
@@ -168,9 +168,9 @@ bir Dataset'e yazın.
 ```python
 from google.colab import drive; drive.mount('/content/drive')
 import zipfile, glob
-z = glob.glob('/content/drive/MyDrive/**/tilesparse-code.zip', recursive=True)[0]
-zipfile.ZipFile(z).extractall('/content/tilesparse')
-%cd /content/tilesparse
+z = glob.glob('/content/drive/MyDrive/**/subfloor-code.zip', recursive=True)[0]
+zipfile.ZipFile(z).extractall('/content/subfloor')
+%cd /content/subfloor
 !pip install -q -r cloud/requirements.txt
 !python cloud/preflight.py --resume-root /content/resume
 ```
@@ -187,7 +187,7 @@ oturumda bitirin. Drive'a 12 GiB blok yazmak bloğun kendisinden uzun sürer:
 Bittiğinde yalnız sonucu Drive'a kopyalayın:
 
 ```python
-!cp /content/resume/*.json /content/drive/MyDrive/tilesparse/
+!cp /content/resume/*.json /content/drive/MyDrive/subfloor/
 ```
 
 ---
