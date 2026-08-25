@@ -1,0 +1,11 @@
+# Cloud extras only.  torch is deliberately NOT pinned: Colab and Kaggle ship a
+# build matched to their driver, and replacing it costs ten minutes and usually
+# breaks triton -- which the pipeline needs, since `torch.compile` on two
+# elementwise kernels is worth 1.64-1.87x (docs/STATUS.md section 6.5).
+#
+# transformers >= 5 is NOT optional: `hf_llama.load_llama` calls
+# `from_pretrained(dtype=...)`, which is a v5 keyword.  On v4 the failure is an
+# unrelated-looking TypeError several frames deep.
+transformers>=5.0
+datasets>=3.0
+sentencepiece
