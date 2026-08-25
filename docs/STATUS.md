@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-25 · HEAD `PENDING` · Testler: **632 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-25 · HEAD `515eb35` · Testler: **632 geçiyor, 6 atlanıyor**
 > Bu oturumun ölçüm dersleri **§14**'te — hız kazançlarından daha taşınabilir.
 
 ---
@@ -1603,6 +1603,10 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `a3d5a05` | **§8.1'in dikişi GPU'da hiç koşmamış** (§6.12). Bir yolda **beş** kusur, beşi de 599 CPU testinin kör noktasında. Zincir artık uçtan uca koşuyor: gerçek Llama blokları → `sequential_calibrate` → `run_config` → `streamed_perplexity` |
 | `7872949` | **Süpürme ızgaranın ortasında 65,536 kodsözcüğü tarıyordu** (§6.13). Üç sabit arasındaki yazılmamış eşitsizlik; 21 hücrenin 8'i. Ağırlıklı **1.25×**, kalite bit-birebir. Ayrıca `bench_guard`: boşluk testi artık alışkanlık değil **assert**, çünkü alışkanlığın baktığı sayı boş kartta %42 okuyor |
 | `96f973b` | **`TILE_TIMINGS` `n_tiles` kaydedilerek yeniden ölçüldü** ve modelin **sekizinci hatası** çıktı (§6.14): 4 satırın altında hiç örnek yokmuş. Toplam **15.0'da kaldı** ama **tepe ortadan ince uca kaydı**, T=1'de duvar geri geldi, Tasarım G/F üçüncü kez yer değiştirdi |
+| `9990d53` | **Üç kaldıraç açıldı**, ve biri `run_config`'ten **erişilemiyormuş** (`compensate_block`). Varsayılanlar adlandırılmış sabitlerde, çözülen değer her kayda yazılıyor |
+| `9dba639` | **`m1_run.py` yazıldı — §8.1 kapandı.** Blok granülerliğinde checkpoint; testi "resume çalışıyor" değil **"resume cevapta görünmez"**. Ayrıca fp16'nın CPU'da 4.3× **yavaş** olduğu bulundu |
+| `ffb8a06` + `ac45c1b` | **Sürücü gerçek modelde koştu** ve maliyet modeli ilk kez **koşarak** sınandı: blok başına 65 s dediği yerde **339 s** (§6.16). Dokuz hatanın hiçbirinin sınıfı değil — liste doğru, **oranlar** yanlış |
+| `515eb35` | **Bellek baskısı ölçüldü** (Hessian'ları bırakmak **1.46×**, §6.17) ve **fp16 geri kapatıldı**: gerçek blokta 1.00×, onu haklı çıkaran ölçüm tek katmanın 512 satırıymış |
 | `5b0a4d3` | **`SCALE_FIT_MULTIPLIER` de satır eksenine yayıldı** — **dokuzuncu hata** (§6.15). Eğri U şeklinde (2.60 … 1.65 … 2.17) ve eski 1.39 hepsinin altında, yani "fiti atmanın maliyet gerekçesi yok" reddi kaldıracı **küçük gösteren** bir sayıyla savunulmuş. Ayrıca ölçüm artık **tekrarlanıyor**: iki koşu, en büyük sapma %3.4 |
 
 **08-24 oturumunun yayı, tek satırda:** hat 17 günden 12'ye indi (`1efa971`),
