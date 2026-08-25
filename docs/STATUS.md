@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-25 · HEAD `ffb8a06` · Testler: **629 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-08-25 · HEAD `PENDING` · Testler: **632 geçiyor, 6 atlanıyor**
 > Bu oturumun ölçüm dersleri **§14**'te — hız kazançlarından daha taşınabilir.
 
 ---
@@ -145,6 +145,7 @@ Ayrıca hiç ölçülmemiş: **eval'in gerçek maliyeti** (238 s yalnız WikiTex
 | fp16 arama **eklendi, varsayılan kapalı** | 08-23 | 1.3–1.7×, bedel ≤%1 ve **belirlenimci**. Kaliteyi ölçülebilir biçimde değiştirdiği için varsayılan olması bir karar gerektirir |
 | **Kronecker kongrüansı eklendi, varsayılan kapalı** | 08-24 | Gerçek katmanda `H512` kolunda −0.03…−0.31% (lehte), rotasyon terimi **5.52×**. Bit-birebir olmadığı için açmak ayrı bir karar (§6.8, §8.5) |
 | ~~**fp16 arama ve telafi bloklaması da kapalı kaldı**~~ | 08-24 | Kullanıcı kararı: şimdiye kadarki her kalite sayısı üçü de kapalıyken alındı. **08-25'te geçersiz kılındı** — silinmedi, çünkü M0'ın sayıları hâlâ o rejimde |
+| **fp16 arama geri KAPANDI** | 08-25 | Sekiz saat açık kaldıktan sonra gerçek blok şekillerinde yeniden ölçüldü: **1.00×**. Onu haklı çıkaran 1.09–1.22× tek katmanın 512 satırıyla alınmıştı. CPU'da 4.3× yavaş, kalite ≤%0.90. Açıkça istenirse çalışıyor (§6.17) |
 | **Üç kaldıraç AÇILDI** | 08-25 | Kullanıcı kararı. `run_config`'in varsayılanı artık kron + fp16 + telafi bloklaması; M1 15.0 → **7.5 g**, Tasarım F 20.1 → 10.6 saat. Kıyaslanabilirlik bedeli **not düşülerek değil ölçülerek** kapatılıyor: sarsma koşusu aynı konfigürasyonu bir kez iki kolda da koşuyor (§8.5) |
 | **TF32 kapandı — kalite yüzdesiyle değil** | 08-24 | Hattı kırıyor: döndürülmüş alt-Hessian Cholesky'den geçmiyor, sönümleme payının %85'i gidiyor. Çalıştığı yerde de %3.2'yi aşan tek kol (§6.9) |
 | **Analitik en-yakın-kodsözcüğü** taramanın yerine | 08-23 | Kodsözcüğü uzayının yapısı aramayı çözüyor. Uçtan uca 1.3–4.0×, float64'te kesin (§6.4) |
@@ -1200,6 +1201,82 @@ yapardı. Tekrar görülene kadar açık.
 
 ---
 
+### 6.17 Bellek baskısı ölçüldü, ve fp16 sekiz saat sonra geri kapandı
+
+08-25'in ikinci yarısı. §6.16 sürücünün blok başına 339 s harcadığını ve modelin
+65 s dediğini bırakmıştı; boşluğun `run_config`'in **içinde** olduğu ve
+**bağlamla** büyüdüğü ölçülmüştü (84 s ısınmış → 142 s soğuk ayrı süreçte →
+339 s sürücüde). Hipotez bellek baskısıydı.
+
+**Doğrulandı, ve düzeltme ölçüldü.** Aynı yedi katman, aynı sırayla, tek süreçte
+dönüşümlü:
+
+| | süre | tepe tahsis |
+|---|---|---|
+| yedi Hessian blok boyunca tutuluyor (eski) | 122.7 s | 5.40 GiB |
+| **her katmanınki bitince bırakılıyor** | **84.2 s** | 5.02 GiB |
+| | **1.46×** | |
+
+> **Mekanizma sezgiye aykırı ve taşınmaya değer.** Tepe yalnız 0.38 GiB
+> düşüyor ama süre 1.46× iyileşiyor. Kazanç *sığdırmaktan* değil, ayırıcının
+> blokları tahliye edip yeniden istemek yerine **yeniden kullanabilmesinden**
+> geliyor. Bir bellek tavanı testi bunu göremezdi — ve bir doğruluk testi de
+> göremez, çünkü cevap değişmiyor. Koruyan test `weakref` ile **referansı**
+> izliyor.
+
+Yan sayı: sıkıştırma tek katmanda **5.4 GiB** tepe yapıyor, kullanılabilir
+6.8 GiB'de. Kalibrasyon setini batch başına taşımaya çevirmeseydik (08-25 sabahı)
+üstüne 4.0 GiB daha binecekti — **9.4 GiB, kartın tamamından fazla**. Tam koşu
+OOM ile ölürdü.
+
+**Ve fp16 geri kapandı.** Sabah üç kaldıraç açılmıştı; fp16 sekiz saat açık
+kaldı ve gerçek blok şekillerinde yeniden ölçülünce **hiçbir şey kazandırmadığı**
+görüldü:
+
+| katman | fp32 | fp16 | oran |
+|---|---|---|---|
+| q_proj 4096×4096 | 6.22 s | 6.21 s | **1.002×** |
+| gate_proj 11008×4096 | 15.99 s | 15.98 s | **1.000×** |
+
+Onu haklı çıkaran 1.09–1.22× **tek bir katmanda**, üstelik `o_proj`'un 4096
+satırının **512'siyle** ölçülmüştü. O boyutta arama geçen sürenin büyük bir
+kesri ve fırlatma bağımlı; gerçek genişliklerde süpürme bant genişliği bağımlı
+ve fp16'nın kaldıracağı bir şey kalmıyor. **Bir rejimde ölçülmüş, hepsinde
+uygulanmış** — bu hafta düzeltilen her sabitle aynı şekil.
+
+Bilanço, üç kalemin üçü de ölçülü:
+
+| kalem | ölçülen |
+|---|---|
+| GPU'da hız | **1.00×** |
+| CPU'da hız | **0.23×** (4.3× yavaş, aritmetik emüle) |
+| kalite | ≤%0.90 kötü (§6.9) |
+
+Hiçbir yerde kazandırmayan, bir yerde 4.3× kaybettiren ve kaliteye mal olan bir
+kaldıraç. **Varsayılan kapandı; açıkça istenirse hâlâ çalışıyor** — bu projede
+her ret erişilebilir kalıyor ki bir sonraki yeniden fiyatlayabilsin.
+
+> **Kalan iki kaldıraç aynı denetimi borçlu.** `rotate_kron`'un 5.52×'i §6.8'in
+> tile-ağırlıklı ortalaması, telafi bloklamasının 6.63×'i bir terim oranı, ve
+> **ikisi de gerçek blokta ölçülmedi**. Model bir blokta 5.2× iyimser (§6.16) ve
+> türetilmiş kaldıraç çarpanları adı konmuş şüpheli.
+
+**Ölçüm aracına dair iki hata daha, ikisi de benim.** Birincisi: §14.2'nin
+"kartın boş olduğunu doğrula" kuralı yalnız bir **ön-uçuş** kontrolü, ve
+dakikalarca süren bir ölçümde sonradan gelen çekişmeyi hiçbir şey görmüyor.
+Üstelik dönüşümlü A/B bunu **gizliyor** — çekişme iki kola da bindiği için
+yayılım küçük kalıyor ve her oran 1.00×'e sürükleniyor. Bir fp16 ölçümü tam
+olarak böyle kirlendi (başka bir projenin Python'u kartta).
+
+İkincisi: düzeltmeyi önce **saate** bağladım, ve guard ilk gerçek ölçümde
+**kendi yüküne** ateş etti — çünkü ölçüm koşarken saat zaten yüksek, kendi
+çekirdeklerimizden. Bunu `require_quiet_gpu`'nun docstring'ine ben yazmıştım.
+Doğru sinyal **meşgul kart değil, yabancı süreç**: bir PID ya vardır ya yoktur
+ve bizim çekirdeklerimiz PID üretmez. `alternating` artık başlangıçta taban
+alıyor ve **sonradan geleni** yakalıyor.
+
+---
+
 ## 7. Denenip **reddedilenler** — tekrar denenmesin
 
 Bu bölüm kasıtlı olarak uzun. Bir fikrin denenip elendiğini kaydetmemek, onu
@@ -1214,7 +1291,7 @@ ikinci kez denemek demek.
 | **Katman-başı ölçek** (`per_layer`) | %11, yeniden ölçümde T=4'te **+87.9%** | Küçük `T`'de tile'ların ölçekleri gerçekten farklı |
 | **Rotasyonu daraltmak** (blok-köşegen RHT) | `R8` ≈ rotasyonsuz (−3.3%) | Rotasyonun işi kalın kuyruğu **geniş** yaymak; 8 koordinat içinde norm değişmez |
 | **TF32** | **hattı kırıyor** | Ölçüldü 08-24 ve iş kalite yüzdesine kalmadı: T=4'te döndürülmüş alt-Hessian Cholesky'den geçmiyor, sönümleme payının %85'i gidiyor. Çalıştığı yerde de +%4.8 ile Kapı B'nin %3.2'sini aşan tek kol (§6.9). **Kapandı** |
-| **fp16 arama** | 1.3–1.7×, bedel ≤%1 | Reddedilmedi, **varsayılan kapalı**: kaliteyi ölçülebilir biçimde değiştirdiği için bir karar gerektirir |
+| **fp16 arama** | gerçek blokta **1.00×**, CPU'da **0.23×**, kalite ≤%0.90 | 08-25'te açıldı, sekiz saat sonra **reddedildi**. Onu haklı çıkaran 1.09–1.22× tek bir katmanın 512 satırıyla ölçülmüştü; gerçek genişliklerde hiçbir şey kazandırmıyor (§6.17). Açıkça istenirse çalışıyor |
 
 ### 7.2 Mühendislik gerekçesiyle elenenler
 
@@ -1244,9 +1321,15 @@ ikinci kez denemek demek.
 
 ## 8. Sırada ne var
 
-### 8.1 Bir sonraki oturumun ilk işi — kritik yol
+### 8.1 ~~Bir sonraki oturumun ilk işi~~ — **KAPANDI 08-25**
 
-**`experiments/m1_run.py` yaz: tam model sürücüsü + checkpoint.**
+**`experiments/m1_run.py` yazıldı, gerçek modelde koştu, resume doğrulandı.**
+Kalan iş bu bölümde değil: sıradaki engel §8.6'nın ilk maddesi (modelin gerçek
+blokta 5.2× iyimser olması) ve ondan sonra Tasarım F.
+
+*Aşağıdaki tarif, betiğin ne yapması gerektiğini anlatan hâliyle duruyor.*
+
+**`experiments/m1_run.py`: tam model sürücüsü + checkpoint.**
 
 Şu an yok, ve "sıkıştırılmış ppl hiç ölçülmedi" durumunun sebebi bu.
 `calibrate.sequential_calibrate` (mevcut, `compress_fn` alıyor) ile
@@ -1319,11 +1402,16 @@ Sıra önemli: ön-kayıt donmadan M1 başlamaz. Ama F koşusu ön-kayda girmiyo
 bit-birebir değil, ve şimdiye kadarki her kalite sayısı üçü de kapalıyken
 alındı — açmak bir karar, bir sonuç değil (kullanıcı kararı, 08-24).
 
-| kaldıraç | nasıl | hız | kalite bedeli |
+| kaldıraç | durum | iddia edilen hız | kalite bedeli |
 |---|---|---|---|
-| `rotate_kron=True` | Kronecker kongrüansı (§6.8) | rotasyon terimi 5.52× | gerçek katmanda −0.03…−0.31% (**lehte**) |
-| `search_dtype=float16` | arama fp16'da (§6.9) | codebook terimi 1.24–1.52× | ≤%0.90 |
-| `compensate_block=512` | telafi bloklanmış (§6.11c) | telafi terimi 6.63× | 2.7e-6…4.8e-6 |
+| `rotate_kron=True` | **açık** (08-25) | rotasyon terimi 5.52× — **türetilmiş** | −0.03…−0.31% (**lehte**) |
+| `compensate_block=512` | **açık** (08-25) | telafi terimi 6.63× — **türetilmiş** | 2.7e-6…4.8e-6 |
+| ~~`search_dtype=float16`~~ | **reddedildi** (§6.17) | gerçek blokta **1.00×** | ≤%0.90, CPU'da 4.3× yavaş |
+
+> **İki açık kaldıracın hız iddiası da ÖLÇÜLMEDİ, türetildi** — biri §6.8'in
+> tile-ağırlıklı ortalaması, diğeri bir terim oranı. fp16 aynı şekilde
+> türetilmişti ve gerçek blokta 1.00× çıktı. Model bir blokta 5.2× iyimser
+> (§6.16) ve bu çarpanlar adı konmuş şüpheli. **Sıradaki denetim bu.**
 
 Birlikte **M1 15.0 → 7.5 gün** (1.99×), Tasarım F 20.1 → 10.6 saat. `fp16` ile
 `kron` ayrık terimlere biniyor ve ayrık-null'a göre %99 birleşiyorlar (§6.9).
@@ -1350,6 +1438,12 @@ Tek tek: kron 10.3 g (1.46×), telafi 13.7 g (1.10×), fp16 13.6 g (1.10×).
   `T=max` için sert kısıt, hâlâ yalnızca ima edilmiş
 - **Eval maliyeti** — 238 s yalnız WikiText-2; C4 ve 5 zero-shot görev hiç
   ölçülmedi ve ön-kayıt §4 ikisini de şart koşuyor
+- **Modelin gerçek blokta 5.2× iyimserliği** (§6.16) — **sıradaki iş**. Boşluk
+  `run_config`'in içinde ve bağlamla büyüyor. Bir kısmı ölçüldü ve düzeltildi
+  (Hessian'ları bırakmak, 1.46× — §6.17); kalanı için iki türetilmiş kaldıraç
+  çarpanı (`rotate_kron` 5.52×, telafi 6.63×) gerçek blokta ölçülmeli
+- **`TILE_TIMINGS` ısınmış ölçüldü** (§6.16) — `m0_pass_breakdown` ikinci çağrıyı
+  raporluyor, gerçek koşuda her şekil bir kez soğuk karşılanıyor
 - **Fiti tile'lar arasında toplamak** — §7.2'de bit-birebir olmadığı için
   alınmamıştı (2.16×). §6.15 fitin payını ince uçta 2.60× ölçtü, yani o ret
   yeniden fiyatlanmayı hak ediyor; erişilebilir tek biçim o
@@ -1457,7 +1551,7 @@ bu belge.
 *(`experiments/m1_run.py` **08-25'te yazıldı** — §8.1 kapandı.)*
 
 ```bash
-python -m pytest tests/ -q                         # 629 test, ~2.8 dk
+python -m pytest tests/ -q                         # 632 test, ~3 dk
 HF_HUB_DISABLE_XET=1 python experiments/m0_dense_ppl.py --seqlens 2048 4096 --device cuda
 HF_HUB_DISABLE_XET=1 python -u experiments/m0_rotation_value.py \
     --tiles 4 16 max --seqs 16 --rows 512 --solve-device cuda --solve-dtype float32

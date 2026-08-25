@@ -195,6 +195,52 @@ def test_compress_fn_must_return_the_same_shape():
         )
 
 
+def test_a_finished_layer_s_hessian_is_released_before_the_next_one():
+    """The fix that made a block 1.46x faster, and the only kind of test that
+    can hold it.
+
+    A block's seven accumulators are 846 MB at Llama-2-7B's widths and one
+    layer's compression peaks at 5.4 GiB against 6.8 usable, so holding all
+    seven for the whole block leaves the allocator evicting and re-requesting
+    instead of reusing.  Measured on a real block: 122.7 s holding against
+    84.2 s releasing, while the peak moved only 5.40 -> 5.02 GiB.  The win is
+    the room to reuse, not the peak -- which is why a memory-ceiling test would
+    not see it either.
+
+    Nothing about the ANSWER changes, so no correctness test can catch a
+    regression here.  What can is the reference itself: take a weakref to one
+    layer's Hessian and require it to be dead by the time a later layer is
+    compressed.
+    """
+    import gc
+    import weakref
+
+    blocks = _blocks(2)
+    seen: dict[str, object] = {}
+    order: list[str] = []
+
+    def compress(i, name, problem):
+        order.append(name)
+        # Both indices are in the SAME block -- a check that straddled two
+        # blocks would pass on its own, since each block builds a fresh
+        # accumulator dict and the previous one goes out of scope regardless.
+        # That vacuous version was written first and survived the mutation.
+        if len(order) == 1:
+            seen["first"] = weakref.ref(problem.H)
+        elif len(order) == 2:
+            gc.collect()
+            assert seen["first"]() is None, (
+                f"the Hessian of {order[0]} was still alive while {name} was "
+                "being compressed in the same block; every accumulator is held "
+                "at once and the allocator has nothing to reuse"
+            )
+            seen["checked"] = True
+        return problem.W
+
+    Cal.sequential_calibrate(blocks, list(_inputs()), compress)
+    assert seen.get("checked"), "the block had too few layers to check"
+
+
 def test_sequential_calibrate_validates_inputs():
     with pytest.raises(ValueError, match="no blocks"):
         Cal.sequential_calibrate([], _inputs(), lambda i, n, p: p.W)

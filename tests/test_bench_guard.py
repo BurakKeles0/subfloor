@@ -91,7 +91,7 @@ def test_alternating_runs_the_arms_round_robin():
     actually -0.8%.  Interleaving makes a drift hit both arms."""
     order = []
     arms = {"a": lambda: order.append("a"), "b": lambda: order.append("b")}
-    BG.alternating(arms, reps=3, warmup=1)
+    BG.alternating(arms, reps=3, warmup=1, watch=False)
     # warmup pass, then three interleaved pairs -- never "aaa" then "bbb".
     assert "".join(order) == "ab" * 4
     assert order[2::2] == ["a", "a", "a"]
@@ -106,7 +106,7 @@ def test_alternating_reports_the_spread():
     real = bench_guard._once
     bench_guard._once = lambda fn: next(times)
     try:
-        out = BG.alternating(arms, reps=3, warmup=2)
+        out = BG.alternating(arms, reps=3, warmup=2, watch=False)
     finally:
         bench_guard._once = real
 
@@ -121,16 +121,57 @@ def test_alternating_discards_the_warmup():
     first repetitions measure the clock coming up rather than the work."""
     calls = []
     arms = {"a": lambda: calls.append(1)}
-    out = BG.alternating(arms, reps=2, warmup=3)
+    out = BG.alternating(arms, reps=2, warmup=3, watch=False)
     assert len(calls) == 5                    # 3 warmup + 2 measured
     assert len(out["a"]["samples"]) == 2      # only the measured ones reported
 
 
+def test_alternating_refuses_a_measurement_taken_under_contention(monkeypatch):
+    """The gap `require_quiet_gpu` cannot cover, and it cost a real measurement.
+
+    That check is pre-flight: it answers "was the card quiet a moment ago".  A
+    timing that runs for minutes can have another job arrive halfway through and
+    nothing notices -- the arms interleave, so contention lands on both, the
+    SPREAD stays small, and every ratio drifts toward 1.00x.  On 2026-08-25 that
+    produced a clean-looking 0.993x and 1.005x for a bandwidth lever while
+    another project's Python held the card the whole time.
+
+    So the window is watched, not just its start.
+    """
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    seen = iter([[], [(4242, "other.exe")], [(4242, "other.exe")]])
+    monkeypatch.setattr(BG, "foreign_compute_pids",
+                        lambda: next(seen, [(4242, "other.exe")]))
+    with pytest.raises(RuntimeError, match="contended GPU"):
+        BG.alternating({"a": lambda: None}, reps=2, warmup=0)
+
+
+def test_alternating_watches_for_a_PID_not_a_busy_card(monkeypatch):
+    """The signal has to survive our OWN load, and the clock does not.
+
+    A during-the-run check keyed on the clock fires on itself: once the
+    measurement is going the card is hot because WE are working it, which
+    `require_quiet_gpu` says in as many words.  The first version of this watch
+    was written that way anyway and refused the very next measurement.
+
+    A foreign PID is different in kind -- our kernels cannot produce one -- and
+    what is flagged is arrival, since the unnameable entries WDDM always lists
+    would make an absolute check fire forever.
+    """
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    always_there = [(11060, "[Insufficient Permissions]")]
+    monkeypatch.setattr(BG, "foreign_compute_pids", lambda: list(always_there))
+    out = BG.alternating({"a": lambda: None}, reps=2, warmup=0)
+    assert out["a"]["foreign_processes"] == [], (
+        "a process present from the start is the baseline, not an intruder"
+    )
+
+
 def test_alternating_rejects_an_empty_or_degenerate_call():
     with pytest.raises(ValueError, match="no arms"):
-        BG.alternating({}, reps=2)
+        BG.alternating({}, reps=2, watch=False)
     with pytest.raises(ValueError, match="reps must be positive"):
-        BG.alternating({"a": lambda: None}, reps=0)
+        BG.alternating({"a": lambda: None}, reps=0, watch=False)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda")
@@ -145,5 +186,5 @@ def test_alternating_waits_for_the_queue():
         for _ in range(40):
             y = y @ x
     out = BG.alternating({"heavy": heavy, "light": lambda: None},
-                         reps=3, warmup=2)
+                         reps=3, warmup=2, watch=False)
     assert out["heavy"]["median"] > out["light"]["median"] * 10

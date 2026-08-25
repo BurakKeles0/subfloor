@@ -93,6 +93,55 @@ class GPUState:
                 f"utilization {self.utilization_pct:.0f}% [untrusted]")
 
 
+#: Executables nvidia-smi lists as "compute apps" on this machine that are the
+#: desktop, not anyone's workload.  WDDM puts the shell, the search box and every
+#: Electron window in that list, so a bare "is anything else on the card" check
+#: is useless without it.
+_DESKTOP = ("shellhost.exe", "crossdeviceresume.exe", "startmenuexperiencehost.exe",
+            "searchhost.exe", "textinputhost.exe", "msedgewebview2.exe",
+            "claude.exe", "explorer.exe", "dwm.exe", "ms-teams.exe",
+            "whatsapp.root.exe")
+
+
+def foreign_compute_pids() -> list[tuple[int, str]]:
+    """Processes on the card that are neither ours nor the desktop.
+
+    THE SIGNAL THAT SURVIVES OUR OWN LOAD, which the clock does not.  Once a
+    measurement is running the clock is high because WE are working the card --
+    `require_quiet_gpu` says so in as many words -- so a during-the-run check
+    keyed on the clock fires on itself.  It did, on 2026-08-25, on the first
+    measurement after the watch was added.
+
+    A foreign PID is different in kind: it is there or it is not, and our own
+    kernels cannot produce one.
+
+    Two entries here are unnameable -- WDDM reports `[Insufficient Permissions]`
+    for processes of other sessions -- and they are always present, so an
+    absolute list is the wrong test.  `alternating` takes a BASELINE before it
+    starts and flags only what ARRIVES, which is the thing a pre-flight check
+    cannot see anyway.
+    """
+    import os
+    out = subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=pid,process_name",
+         "--format=csv,noheader"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if out.returncode != 0:
+        return []
+    mine = os.getpid()
+    found = []
+    for line in out.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",", 1)]
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid, name = int(parts[0]), parts[1]
+        if pid == mine or name.rsplit("\\", 1)[-1].lower() in _DESKTOP:
+            continue
+        found.append((pid, name))
+    return found
+
+
 def _smi(fields: str) -> list[str]:
     out = subprocess.run(
         ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
@@ -184,6 +233,8 @@ def alternating(
     *,
     reps: int = 5,
     warmup: int = 2,
+    watch: bool = True,
+    strict: bool = True,
 ) -> dict[str, dict]:
     """Run every arm round-robin in ONE process and report the spread.
 
@@ -199,6 +250,17 @@ def alternating(
     Returns per arm: median, min, max, and `spread` = (max - min) / median.  A
     large spread is the signal to distrust the median, and it catches contention
     that no counter reports.
+
+    `watch` SAMPLES THE CARD BETWEEN REPETITIONS, and that is not the same check
+    `require_quiet_gpu` does.  That one is pre-flight -- it answers "was the card
+    quiet a moment ago" -- and this file's own docstring told callers to run it
+    before the speed phase and not during.  A measurement that takes minutes can
+    have another job arrive halfway through, and nothing would notice: the arms
+    interleave, so contention lands on both and the SPREAD stays small while
+    every ratio drifts toward 1.00x.  That is the exact signature of the trap
+    section 14.2 records, and on 2026-08-25 it produced a clean-looking 0.993x
+    and 1.005x for a lever whose whole benefit is bandwidth -- with another
+    project's Python on the card the entire time.
     """
     if not arms:
         raise ValueError("no arms to time")
@@ -209,10 +271,29 @@ def alternating(
         for fn in arms.values():
             _once(fn)
 
+    # Sampled between repetitions, never inside a timed region: the nvidia-smi
+    # call costs tens of milliseconds and would land in whichever arm ran next.
+    #
+    # A FOREIGN PID, not the clock.  The clock is high during a measurement
+    # because we are the ones working the card, so a clock-keyed watch fires on
+    # itself -- which is exactly what happened the first time this was written.
+    watching = watch and torch.cuda.is_available()
+    baseline = dict(foreign_compute_pids()) if watching else {}
+    intruders: dict[int, str] = {}
+
+    def sweep():
+        for pid, name in foreign_compute_pids():
+            if pid not in baseline:
+                intruders[pid] = name
+
     samples: dict[str, list[float]] = {name: [] for name in arms}
     for _ in range(reps):
+        if watching:
+            sweep()
         for name, fn in arms.items():
             samples[name].append(_once(fn))
+    if watching:
+        sweep()
 
     out = {}
     for name, xs in samples.items():
@@ -224,5 +305,16 @@ def alternating(
             "max": xs_sorted[-1],
             "spread": (xs_sorted[-1] - xs_sorted[0]) / median if median else 0.0,
             "samples": xs,
+            "foreign_processes": [f"{p} {n}" for p, n in intruders.items()],
         }
+
+    if intruders:
+        who = ", ".join(f"{p} ({n.rsplit(chr(92), 1)[-1]})"
+                        for p, n in intruders.items())
+        msg = (f"another process ARRIVED on the card mid-measurement: {who}."
+               f"  Interleaving hides that -- contention lands on both arms, the "
+               f"spread stays small, and every ratio drifts toward 1.00x")
+        if strict:
+            raise RuntimeError("timing taken on a contended GPU: " + msg)
+        print(f"  [WARNING] {msg}")
     return out

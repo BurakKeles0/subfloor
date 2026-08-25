@@ -62,11 +62,19 @@ DEFAULT_TILES = (1, 2, 4, 8, 16, 32, Tl.MAX_TILE)
 # What the pipeline runs with (user decision, 2026-08-25)
 #
 # All three were measured, tested and left OFF on 2026-08-24 because every
-# quality number to that point had been taken without them.  They are on now,
-# and together they take M1 from 15.0 days to 7.5.  The comparability that costs
-# is not being waved at: the shakedown run measures the same configuration both
-# ways once, so every later number can be tied back to the M0 baseline through a
-# MEASURED offset instead of an assumption.
+# quality number to that point had been taken without them.  Two are on now.
+#
+# THE THIRD WAS TURNED BACK OFF THE SAME DAY.  fp16 search was on for eight
+# hours and then re-measured at the shapes a real block has: 1.00x.  What had
+# justified it was a single 512-row layer, and the factor fed to the cost model
+# was derived from that rather than measured.  Its docstring below carries the
+# numbers, because a rejection is worth more written down than quietly reverted.
+#
+# The two that remain still owe the same audit: `rotate_kron`'s 5.52x is a
+# tile-weighted average from section 6.8 and the compensation's 6.63x is a term
+# ratio, and NEITHER has been measured through a real block.  The cost model is
+# 5.2x optimistic on one (section 6.16) and derived lever factors are the named
+# suspect.
 #
 # Named here rather than written into the parameter defaults for a reason.
 # `run_config` is two things at once -- the pipeline, and the harness the M0
@@ -84,21 +92,35 @@ DEFAULT_TILES = (1, 2, 4, 8, 16, 32, Tl.MAX_TILE)
 #: moves -0.03..-0.31%, i.e. in our favour (section 6.8).
 PIPELINE_ROTATE_KRON = True
 
-#: Search the codebook in fp16 -- ON CUDA, and the qualifier is the point.
+#: Search the codebook in fp16.  OFF, and this is a rejection rather than a
+#: default that happens to be false -- it was on for eight hours on 2026-08-25
+#: and every reason for turning it on failed measurement.
 #:
-#: 1.24-1.52x on the codebook term there, at most 0.90% quality (section 6.9),
-#: and verified not to disturb the routing: the decoder's miss fraction is the
-#: same to within 0.1 pp in fp16 and fp32, so the inequality section 6.13 rests
-#: on still holds.
+#: What justified it: `m0_precision_levers` on 2026-08-24 measured 1.09-1.22x
+#: end to end.  That was ONE layer -- `o_proj` at 512 of its 4096 output rows --
+#: and the 1.38x term ratio handed to the cost model was derived from the
+#: median rather than measured at all.
 #:
-#: ON THE CPU IT IS 4.3x SLOWER, measured the moment it became a default and the
-#: test suite went from 2:44 to 6:20.  fp16 arithmetic is emulated there, so the
-#: lever runs backwards.  The measurement that justified it was a CUDA
-#: measurement and saying "fp16 is faster" without that qualifier is the same
-#: shape as every other constant corrected this week -- right in one regime,
-#: applied in all of them.  `_pipeline_search_dtype` resolves it per device and
-#: the record says which was used.
-PIPELINE_SEARCH_DTYPE = torch.float16
+#: Re-measured on a verified-quiet card at the three shapes a Llama-2-7B block
+#: actually has, alternating in one process:
+#:
+#:      q_proj    4096x4096   fp32  6.22 s   fp16  6.21 s   1.002x
+#:      gate_proj 11008x4096  fp32 15.99 s   fp16 15.98 s   1.000x
+#:
+#: Nothing.  At a 512-row layer the search is a large fraction of the pass and
+#: launch-bound, so halving the bytes per launch helps; at a real block's widths
+#: the sweep is bandwidth bound and there is nothing left for fp16 to remove.
+#: Same shape as every other constant corrected this week -- measured in one
+#: regime, applied in all of them.
+#:
+#: And it is not free elsewhere.  On the CPU it is 4.3x SLOWER (0.55 s a call
+#: against 2.34) because the arithmetic is emulated, and it costs up to 0.90%
+#: quality (section 6.9).  A lever that buys nothing where it was aimed, loses
+#: badly where it was not, and is not free either way has no defence.
+#:
+#: `search_dtype=torch.float16` still works when asked for explicitly; what is
+#: gone is the pipeline choosing it.
+PIPELINE_SEARCH_DTYPE = None
 
 #: Defer each block of the compensation sweep's errors into one matmul.  6.63x
 #: on the term; not bit-identical, but the difference is 2.7e-06..4.8e-06, which
@@ -112,11 +134,6 @@ PIPELINE_COMPENSATE_BLOCK = 512
 #: explicit request is how a caller loses the ability to ask for the old
 #: behaviour.
 _PIPELINE = object()
-
-
-def _pipeline_search_dtype(device: torch.device) -> torch.dtype | None:
-    """`PIPELINE_SEARCH_DTYPE` where it is a speedup, `None` where it is not."""
-    return PIPELINE_SEARCH_DTYPE if device.type == "cuda" else None
 
 
 # --------------------------------------------------------------------------- #
@@ -254,7 +271,7 @@ def run_config(
     if not kron_explicit:
         rotate_kron = PIPELINE_ROTATE_KRON
     if search_dtype is _PIPELINE:
-        search_dtype = _pipeline_search_dtype(problem.W.device)
+        search_dtype = PIPELINE_SEARCH_DTYPE
     if compensate_block is _PIPELINE:
         compensate_block = PIPELINE_COMPENSATE_BLOCK
 
