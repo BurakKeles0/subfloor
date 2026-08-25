@@ -275,3 +275,5 @@ rotasyonun maskeyi koruduğu, kapının gürültüde geçmediği.
 `tests/golden.py` özel bir dosya — `accounting.py`'yi **import etmez**. Golden
 değerleri çağıran bir test hiçbir şey kanıtlamaz; bu yüzden aynı sayılara iki
 bağımsız yoldan varılıyor.
+
+Bu çalışmanın bazı bölümleri yapay zekâ desteğiyle geliştirildi (Claude).
