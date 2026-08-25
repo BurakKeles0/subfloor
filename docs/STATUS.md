@@ -1157,6 +1157,13 @@ tile süresinden **ikisi hiç tekrarlanmadı** (%28 ve %65, §6.3). Betiğe
 
 ### 6.16 Sürücü koştu, ve model gerçek blokta 5.2× iyimser çıktı
 
+> **BU BAŞLIK 08-25'te DÜZELTİLDİ — §6.18'i okumadan buradan ayrılma.** Model
+> gerçek katmanda 5.2× iyimser değil, **1.03×**. Aşağıdaki 65 s'nin kendisi
+> yanlıştı: 5.52× ile fp16'nın 1.38×'i terimlere elle uygulanarak çıkarılmıştı
+> ve ikisi de fazla kredi verdi. Doğru karşılaştırma 339'a karşı **84**, ve
+> boşluğun tamamı **bağlam**. Bölüm olduğu gibi duruyor çünkü o günkü akıl
+> yürütme — ve yanlış çıkan tarafı — kayda değer.
+
 08-25. `m1_run.py` yazıldı (§8.1 kapandı) ve gerçek Llama-2-7B üzerinde koştu.
 İlk gerçek blok sıkıştırıldı, checkpoint yazıldı, ve **resume gerçek modelde
 doğrulandı** — "resuming at block 1 of 32", ardından blok 2, 3, 4.
@@ -1768,6 +1775,15 @@ python experiments/m0_vq_bits.py --all             # ~100 KB ağ, saniyeler
 | `ffb8a06` + `ac45c1b` | **Sürücü gerçek modelde koştu** ve maliyet modeli ilk kez **koşarak** sınandı: blok başına 65 s dediği yerde **339 s** (§6.16). Dokuz hatanın hiçbirinin sınıfı değil — liste doğru, **oranlar** yanlış |
 | `515eb35` | **Bellek baskısı ölçüldü** (Hessian'ları bırakmak **1.46×**, §6.17) ve **fp16 geri kapatıldı**: gerçek blokta 1.00×, onu haklı çıkaran ölçüm tek katmanın 512 satırıymış |
 | `5b0a4d3` | **`SCALE_FIT_MULTIPLIER` de satır eksenine yayıldı** — **dokuzuncu hata** (§6.15). Eğri U şeklinde (2.60 … 1.65 … 2.17) ve eski 1.39 hepsinin altında, yani "fiti atmanın maliyet gerekçesi yok" reddi kaldıracı **küçük gösteren** bir sayıyla savunulmuş. Ayrıca ölçüm artık **tekrarlanıyor**: iki koşu, en büyük sapma %3.4 |
+| `5271044` | **İki kaldıraç denetlendi**: kron ve telafi bloklaması gerçek blokta tuttu (%95–107); model gerçek katmanda 5.2× değil **1.03×** iyimser, yani boşluk aritmetikte değil bağlamda. Modelin iki kötümser kusuru düzeldi; `ROT_TILE_TIMINGS` on dört genişlikte |
+
+**08-25 oturumunun yayı, tek satırda:** gün, sürücünün ilk kez koşup modeli
+5.2× yalanlamasıyla başladı; bellek baskısının 1.46×'i ölçüldü, fp16 sekiz saat
+sonra kendi ölçümüyle düştü, ve kalan iki kaldıraç denetlenince **model haklı
+çıktı** — gerçek katmanda 1.03×. Yani günün asıl bulgusu bir hızlanma değil, bir
+**yer değiştirme**: aranan boşluk `run_config`'in aritmetiğinde değil, sürücünün
+onu koşturduğu bağlamda. Ve modelin o boşluğu kısmen gizlediği ortaya çıktı,
+çünkü hattın koşmadığı yoğun rotasyonu fiyatlıyordu.
 
 **08-24 oturumunun yayı, tek satırda:** hat 17 günden 12'ye indi (`1efa971`),
 sonra modelin iki eksik terimi bulununca gerçeğin ~40 olduğu anlaşıldı
