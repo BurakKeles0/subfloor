@@ -135,6 +135,16 @@ Defteri kullanmıyorsanız, bir hücreye **aynen** bu üç satır:
 !pip install -q -r cloud/requirements.txt
 ```
 
+> **`HF_HUB_DISABLE_XET=1` kurun.** Defter hücre 2'de kendisi kuruyor; elle
+> kuşturuyorsanız siz koyun. STATUS §10'un tuzağı: Xet ile HF indirmeleri
+> **0 B/s'de takılıyor**, ve belirti bir hata değil — ilerleme çubuğu olduğu
+> yerde duruyor, ekranda hiçbir şey yazmıyor. Özellikle C4 parçasını
+> çekerken vuruyor.
+
+```python
+import os; os.environ['HF_HUB_DISABLE_XET'] = '1'
+```
+
 Baştaki `!` şart: onsuz defter satırı **Python** sanar ve `SyntaxError` verir.
 URL'nin başına `$` koymayın — `$REPO_URL` defterin içindeki değişkenin adı,
 elle yazarken URL'nin kendisi geliyor. Kaggle'da oturum **Internet kapalı** başlar: Settings →
