@@ -492,6 +492,38 @@ Ayrıca `preflight.py`'nin sonunda bastığı beş **eşik** var
 ayarlandı ve başka bir kartta ölü bant başka yere düşer — §6.13 tam olarak bu
 hataydı ve ızgaranın 21 hücresinin 8'ini 65,536 kodsözcüğü taratıyordu.
 
+Ve listede olmayan, ama gerekçesini en açık söyleyen sabit
+`quantize.CHUNK_BUDGET_BYTES`. Kendi yorumu:
+
+> *One GiB is a judgement: **the card has 8** and the compressed layer, its
+> sub-Hessian and the activations all want room too.*
+
+Bu projede hiçbir tavan kullanılabilir VRAM'e göre ölçeklenmiyor. `auto_chunk`
+kaç tile'ı birlikte süpüreceğine `min(n_tiles, by_memory, by_saturation)` ile
+karar veriyor ve `by_memory` o 1 GiB'ı bölüyor — kart 16 GB olduğunda bu sayı
+kendiliğinden büyümüyor. Ölçüldü: T4'te sürücü kartın 14.6 GiB'ının **8.1**'ini
+kullanıyor, çünkü tavanlar kartın altında.
+
+Yükseltmenin işe yarayıp yaramadığını **mevcut ölçüm söyleyemiyor**, ve sebebi
+`CHUNK_TARGET_ROWS`'un kendi tablosunda yazılı:
+
+```
+shape (n_tiles)       1024    2048    3072    4096    8192   binds
+T=16 k=2944 (256)    1.00x   1.37x   1.33x   1.35x   1.35x   memory
+```
+
+"2048'in ötesi düz" sonucu, bağlayan şeyin satır hedefi değil **1 GiB'lık bellek
+tavanı** olduğu koşullarda alındı — yorumun kendisi söylüyor: *"three of the
+four shapes are held by `CHUNK_BUDGET_BYTES` anyway."* Yani o düzlük 8 GiB'lık
+kartın düzlüğü. Onu 16 GB'lık bir karta taşımak, §14.2'nin adıyla yasakladığı
+şey: **bir oranı, oranın kaynağı değişen bir yere taşımak.**
+
+Ölçmek isterseniz tek süreçte dönüşümlü A/B, `bench_guard` ile sessiz kart,
+ve `CHUNK_BUDGET_BYTES`'ı 1/2/4 GiB'ta gezdirip `m0_tile_timings.py`'yi
+tekrarlamak. Ama önce şunu bilin: darboğazın orada olduğu **gösterilmedi**.
+Sürücünün modele göre 2× açığı bağlamda, ve dizüstünde o açığın 1.46×'ini
+kapatan şey daha çok bellek kullanmak değil, **daha erken bırakmaktı** (§6.17).
+
 ### 3. Kaldıraçlar
 
 Hat şu an `rotate_kron=True`, `compensate_block=512`, `search_dtype=None`
