@@ -42,11 +42,22 @@ tensor çekirdeği avantajı da erişilebilir değil.
 | oturum sınırı | 12 saat | nominal 12, pratikte 3–6 |
 | haftalık kota | **30 GPU-saat** | yok, ama önceliksiz |
 | kalıcı disk | `/kaggle/working` **20 GB** | Drive **15 GB** (Gmail'le ortak) |
+| **host RAM** | **~29 GB** | **~12.7 GB** — model sığmıyor |
 | model | Dataset olarak bağlanır, bir kez | her oturumda 13 GB iner |
 
-**Kaggle bu iş için açık ara daha uygun.** Tek sebebi disk: bir noktanın
-checkpoint'i **~13 GiB**'e ulaşıyor ve Colab'ın ücretsiz 15 GB Drive'ına model
-ile birlikte sığmıyor.
+**Kaggle bu iş için açık ara daha uygun**, ve iki bağımsız sebeple.
+
+**Disk.** Bir noktanın checkpoint'i **16.06 GiB**'e ulaşıyor (aşağıdaki tablo) ve
+Colab'ın ücretsiz 15 GB Drive'ına model ile birlikte değil, **tek başına bile**
+sığmıyor.
+
+**Host RAM.** Bundan daha sert olanı bu. `hf_llama.load_llama` `device_map=None`
+ile yüklüyor — model bilerek CPU'da duruyor ve kalibrasyon döngüsü karta blok
+blok taşıyor, 7B'yi küçük bir kartta çalıştırılabilir kılan şey bu. Ama bedeli
+**13.5 GiB** host RAM, üstüne `capture_block_inputs`'ın tuttuğu 2.00 GiB
+aktivasyon biniyor. Kaggle'ın ~29 GB'ı bunu kaldırıyor; Colab ücretsiz katmanın
+~12.7 GB'ı **kaldırmıyor** ve süreç blok 0'dan önce OOM-kill yiyor.
+`cloud/preflight.py` bunu göremiyor: yalnız VRAM'e bakıyor, host RAM'e değil.
 
 ### Bir noktanın disk matematiği
 
@@ -70,23 +81,27 @@ F = tek bütçe (B=1.5), tek çekiliş, 7 tile boyutu. Noktalar **tamamen
 bağımsız** — aralarında hiçbir veri akışı yok, bu yüzden ayrı makinelere
 dağıtılabilirler.
 
-| T | modelin dediği | nereye |
+| T | modelin dediği | devam gerekir mi |
 |---|---|---|
-| 1 | 4.01 saat | Kaggle (devam gerekebilir) |
-| 2 | 3.34 saat | Kaggle |
-| 4 | 2.07 saat | Kaggle |
-| 8 | 1.54 saat | Colab — tek oturumda biter |
-| 16 | 1.14 saat | Colab |
-| 32 | 0.92 saat | Colab |
-| max | 0.66 saat | Colab |
+| 1 | 4.01 saat | muhtemelen |
+| 2 | 3.34 saat | sınırda |
+| 4 | 2.07 saat | hayır |
+| 8 | 1.54 saat | hayır |
+| 16 | 1.14 saat | hayır — **ilk nokta için bu** |
+| 32 | 0.92 saat | hayır |
+| max | 0.66 saat | hayır |
 | **toplam** | **13.7 saat** | |
 
-**Ucuz noktalar Colab'a, pahalılar Kaggle'a.** Sebep devam etme: 1 saatlik bir
-nokta tek oturumda biter ve hiç checkpoint'e ihtiyaç duymaz; 4 saatlik bir nokta
-Colab'ın ücretsiz katmanında büyük olasılıkla kesilir.
+**Hepsi Kaggle'a, sırayla.** Bu tablo bir zamanlar ucuz noktaları Colab'a
+dağıtıyordu; o dağıtım **yanlıştı** ve sebebi yukarıdaki host RAM satırı:
+Colab'ın ücretsiz katmanı modeli hiç tutamıyor, noktanın ucuz ya da pahalı
+olmasından bağımsız olarak. Paralellik isteniyorsa iki ayrı Kaggle oturumu
+gerekiyor — **aynı oturumda iki süreç değil**, çünkü iki host kopyası (2 × 13.5
+GiB) ve iki checkpoint (2 × 16.06 GiB) tek kutuya sığmıyor.
 
-Üç eşzamanlı GPU ile (1 Colab + Kaggle'ın T4×2'si) en uzun kol **~4.7 saat**.
-Kaggle kotası: pahalı üç nokta ≈ 9.4 GPU-saat, haftalık 30'un içinde rahat.
+Kaggle kotası: yedi noktanın tamamı ≈ 13.7 GPU-saat, haftalık 30'un içinde
+rahat — model saatleri tutarsa. Tutmazsa kota bağlayıcı olabilir, ve bunu
+söyleyecek şey ilk noktanın blok süresi.
 
 > **Bu saatler modelin dediği.** Yerel sürücü modelden çok daha yavaş koşuyor ve
 > sebebin bellek olduğuna dair kanıt yukarıda. 16 GB'ta ne kadarının kalktığı
@@ -152,12 +167,12 @@ zipfile.ZipFile(z).extractall('/kaggle/working/subfloor')
 Çıkış kodu **42** ise bütçe doldu ve checkpoint tam: aynı komutu yeniden
 koşturun, kaldığı yerden devam eder.
 
-**T4 ×2 kullanmak için** iki hücreyi ayrı `CUDA_VISIBLE_DEVICES` ile başlatın:
-
-```python
-!CUDA_VISIBLE_DEVICES=0 python -u cloud/run_point.py --tile 1 ... &
-!CUDA_VISIBLE_DEVICES=1 python -u cloud/run_point.py --tile 2 ...
-```
+**İkinci T4 tek kutuda kullanılamıyor.** Burada bir zamanlar iki
+`CUDA_VISIBLE_DEVICES` süreci başlatan bir reçete vardı; darboğaz GPU değil host.
+Model `device_map=None` ile CPU'da duruyor, yani iki süreç **2 × 13.5 GiB** RAM
+ister (kutuda ~29 GB, üstüne iki aktivasyon kümesi) ve **2 × 16.06 GiB**
+checkpoint yazar (`/kaggle/working`'de 20 GB). İkisi de yetmiyor. Paralellik
+istiyorsanız iki ayrı oturum açın.
 
 **Oturumlar arası kalıcılık:** `/kaggle/working` yalnız oturum içinde yaşıyor.
 Devam etmek istiyorsanız notebook'u "Save Version" ile koşturun (çıktı kalıcı
@@ -167,6 +182,12 @@ bir Dataset'e yazın.
 ---
 
 ## Colab — adım adım
+
+> **Ücretsiz katmanda çalışmıyor.** Model CPU'da duruyor (13.5 GiB) ve üstüne
+> 2.00 GiB aktivasyon biniyor; ücretsiz Colab ~12.7 GB host RAM veriyor, yani
+> süreç blok 0'dan önce OOM-kill yiyor. `preflight.py` bunu yakalayamıyor —
+> yalnız VRAM'e bakıyor. Aşağıdakiler daha fazla RAM'i olan bir katman için
+> duruyor; ücretsiz katmandaysanız Kaggle'a gidin.
 
 ```python
 from google.colab import drive; drive.mount('/content/drive')
