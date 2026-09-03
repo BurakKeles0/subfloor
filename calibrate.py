@@ -369,6 +369,15 @@ def sequential_calibrate(
 
     records: list[dict] = []
     for i, block in enumerate(blocks):
+        # The block's index IN THE MODEL, which is not `i` when a resumed run
+        # hands us `blocks[start:]`.  Everything a caller can see is keyed on
+        # this: the progress line, the record, `on_block_done`, the layer name,
+        # and `compress_fn`.  The last two used to be keyed on `i`, so a run
+        # resuming at block 17 compressed `blocks.0.q_proj` -- one record, two
+        # different block numbers in it -- and any `compress_fn` branching on
+        # "is this block 0" (m1_run's E8P early warning) fired on the wrong
+        # block.  Named once so the two cannot drift apart again.
+        block_index = i + block_offset
         if device is not None:
             block.to(device)
 
@@ -391,11 +400,11 @@ def sequential_calibrate(
             W_ref = W.to(device=acc.H.device, dtype=dtype)
             problem = LayerProblem.from_statistics(
                 W_ref, acc.H, acc.act_norm,
-                name=f"blocks.{i}.{name}", n_tokens=acc.n_tokens,
+                name=f"blocks.{block_index}.{name}", n_tokens=acc.n_tokens,
             )
             if progress:
-                progress(i + block_offset, name)
-            new_W = compress_fn(i, name, problem)
+                progress(block_index, name)
+            new_W = compress_fn(block_index, name, problem)
             if new_W.shape != W.shape:
                 raise ValueError(
                     f"{problem.name}: compress_fn returned {tuple(new_W.shape)}, "
@@ -403,7 +412,7 @@ def sequential_calibrate(
                 )
             mod.weight.data = new_W.to(W.dtype).to(W.device)
             records.append({
-                "block": i + block_offset,
+                "block": block_index,
                 "name": name,
                 "layer": problem.name,
                 "n_in": problem.n_in,
@@ -443,7 +452,7 @@ def sequential_calibrate(
 
         # Only here: the block is final and `inputs` is what block i+1 sees.
         if on_block_done:
-            on_block_done(i + block_offset, inputs, records)
+            on_block_done(block_index, inputs, records)
 
     return records
 

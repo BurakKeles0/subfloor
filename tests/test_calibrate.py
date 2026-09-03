@@ -276,6 +276,41 @@ def test_pipeline_plugs_into_calibration():
     assert all(c["bits_realized"] == pytest.approx(1.5, abs=1e-9) for c in calls)
 
 
+def test_block_offset_reaches_compress_fn_and_the_layer_name():
+    """A resumed run is handed `blocks[start:]`, so the loop index is not the
+    block's index in the model.  Every number a caller can see has to be the
+    model's.
+
+    This was wrong in two places at once and neither could fail loudly.  The
+    record's `block` field was absolute while its `layer` field was built from
+    the loop index, so one record carried two different block numbers; and
+    `compress_fn` was handed the loop index, so a `compress_fn` that branches
+    on "is this block 0" -- which is how `experiments/m1_run.py` decides where
+    to take the dense-E8P early warning for section 3.2, the check on this
+    project's largest single risk -- fired on whichever block a session
+    happened to resume at, and labelled the result block 0.
+
+    On the cloud path every finishing session is a resumed session, so the
+    diagnostic was always attached to the wrong block there.
+    """
+    blocks = _blocks(2)
+    seen = []
+
+    def compress(i, name, problem):
+        seen.append((i, name, problem.name))
+        return problem.W
+
+    records = Cal.sequential_calibrate(blocks, list(_inputs()), compress,
+                                       block_offset=17)
+
+    assert [i for i, _, _ in seen] == [17, 17, 18, 18]
+    assert [r["block"] for r in records] == [17, 17, 18, 18]
+    # The layer name is the same index, spelled: one record, one block number.
+    for r in records:
+        assert r["layer"].startswith(f"blocks.{r['block']}.")
+    assert [p for _, _, p in seen] == [r["layer"] for r in records]
+
+
 # --------------------------------------------------------------------------- #
 # Calibration windows
 # --------------------------------------------------------------------------- #
