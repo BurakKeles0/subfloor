@@ -50,8 +50,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -68,6 +70,11 @@ import streamed as ST                # noqa: E402
 import tiling as Tl                  # noqa: E402
 
 DEFAULT_MODEL = "NousResearch/Llama-2-7b-hf"
+
+#: Where a finished point's JSON lands when `--out` is not given.  It has a
+#: default because the checkpoint is cleared on success: without one, the only
+#: record of a multi-hour run was the terminal it was launched from.
+DEFAULT_OUT_DIR = Path("results/m1_points")
 
 #: The preregistration's calibration set: 128 windows at the primary seqlen.
 CALIB_SAMPLES = 128
@@ -100,6 +107,18 @@ class PointSpec:
 # --------------------------------------------------------------------------- #
 # Checkpoint
 # --------------------------------------------------------------------------- #
+
+def _atomic(path: Path, write: Callable[[Path], None]) -> None:
+    """Write through a sibling temporary file, then rename onto `path`.
+
+    `os.replace` is atomic on POSIX and on Windows, and the sibling keeps it on
+    one volume, which is what the guarantee requires.  A failed write leaves the
+    temporary behind and `path` as it was; it is removed on the next attempt.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    write(tmp)
+    os.replace(tmp, path)
+
 
 class Checkpoint:
     """Block-granular resume for one point.
@@ -138,23 +157,45 @@ class Checkpoint:
         return state
 
     def save_block(self, index: int, block: torch.nn.Module,
-                   inputs: list[torch.Tensor], records: list[dict]) -> None:
+                   inputs: list[torch.Tensor], records: list[dict],
+                   diagnostics: list[dict] | None = None,
+                   seconds: float = 0.0) -> None:
         """Persist one finished block.  Weights first, state last.
 
         The order is the crash contract: `state.json` is what says a block is
         done, so it is written only once the weights and activations it refers
         to are on disk.  A crash between them leaves a block file nothing points
         at, which the next run overwrites -- the harmless direction.
+
+        The two files that are REWRITTEN every block go through a temporary
+        path and `os.replace` (`_atomic`).  In place they are truncated the
+        moment the write opens, and `inputs.pt` is gigabytes: a crash inside
+        that window leaves `state.json` still saying block `i` is next while
+        the activations it names are half this block's and half the last one's.
+        That does not fail on resume -- it calibrates the next block against
+        activations no version of the model ever produced, which is exactly the
+        silent wrongness this checkpoint exists to prevent (see the module
+        docstring).  Renaming makes the failure land on the harmless side: the
+        previous complete pair survives untouched.
+
+        `diagnostics` and `seconds` are carried for the same reason `records`
+        is: the point's answer is assembled across sessions, and a cloud point
+        is several by construction.  Left out, both belonged to whichever
+        session happened to finish -- the E8P early warning could be `[]` and
+        the wall clock counted only the last leg.
         """
         self.dir.mkdir(parents=True, exist_ok=True)
         torch.save({k: v.detach().cpu() for k, v in block.state_dict().items()},
                    self.block_path(index))
-        torch.save([t.detach().cpu() for t in inputs], self.inputs_path)
-        self.state_path.write_text(json.dumps({
+        _atomic(self.inputs_path,
+                lambda p: torch.save([t.detach().cpu() for t in inputs], p))
+        _atomic(self.state_path, lambda p: p.write_text(json.dumps({
             "spec": asdict(self.spec),
             "next_block": index + 1,
             "records": records,
-        }, indent=2), encoding="utf-8")
+            "diagnostics": list(diagnostics or []),
+            "seconds": seconds,
+        }, indent=2), encoding="utf-8"))
 
     def restore_inputs(self) -> list[torch.Tensor]:
         return list(torch.load(self.inputs_path, weights_only=True))
@@ -231,7 +272,11 @@ def run_point(
     state = ckpt.load() if ckpt else None
     start_block = state["next_block"] if state else 0
     records: list[dict] = list(state["records"]) if state else []
-    diagnostics: list[dict] = []
+    # Restored, not restarted.  `.get` rather than `[]` so a checkpoint written
+    # before these two were carried still resumes -- it loses them, which is
+    # what it had anyway.
+    diagnostics: list[dict] = list(state.get("diagnostics", [])) if state else []
+    seconds_before: float = float(state.get("seconds", 0.0)) if state else 0.0
 
     if start_block >= len(blocks):
         progress(f"  all {len(blocks)} blocks already compressed; evaluating")
@@ -272,9 +317,10 @@ def run_point(
         return r["W_hat"]
 
     def block_done(i: int, ins, recs) -> None:
+        done = seconds_before + (time.time() - t0)
         if ckpt:
-            ckpt.save_block(i, blocks[i], ins, recs)
-        done = time.time() - t0
+            ckpt.save_block(i, blocks[i], ins, recs,
+                            diagnostics=diagnostics, seconds=done)
         progress(f"  block {i + 1}/{len(blocks)} done ({done / 60:.1f} min)")
         if stop_after_block is not None and i >= stop_after_block:
             raise _StopRun()
@@ -307,9 +353,15 @@ def run_point(
         ppl[dataset] = r.perplexity
         progress(f"    {dataset}: {r.perplexity:.4f} over {r.n_windows} windows")
 
+    # `seconds` is the POINT's cost, summed over every session that built it --
+    # a cloud point is several by construction, and this run is also the
+    # measurement of what a 16 GiB card does with one (`cloud/README.md`).
+    # Reported from `t0` alone it counted only the last leg, which for a
+    # resumed point could be the evaluation and nothing else.
     out = {
         "spec": asdict(spec),
-        "seconds": time.time() - t0,
+        "seconds": seconds_before + (time.time() - t0),
+        "seconds_this_session": time.time() - t0,
         "perplexity": ppl,
         "records": records,
         "diagnostics": diagnostics,
@@ -363,7 +415,9 @@ def main(argv=None) -> int:
     ap.add_argument("--max-eval-windows", type=int, default=None)
     ap.add_argument("--stop-after-block", type=int, default=None,
                     help="abort mid-run, for the resume test")
-    ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--out", type=Path, default=None,
+                    help="where the finished point's JSON goes; defaults to "
+                         f"{DEFAULT_OUT_DIR}/<slug>.json")
     args = ap.parse_args(argv)
 
     tile = Tl.MAX_TILE if args.tile == "max" else int(args.tile)
@@ -379,11 +433,19 @@ def main(argv=None) -> int:
         max_eval_windows=args.max_eval_windows,
         stop_after_block=args.stop_after_block,
     )
-    if args.out:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps(out, indent=2, default=str),
-                            encoding="utf-8")
-        print(f"written: {args.out}")
+    # Written unconditionally, and this is not a convenience.  A point is hours
+    # and `run_point` clears the checkpoint once it has evaluated, so with no
+    # `--out` the perplexity, the per-layer records and block 0's E8P
+    # early-warning diagnostic -- the check on this project's largest single
+    # risk -- survived only as stdout.  An interrupted run writes nothing: it
+    # has no result yet, and clobbering a finished point's JSON with a partial
+    # one is the failure this avoids.
+    if "stopped_after_block" not in out:
+        dest = args.out or (DEFAULT_OUT_DIR / f"{spec.slug()}.json")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(out, indent=2, default=str),
+                        encoding="utf-8")
+        print(f"written: {dest}")
     return 0
 
 
