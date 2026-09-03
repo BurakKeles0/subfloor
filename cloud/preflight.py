@@ -211,8 +211,8 @@ def measure_constants(out_dir: Path, *, quick: bool = False) -> dict:
         print("    python experiments/m0_tile_timings.py")
         print("    python -u experiments/m0_lever_audit.py --build --rot-sweep")
         if not quick:
-            print("  (--full would run them; they want a quiet card and "
-                  "20-40 minutes)")
+            print("  (both want a quiet card and 20-40 minutes; this script "
+                  "does not run them)")
     return report
 
 

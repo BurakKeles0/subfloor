@@ -62,12 +62,21 @@ aktivasyon biniyor. Kaggle'ın ~29 GB'ı bunu kaldırıyor; Colab ücretsiz katm
 ### Bir noktanın disk matematiği
 
 ```
-32 blok × 0.38 GiB   = 12.1 GiB   sıkıştırılmış ağırlıklar
+32 blok × 0.377 GiB = 12.06 GiB   sıkıştırılmış ağırlıklar (fp16 decoder katmanı)
 inputs.pt              2.00 GiB   128 × 2048 kalibrasyonda (defterin koştuğu)
 inputs.pt.tmp          2.00 GiB   atomik yazma sırasında, bir torch.save boyu
-                       4.00 GiB   ön-kaydın 128 × 4096'sında
-model önbelleği       13.0  GiB   (Kaggle'da Dataset, Colab'da her sefer)
+                     -----------
+                      16.06 GiB   preflight 16.1'in altında reddediyor
+
+model önbelleği      13.0  GiB   ayrı bir birimde; preflight yalnız --hf-home
+                                  verilirse bakıyor, defter vermiyor
 ```
+
+> **Ön-kaydın şekli diske sığmıyor.** `--calib-seqlen 4096`'da iki aktivasyon
+> satırının **ikisi birden** ikiye katlanıyor: 12.06 + 4.00 + 4.00 = **20.06 GiB**,
+> yani `/kaggle/working`'in 20 GB'ını aşıyor. C4 örnekleyicisi düzeltilse bile
+> ön-kayıt protokolüyle bir noktayı Kaggle'da koşturmak disk tarafından
+> bağlı — bu, aşağıdaki "geçici çözüm"ün ikinci ve kaydedilmemiş sebebi.
 
 Blok dosyalarının **hepsi sonuna kadar gerekiyor**: değerlendirme birleştirilmiş
 sıkıştırılmış model üzerinde koşuyor (`Checkpoint.apply_saved_blocks`). Yani
@@ -139,8 +148,25 @@ git archive --format=zip -o ~/subfloor-code.zip HEAD
 
 ## Kaggle — adım adım
 
-1. Yeni Notebook → Settings → **Accelerator: GPU T4 ×2**, **Internet: On**
-2. `cloud/subfloor_cloud.ipynb`'yi yükleyin, veya ilk hücreyi elle koşturun:
+### 1. Oturumu kurun
+
+Yeni Notebook → sağ panel → Settings:
+
+- **Accelerator: GPU T4 ×2.** Kaggle tek T4 sunmuyor; ikincisini
+  kullanmayacağız (aşağıda).
+- **Internet: On.** Hesabın telefonla doğrulanmış olması gerekiyor, yoksa
+  anahtar gri kalıyor.
+
+> **Internet bu koşunun en sinsi hatası.** Kaggle oturumları **kapalı**
+> başlıyor, ve `preflight.py` ağı hiç yoklamıyor — hat kontrolü bilerek
+> sentetik (`Cal.synthetic_problem(64,128,256)`), indirme gerektirmiyor. Yani
+> kapalıyken bile `READY` yazar, çekirdek hızlarını ölçer, ve koşu dakikalar
+> sonra ilk HuggingFace çağrısında düşer. Belirti sebebe hiç benzemiyor.
+
+### 2. Kodu getirin
+
+`cloud/subfloor_cloud.ipynb`'yi **File → Import Notebook** ile yükleyin, ya da
+ilk hücreyi elle koşturun:
 
 ```python
 import zipfile, glob
@@ -150,22 +176,73 @@ zipfile.ZipFile(z).extractall('/kaggle/working/subfloor')
 !pip install -q -r cloud/requirements.txt
 ```
 
-3. Uçuş öncesi — **atlamayın**, aşağıda nedeni var:
+### 3. Uçuş öncesi — atlamayın
 
 ```python
 !python cloud/preflight.py --resume-root /kaggle/working/resume
 ```
 
-4. Bir nokta:
+Saniyeler değil dakikalar sürüyor, çünkü sonunda çekirdek hızlarını bu kartta
+yeniden ölçüyor. `READY.` ya da `NOT READY:` ile bitiyor.
+
+> **Çıkış kodunu defter yutuyor.** `!python …` IPython'da dönüş kodunu
+> yükseltmiyor, yani `NOT READY` yazıp 1 döndürse bile bir sonraki hücre
+> koşar. **Çıktıyı gözünüzle okuyun.**
+
+`--hf-home <yol>` verirseniz preflight o yolda 13 GiB boş yer arıyor. Defter
+vermiyor, yani model indirmesi için yer kontrolü hiç yapılmıyor. Dikkat: bu
+bayrak indirmenin **yerini değiştirmiyor** — kodda hiçbir yerde `HF_HOME`
+kurulmuyor. Önbelleği oturumlar arası taşımak istiyorsanız `os.environ['HF_HOME']`
+kalıcı bir yola kurulmalı, yoksa 13 GiB her yeni oturumda yeniden iniyor.
+
+### 4. Noktayı koşturun
+
+Çıkış kodunu görmek istiyorsanız `!python` **yetmiyor** (yukarıdaki uyarı burada
+da geçerli). Defterin kullandığı biçim:
 
 ```python
-!python -u cloud/run_point.py --tile 1 --budget 1.5 \
-    --resume-root /kaggle/working/resume --hours 11 \
-    --calib-samples 128 --calib-seqlen 2048
+import subprocess, sys
+cmd = [sys.executable, '-u', 'cloud/run_point.py',
+       '--tile', '16', '--budget', '1.5', '--draw', '0',
+       '--resume-root', '/kaggle/working/resume', '--hours', '11',
+       '--calib-samples', '128', '--calib-seqlen', '2048',
+       '--datasets', 'wikitext2']
+rc = subprocess.run(cmd).returncode
+print({0: 'BITTI', 42: 'BUTCE DOLDU -- bu hucreyi tekrar kosturun'}
+      .get(rc, f'HATA (exit {rc})'))
 ```
 
-Çıkış kodu **42** ise bütçe doldu ve checkpoint tam: aynı komutu yeniden
-koşturun, kaldığı yerden devam eder.
+İlk nokta için **T=16**: modellenen 1.14 saat, tek oturuma sığıyor, yani devam
+etme döngüsünü hiç kullanmıyorsunuz. (Bu tahminin dayandığı 339 s/blok ölçümü
+**dört** kalibrasyon penceresiyle alındı, oysa burada 128 geçiyoruz — istatistik
+toplama pencere sayısıyla ölçekleniyor, yani ekstrapolasyon ölçülmüş değil.)
+
+> **`--datasets wikitext2` C4'ü kaldırmıyor.** O bayrak yalnız *değerlendirme*
+> setini seçiyor; kalibrasyon pencereleri her hâlükarda C4'ten geliyor
+> (`m1_run.run_point`, koşulsuz `dataset="c4"`). Ama bu indirme **nokta başına
+> bir kez**: devam eden oturum `inputs`'u checkpoint'ten okuyor ve C4'e hiç
+> dokunmuyor.
+
+| çıkış | anlamı | ne yapacaksınız |
+|---|---|---|
+| `0` | nokta bitti, JSON yazıldı | sonucu indirin |
+| `42` | duvar saati doldu, checkpoint **tam** | aynı hücreyi aynı bayraklarla tekrar koşturun |
+| `1` | **herhangi bir hata.** İlk satır `no CUDA device` ise runtime GPU'da değil; değilse traceback | traceback ne diyorsa |
+| `2` | bayrak yanlış yazılmış (argparse) | komutu düzeltin |
+| `-9` / `137` | süreç öldürüldü — host RAM | aşağıdaki tabloya bakın |
+
+`run_point.py` bütçe dolduğunda ayrıca düz metinle söylüyor: `budget spent after
+N block(s) this session; …`. Yani 42'yi kaçırsanız bile ekranda yazıyor.
+
+> **Devam ederken bayrakları değiştirmeyin.** İki ayrı sonuç doğuruyor.
+> `--calib-seqlen`'i değiştirirseniz aktivasyonlar diskten eski uzunlukta gelir,
+> causal mask ve rotary yenisinde kurulur; checkpoint bunu reddetmiyor.
+> `--calib-samples` sessizce yok sayılıyor, çünkü `inputs` checkpoint'ten
+> okunuyor. Daha pahalısı: `--tile`, `--budget`, `--draw` ya da `--model`
+> değişirse **slug değişiyor**, yani hata almazsınız — yeni ve boş bir
+> checkpoint dizini açılır ve eskisinin ~16 GiB'ı 20 GB'lık diskte öylece
+> kalır. `Checkpoint.load`'un "refusing to resume across configurations"
+> koruması bu yüzden neredeyse hiç ateşlemiyor.
 
 **İkinci T4 tek kutuda kullanılamıyor.** Burada bir zamanlar iki
 `CUDA_VISIBLE_DEVICES` süreci başlatan bir reçete vardı; darboğaz GPU değil host.
@@ -178,6 +255,145 @@ istiyorsanız iki ayrı oturum açın.
 Devam etmek istiyorsanız notebook'u "Save Version" ile koşturun (çıktı kalıcı
 olur ve bir sonraki koşuya Dataset olarak bağlanır), ya da `resume` klasörünü
 bir Dataset'e yazın.
+
+---
+
+## Uçuş öncesi neyi görüyor, neyi görmüyor
+
+`preflight.py` READY demeden önce altı şeye bakıyor. **Beşi sert reddediyor**
+(CUDA, transformers, datasets, disk, hat); yalnız VRAM kendi geçersiz kılma
+bayrağını adıyla söylüyor — bir duvar sebebi olan birini durdurur, bir uyarı ise
+akıp gider ve koşu saatler sonra ölür.
+
+| kontrol | geçme koşulu | T4'te |
+|---|---|---|
+| CUDA | cihaz var | ✓ |
+| VRAM | ≥ 12 GiB, yoksa `--allow-small-gpu` | ✓ ~14.7 |
+| transformers | major ≥ 5 | defterin 1. bölümündeki `pip install -r cloud/requirements.txt`'ten sonra ✓ |
+| datasets | kurulu | ✓ |
+| disk | `--resume-root`'ta ≥ **16.1 GiB** (`POINT_CHECKPOINT_GIB`) | ✓ 20 GB'de |
+| hat | sentetik katman uçtan uca `run_config`, artı codebook'un kanonik olduğu | ✓ |
+
+Tablodaki sıra çalışma sırası, ve **hat kontrolü koşullu**: yalnız diğerleri
+temizse koşuyor. Yani disk ya da transformers yüzünden gelen bir `NOT READY`
+raporunda hat hakkında hiçbir şey yazmıyor — yokluğundan "hat sağlam" sonucu
+çıkarılamaz. `--hf-home` verirseniz yedinci bir koşul ekleniyor: o yolda 13 GiB.
+
+**Görmedikleri.** İkisi koşuyu düşürüyor, üçüncüsü yalnız yavaşlatıyor:
+
+- **Internet.** Hiç yoklamıyor. Hat kontrolü bilerek sentetik
+  (`Cal.synthetic_problem(64,128,256)`), indirme gerektirmiyor — dolayısıyla
+  kapalı bir oturumda da READY yazıyor. **Koşuyu düşürür.**
+- **Host RAM.** Yalnız VRAM'e bakıyor. Colab ücretsizin blok 0'dan önce
+  OOM-kill yemesinin sebebi bu. **Koşuyu düşürür.**
+- **Beş eşik.** `_LATTICE_MIN_ROWS`, `_ANALYTIC_MIN_ROWS`,
+  `_ANALYTIC_DIRECT_MIN_ROWS`, `CHUNK_TARGET_ROWS`, `DECODER_MISS_FRACTION` —
+  yeniden ölçmüyor, yalnız **basıyor**. Yanlışlarsa **sonuç bozulmaz, koşu
+  yavaşlar**: ölü bant başka yere düşer ve hücreler tam taramaya sapar.
+
+> **Ve preflight'ın kendi hız ölçümü korumasız.** `bench_guard.require_quiet_gpu`
+> yalnız `m0_tile_timings.py` ile `m0_lever_audit.py`'de çağrılıyor; preflight'ın
+> `measure_rates` çağrısı meşgul bir kartta da ölçer ve sonucu
+> `results/m0_rates.json`'a **önbellekler**, sonraki koşular onu yeniden okur.
+> Meşgul bir kartta ölçtüyseniz o dosyayı silin.
+
+---
+
+## Koşarken neye bakacaksınız
+
+Ekranda iki satır, dosyada bir alan.
+
+### Blok süresi ve bütçe
+
+`run_point.py` her mesajın başına geçen süreyi ekliyor, ve blok sonunda bütçenin
+ne kadarının kaldığını yazıyor:
+
+```
+[  27.0 min]   block 1/32 done (27.0 min)
+           checkpoint at block 1/32, 633 min of budget left
+```
+
+İlk sayıyı 32 ile çarpın. Bu, projenin sahip olmadığı sayı. Yerel 8 GiB kartta
+sürücü blok başına **339 s** koşuyordu, oysa aynı yedi katman sessiz bir kartta
+izole ölçümde **86 s** (§6.18; §6.16'nın ısınmış ölçümü 84 s, soğuk ayrı süreçte
+142 s). Aradaki fark aritmetik değil bellek baskısıydı: §6.17 bunun 1.46×'ini
+Hessian'ları erken bırakarak kapattı, kalan ~2.7× **hiç profillenmedi** ve
+16 GiB'ta ne kadarının kalktığı bilinmiyor. İkinci satır ise bütçenin yetip
+yetmeyeceğini doğrudan söylüyor.
+
+### Blok 0'ın erken uyarısı
+
+`diagnostics` alanında `ratio_to_dense` var: sıkıştırılmış katmanın hatasının,
+aynı katmanın **yoğun E8P** referansına oranı. Referans blok 0'ın yedi
+katmanının fazladan bir quantizasyonuyla üretiliyor.
+
+> **`ratio_to_dense > 2.0` ise varsayım düştü.** E8P'nin kompaktlanmış survivor
+> alt-matrisinde 2-bit *kalitesini* koruduğu, §3.2'nin açık varsayımı ve
+> projenin en büyük tek riski. Düşerse geri dönüş yolu rotasyon + GPTQ-3bit
+> (`W = 3.148`) ve bant 1.83–2.83'e kayıyor. `assumption_broken` alanı bunu
+> ayrıca `true` yazıyor.
+
+Sonucu beklemenize gerek yok: blok 0 bittiği anda `state.json`'a yazılıyor.
+Ayrı bir hücreden:
+
+```python
+import json
+p = '/kaggle/working/resume/Llama-2-7b-hf_b1.5_t16_d0/state.json'
+print(json.load(open(p))['diagnostics'])
+```
+
+Hiçbir şey bunu ekrana basmıyor, ve nokta bitince `clear()` o dizini siliyor —
+bakacaksanız koşu sürerken bakın.
+
+---
+
+## Sonuç dosyası
+
+```
+<resume-root>/Llama-2-7b-hf_b1.5_t16_d0.json
+```
+
+`clear()` nokta bitince checkpoint **dizinini** siliyor, ama JSON o dizinin
+kardeşi, yani kalıyor. Defterin son hücresi `<resume-root>/*.json` ile buluyor.
+
+**Yalnız temiz bitişte yazılıyor.** `exit 42`'den sonra ortada checkpoint dizini
+var ama JSON **yok**; dosya ancak nokta 0 ile bittiğinde oluşuyor.
+
+| alan | ne |
+|---|---|
+| `spec` | model, bütçe, tile, çekiliş — yedi nokta dosyasını ayıran şey |
+| `perplexity` | dataset başına. Defter yalnız `wikitext2` koşturuyor, yani tek anahtar olacak; ön-kayıt C4'ü de istiyor |
+| `records` | katman başına `rel_output_error`, artı `block`/`name`/`layer`/`n_in`/`n_out`/`n_tokens` — 224 kayıt. **SNR yok** |
+| `diagnostics` | blok 0'ın yoğun E8P referansı, `ratio_to_dense`, `assumption_broken`, `dense_e8p_snr_db` |
+| `levers` | `rotate_kron`, `search_dtype`, `compensate_block` |
+| `seconds` | noktanın **toplam** maliyeti, oturumlar boyunca |
+| `seconds_this_session` | yalnız son oturum |
+
+SNR'nin katman kayıtlarında olmaması bir eksiklik: `run_config` hesaplıyor ama
+sürücü ondan yalnız `W_hat`'i alıyor. JSON'daki tek SNR blok 0'ın referansı.
+
+**JSON'da olmayanlar**, elle not düşün: GPU adı, torch ve transformers
+sürümleri, `has_triton()`. `calib_seqlen` alan olarak yok ama her kayıttaki
+`n_tokens` onu ele veriyor — 128 × 2048 → 262144, 128 × 4096 → 524288. Ayırt
+edilemeyen şey **slug ve `PointSpec`**, dosyanın içeriği değil.
+
+Oturum kapanmadan indirin — `/kaggle/working` oturumla birlikte gidiyor.
+
+---
+
+## Bir şey ters giderse
+
+| gördüğünüz | sebep | ne yapacaksınız |
+|---|---|---|
+| `exit 42` | bütçe doldu, checkpoint tam | aynı hücreyi aynı bayraklarla tekrar koşturun |
+| `klon basarisiz` + 403/404 | depo private, defter kimlik doğrulamıyor | zip yolu — zip klondan **önce** deneniyor |
+| `transformers 4.x … v5 keyword` | 1. bölümün pip'i koşmadı | `!pip install -q -r cloud/requirements.txt` |
+| preflight READY, sonra hub hatası | Internet kapalı | Settings → Internet: On, oturumu yeniden başlatın |
+| `only found 42/128 windows of 4096 tokens` (sayı oynar) | `--calib-seqlen 4096`; 12.800 denemeden sonra pes ediyor | 2048'e alın |
+| disk hatası, koşunun sonuna doğru (boş alana göre blok ~24–31) | checkpoint sığmadı; 32 bloğun **hepsi** eval için gerekli | resume-root'ta 16.1 GiB boş olmalı |
+| `exit -9` / runtime restart | host RAM | Colab ücretsizdeyseniz Kaggle'a geçin; ikinci bir `run_point` süreci varsa durdurun |
+| `refusing to resume across configurations` | bu dizinde başka bir spec'in state'i var | dizini silin ya da doğru bayraklarla koşturun |
+| `block N is marked done but … is missing` | oturum kapandı, `/kaggle/working` gitti, state kaldı | nokta dizinini silip baştan başlayın |
 
 ---
 
