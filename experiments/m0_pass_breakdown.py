@@ -30,13 +30,20 @@ UNWRAPPED call is timed alongside and both are reported.  If the two disagree by
 much the attribution is not to be trusted and the run says so.
 
 It also counts ROWS through each nearest-codeword path, because the same harness
-answers a second question: `_nearest` opens its fast path with
-`_LATTICE_MIN_ROWS` (1024 on cuda) and only consults `_ANALYTIC_MIN_ROWS` (384)
-INSIDE that gate, so 384 <= rows < 1024 never reaches the analytic form and
-scans 65536 codewords instead.  The LDLQ sweep hands it `chunk * lines_per_tile`
-rows, which lands in that window for the whole T=1, T=2 and T=4 columns -- where
-the tile counts are largest.  Counting the rows says how much of the pass is in
-there rather than arguing about it.
+answers a second question.  `_nearest` used to open its fast path with
+`_LATTICE_MIN_ROWS` (1024 on cuda) and consult `_ANALYTIC_MIN_ROWS` only INSIDE
+that gate, so a row count between the two thresholds never reached the analytic
+form and scanned 65536 codewords instead.  The LDLQ sweep hands it
+`chunk * lines_per_tile` rows, which landed in that window for the whole T=1,
+T=2 and T=4 columns -- where the tile counts are largest.  Counting the rows is
+what said how much of the pass was in there rather than arguing about it.
+
+That band was closed on 2026-08-24: `quantize._nearest` now routes
+`_ANALYTIC_DIRECT_MIN_ROWS (256) <= rows < _LATTICE_MIN_ROWS` straight to the
+analytic search, and `_ANALYTIC_MIN_ROWS` is 320 rather than 384 (see the
+comment at that branch).  The counting stays, because it is what would show the
+band reopening on a card whose measured thresholds differ -- which
+`cloud/README.md` says must be re-measured rather than carried over.
 """
 
 from __future__ import annotations

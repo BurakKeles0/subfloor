@@ -78,7 +78,7 @@ python -m pytest -q                    # 674 test
 Sentetik smoke test — hattın tamamı, iki kapı dahil, GPU gerekmez:
 
 ```bash
-python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --seeds 3 --budgets 1.5
+python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --draws 3 --budgets 1.5
 ```
 
 Gerçek model, tek ızgara noktası (kalibre et → sıkıştır → ölç, blok

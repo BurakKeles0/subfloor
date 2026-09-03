@@ -52,7 +52,8 @@ ile birlikte sığmıyor.
 
 ```
 32 blok × 0.38 GiB   = 12.1 GiB   sıkıştırılmış ağırlıklar
-inputs.pt              0.13 GiB   4 × 2048 kalibrasyonda
+inputs.pt              2.00 GiB   128 × 2048 kalibrasyonda (defterin koştuğu)
+inputs.pt.tmp          2.00 GiB   atomik yazma sırasında, bir torch.save boyu
                        4.00 GiB   ön-kaydın 128 × 4096'sında
 model önbelleği       13.0  GiB   (Kaggle'da Dataset, Colab'da her sefer)
 ```
@@ -95,9 +96,15 @@ Kaggle kotası: pahalı üç nokta ≈ 9.4 GPU-saat, haftalık 30'un içinde rah
 
 ## Önce: kodu buluta nasıl götürürsünüz
 
-Depoda **git remote yok**. İki yol var ve defter ikisini de destekliyor.
+Depo **GitHub'da**: `https://github.com/BurakKeles0/subfloor`, dal `main`.
+Defterin `REPO_URL`'i onu gösteriyor, yani varsayılan yol klonlamak. Zip yolu
+özel bir fork için ya da Internet'i kapalı bir oturum için duruyor.
 
-**A — zip (yayınlama kararı gerektirmez, önerilen).** Yerelde:
+**A — klon (varsayılan).** Defter `git clone --depth 1 $REPO_URL` çalıştırır ve
+başka bir şey istemez. Kaggle'da oturum **Internet kapalı** başlar: Settings →
+Internet'i açın, yoksa bu yol da HuggingFace indirmesi de düşer.
+
+**B — zip (Internet kapalıysa ya da özel fork).** Yerelde:
 
 ```bash
 git archive --format=zip -o ~/subfloor-code.zip HEAD
@@ -109,13 +116,9 @@ git archive --format=zip -o ~/subfloor-code.zip HEAD
   ekleyin. Defter `/kaggle/input/**/subfloor-code.zip` altında kendisi bulur.
 - **Colab**: Drive'a koyun. Defter `MyDrive` altında arar.
 
-**B — uzak depo.** GitHub'a itin ve defterin ilk hücresinde `REPO_URL`'i doldurun.
-Özel depo da olur; o zaman bir token gerekir. Kodun kamuya açılıp açılmayacağı
-sizin kararınız, bu yüzden zip yolu varsayılan.
-
-> Not: çalışma `batch-scale-fit-candidates` dalında, `main`'in 32 commit önünde.
-> `git archive HEAD` bulunduğunuz dalı paketler — istediğiniz bu değilse önce
-> `git checkout main && git merge --ff-only batch-scale-fit-candidates`.
+> `git archive HEAD` **çalışma ağacını değil, HEAD'i** paketler ve klon yolu da
+> HEAD'i çeker. Commit edilmemiş bir düzeltme buluta gitmez — zip'i almadan
+> önce `git status`'a bakın.
 
 ---
 

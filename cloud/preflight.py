@@ -44,8 +44,32 @@ sys.path.insert(0, str(_REPO / "experiments"))
 
 import torch                                     # noqa: E402
 
-#: One point's checkpoint: 32 compressed blocks at 0.38 GiB, plus activations.
-POINT_CHECKPOINT_GIB = 13.0
+#: One point's checkpoint, worked from the shapes rather than rounded off:
+#:
+#:     32 blocks x 0.377 GiB   a Llama-2-7B decoder layer at fp16      12.06
+#:     inputs.pt               128 x 2048 x 4096 at fp16                2.00
+#:     inputs.pt.tmp           its twin, alive for one torch.save       2.00
+#:                                                                     -----
+#:                                                                     16.06
+#:
+#: The twin is what the atomic rename in `Checkpoint.save_block` costs: the new
+#: activations are written beside the old ones and renamed over them, so both
+#: exist for the length of that write.  Two GiB of disk buys a checkpoint that
+#: cannot be half-written, which on a pre-empted cloud session is the
+#: difference between resuming a block early and resuming into activations no
+#: version of the model produced (`tests/test_checkpoint.py`).
+#:
+#: 13.0 until 2026-09-03, which counted the blocks and forgot both activation
+#: files -- so the check passed between 13 and 16 GiB and the run died around
+#: block 30.  That is precisely the late failure the message below promises to
+#: prevent.
+#:
+#: At `--calib-seqlen 4096` (`m1_run`'s default; the cloud runs 2048 because C4
+#: cannot supply 4096-token windows) the last two rows double: add 4 GiB.
+_BLOCK_PARAMS = 4 * 4096 * 4096 + 3 * 11008 * 4096
+_ACTIVATIONS_GIB = 128 * 2048 * 4096 * 2 / 2 ** 30
+POINT_CHECKPOINT_GIB = round(
+    32 * _BLOCK_PARAMS * 2 / 2 ** 30 + 2 * _ACTIVATIONS_GIB, 1)
 #: The Llama-2-7B checkpoint itself, wherever HuggingFace caches it.
 MODEL_CACHE_GIB = 13.0
 

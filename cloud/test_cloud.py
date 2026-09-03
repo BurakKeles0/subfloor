@@ -155,5 +155,11 @@ def test_the_checkpoint_estimate_matches_what_a_point_really_writes():
 
     params = 4 * 4096 * 4096 + 3 * 11008 * 4096          # attn + mlp
     per_block_gib = params * 2 / 2 ** 30
-    assert PF.POINT_CHECKPOINT_GIB >= 32 * per_block_gib
-    assert PF.POINT_CHECKPOINT_GIB <= 32 * per_block_gib + 2.0
+    # The activations are written every block and, since the write is atomic,
+    # the new copy lives beside the old one for the length of one torch.save.
+    # Both were missing from the estimate until 2026-09-03, which is why the
+    # bound below is an equality rather than a tolerance -- a tolerance is what
+    # let 4 GiB go unnoticed.
+    activations_gib = 128 * 2048 * 4096 * 2 / 2 ** 30
+    expected = 32 * per_block_gib + 2 * activations_gib
+    assert PF.POINT_CHECKPOINT_GIB == pytest.approx(expected, abs=0.05)

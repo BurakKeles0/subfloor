@@ -83,7 +83,7 @@ python -m pytest -q                    # 674 tests
 Synthetic smoke test — the whole pipeline including both gates, no GPU needed:
 
 ```bash
-python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --seeds 3 --budgets 1.5
+python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --draws 3 --budgets 1.5
 ```
 
 Real model, one grid point (calibrate → compress → evaluate, checkpointed at

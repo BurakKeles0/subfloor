@@ -55,6 +55,7 @@ sys.path.insert(0, str(_REPO / "experiments"))
 
 import torch                                    # noqa: E402
 import m1_run as R                              # noqa: E402
+from preflight import POINT_CHECKPOINT_GIB      # noqa: E402
 
 
 class BudgetSpent(Exception):
@@ -123,7 +124,8 @@ def make_progress(resume_root: Path, spec: R.PointSpec, *, deadline: float,
 def run(spec: R.PointSpec, *, resume_root: Path, hours: float,
         calib_samples: int, calib_seqlen: int, eval_datasets,
         max_eval_windows: int | None, device: str = "cuda",
-        min_free_gib: float = 18.0) -> tuple[int, dict | None]:
+        min_free_gib: float = POINT_CHECKPOINT_GIB
+        ) -> tuple[int, dict | None]:
     deadline = time.time() + hours * 3600.0
     started = time.time()
     seen = _state_block(resume_root, spec)
