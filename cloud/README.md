@@ -124,8 +124,20 @@ Depo **GitHub'da**: `https://github.com/BurakKeles0/subfloor`, dal `main`.
 Defterin `REPO_URL`'i onu gösteriyor, yani varsayılan yol klonlamak. Zip yolu
 özel bir fork için ya da Internet'i kapalı bir oturum için duruyor.
 
-**A — klon (varsayılan).** Defter `git clone --depth 1 $REPO_URL` çalıştırır ve
-başka bir şey istemez. Kaggle'da oturum **Internet kapalı** başlar: Settings →
+**A — klon (varsayılan).** Defteri kullandığınızda **yazılacak hiçbir komut
+yok**: hücre 2 `REPO_URL`'i okuyup klonlamayı kendisi yapıyor ve pip'i kuruyor.
+
+Defteri kullanmıyorsanız, bir hücreye **aynen** bu üç satır:
+
+```python
+!git clone --depth 1 https://github.com/BurakKeles0/subfloor /kaggle/working/subfloor
+%cd /kaggle/working/subfloor
+!pip install -q -r cloud/requirements.txt
+```
+
+Baştaki `!` şart: onsuz defter satırı **Python** sanar ve `SyntaxError` verir.
+URL'nin başına `$` koymayın — `$REPO_URL` defterin içindeki değişkenin adı,
+elle yazarken URL'nin kendisi geliyor. Kaggle'da oturum **Internet kapalı** başlar: Settings →
 Internet'i açın, yoksa bu yol da HuggingFace indirmesi de düşer.
 
 **B — zip (Internet kapalıysa ya da özel fork).** Yerelde:
