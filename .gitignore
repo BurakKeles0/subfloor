@@ -5,7 +5,13 @@ __pycache__/
 venv/
 
 # Experiment output: regenerate it, do not track it.
-results/
+results/*
+
+# ...with one exception.  A finished M1 point is not regenerable output:
+# it cost a GPU session, and the number it carries cannot be reproduced
+# without spending another one.  That is a measurement, and measurements
+# belong in the repository.
+!results/m1_points/
 *.json.gz
 
 # Model weights and calibration caches never belong in the repo.

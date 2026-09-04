@@ -2,7 +2,7 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-08-25 · HEAD `515eb35` · Testler: **632 geçiyor, 6 atlanıyor**
+> Son güncelleme: 2026-09-04 · İlk gerçek sıkıştırılmış ppl §5.11'de, teşhisi §5.12'de
 > Bu oturumun ölçüm dersleri **§14**'te — hız kazançlarından daha taşınabilir.
 
 ---
@@ -18,10 +18,7 @@ makinede 120 günden **11.7 güne**, `τ` süpürmesi 29 günden **4.2 güne** i
 koştuğu aritmetiği** fiyatlamasıyla geldi (15.0 → 11.7), ve model o gün gerçek
 bir blokta 1.03× doğrulukla sınandı (§6.18). Sayının bir kez **yukarı** gittiğine
 dikkat: 12'ye inmişti, sonra modelin hiç yazmadığı iki terim bulununca gerçek
-maliyetin ~40 olduğu anlaşıldı, ve 15'e o terimler düzeltilerek inildi (§6.2). Ama **sıkıştırılmış modelin
-perplexity'si hâlâ hiç ölçülmedi**; Kapı A'nın ve Kapı B'nin tek bir gerçek
-verisi yok. Ve bunun sebebi bilimsel bir karar değil: **tam modeli sıkıştıran
-deney betiği hiç yazılmadı.**
+maliyetin ~40 olduğu anlaşıldı, ve 15'e o terimler düzeltilerek inildi (§6.2). **Ve 09-03'te sıkıştırılmış model ilk kez ölçüldü: 47.64** (B=1.5, T=16, çekiliş 0, Kaggle T4, §5.11). §3.3'ün baş kalemi kapandı. Kapı A'nın hedefi bu hücrede tutulmuyor ve tile ekseninde kalan pay 1.04×, yani **B=1.5'te Kapı A pratikte karara bağlandı**; Kapı B hâlâ açık (≥ 5 çekiliş gerekiyor). Nedeni §5.12'de: rotasyon+LDLQ makinesi kalın kuyruk için ayarlı ve parametrelerin üçte ikisi olan FFN kalın kuyruklu değil.
 
 ---
 
@@ -85,6 +82,7 @@ düşerken B ayakta kalabilir, ve o durumda çerçeve daralır, proje durmaz.
 | **Akıtılan alt-Hessian'ın yığılmışa denkliği** | Bit-birebir aynı çıktı |
 | **Maliyet modelinin kendini doğrulaması** | Hiç uydurulmadığı bir genişlikte (k=7912) gerçek tile süresini 16 satırda %11.9 içinde tahmin ediyor. 4 satırda %39.8 sapıyor — **fazla** yazarak, yani 12 gün bir üst sınır (§6.3) |
 | **§8.1 dikişinin GPU'da uçtan uca koştuğu** | Gerçek Llama blokları → `sequential_calibrate` → `run_config` → sıkıştırılmış ağırlıklar → `streamed_perplexity`, hepsi cuda'da. 08-25'e kadar **koşmuyordu** ve bunu hiçbir test görmüyordu (§6.12) |
+| **Sıkıştırılmış modelin perplexity'si (gerçek model)** | 09-03, Kaggle T4: B=1.5, T=16, çekiliş 0 → **47.6368** (WikiText-2, seqlen 4096, 83 pencere). Muhasebe doğrulandı: gerçekleşen bit 1.500000, sapma %0.000. Kayıt `results/m1_points/` altında (§5.11) |
 
 ### 3.2 Varsayım — doğrulanmadı
 
@@ -106,14 +104,9 @@ rotasyon + GPTQ-3bit (`W=3.148`), bant 1.83–2.83'e kayar.
 
 ### 3.3 Henüz hiç ölçülmemiş
 
-**Sıkıştırılmış modelin perplexity'si.** Kapı A ve Kapı B'nin **hiçbir gerçek
-verisi yok**. Sentetik smoke testte hata eğrisi U şeklinde çıkıyor ve Kapı A
-geçiyor — **ama veriyi biz ürettik, bu tez lehine kanıt değil.**
+*(Bu bölümün baş kalemi — sıkıştırılmış modelin perplexity'si — 09-03'te kapandı: §5.11.)*
 
-Sebebi artık maliyet değil (bir U eğrisi **13.7 saat**): **tam modeli sıkıştıran
-betik yok.** `calibrate.sequential_calibrate` kütüphane olarak var ama yalnızca
-testlerden çağrılıyor. Aynı şey `τ` süpürmesi için de geçerli — maliyeti
-modellenmiş, kodu yazılmamış (§8.3).
+**Kapı B'nin hâlâ gerçek verisi yok.** Verdikt için ≥ 5 çekiliş gerekiyor (§5.6) ve elde tek çekiliş var; U eğrisinin şekli için de yedi tile'ın altısı henüz koşulmadı. `τ` süpürmesi de aynı durumda — maliyeti modellenmiş, kodu yazılmamış (§8.3).
 
 Ayrıca hiç ölçülmemiş: **eval'in gerçek maliyeti** (238 s yalnız WikiText-2;
 ön-kayıt §4 C4'ü de şart koşuyor ve 5 zero-shot görev istiyor) ve
@@ -303,6 +296,219 @@ düzlemini bir bütçe altında taramak. Özgünlük iddiası buna göre daralt�
 
 Ölçümden önce hipotez olarak kaydedildi, ölçümde tuttu. Kural "birini seç"
 değil **"pencereyi sabitle"**.
+
+---
+
+### 5.11 ⭐ İlk gerçek perplexity: **47.64** — ve erken uyarı ateşlemedi
+
+**2026-09-03, Kaggle T4 (16 GB).** §3.3'ün projenin başından beri taşıdığı boşluk
+kapandı. Kayıt: `results/m1_points/Llama-2-7b-hf_b1.5_t16_d0.json`.
+
+```
+nokta   B=1.5, T=16, çekiliş 0, NousResearch/Llama-2-7b-hf
+ppl     47.6368   WikiText-2, seqlen 4096, 83 pencere
+süre    1.64 h    92.7 dk sıkıştırma (2.8 dk/blok) + 5.8 dk eval
+```
+
+| | ppl @4096 |
+|---|---|
+| dense (bu hattın kendi ölçümü, §5.10) | 5.1143 |
+| QuIP# 2-bit | 6.66 |
+| QuaRot-GPTQ 2-bit | 22.07 |
+| **bu koşu, 1.5 bit** | **47.64** |
+
+**Muhasebe temiz, ve bu ilk kontrol edilen şeydi.** `density_for_budget` her iki
+genişlikte de d=0.71875 veriyor, `uniform_survivor_count` align=8 ile k=2944
+(n_idx=4096) ve k=7912 (n_idx=11008) kuruyor, geri dönüşte bit **1.500000** —
+sapma %0.000. B=1.5 bitmap rejiminde: B*(1)=1.1667 (n_idx=4096), yani
+`1−1/T` özdeşliği burada geçerli. 47.64 bir bütçe kayması değil.
+
+**Tile ekseni bu sonucu kurtaramaz, ve bu Kapı A için bağlayıcı.** B=1.5'te
+yoğunluk T=1'de 0.25, T=16'da 0.71875, T=max'ta 0.75. Yani T=16 ulaşılabilir
+maksimumun **%95.8**'inde ve tüm eksende kalan pay **1.04×**. `gate_a` tile'lar
+arasında min alıyor, ama alınacak min burada: T=max %4 daha survivor veriyor,
+aşağısı ise yoğunluğu çökertiyor. **B=1.5'te Kapı A pratikte bu tek noktayla
+karara bağlandı.**
+
+#### Erken uyarı ateşlemedi
+
+Blok 0'ın yedi katmanının hepsinde `assumption_broken: false`, ve
+`ratio_to_dense` yedinin altısında 1'in altında:
+
+| katman | sıkıştırılmış | `dense_wall` | oran |
+|---|---|---|---|
+| q_proj | 0.0983 | 0.6280 | **0.157** |
+| k_proj | 0.1057 | 0.5926 | 0.178 |
+| v_proj | 0.1824 | 0.5204 | 0.351 |
+| o_proj | 0.4165 | 0.8672 | 0.480 |
+| gate_proj | 0.2449 | 0.3790 | 0.646 |
+| up_proj | 0.2557 | 0.2408 | 1.062 |
+| down_proj | 0.2913 | 0.4921 | 0.592 |
+
+#### Ama referans çıplak bir quantizer — kural adının ima ettiğinden zayıf
+
+`dense_wall`'un kendi hataları **0.24–0.87**, ve bu gerçek bir 2-bit yönteminin
+katman hatası değil. Sebebi implementasyon (`m1_gates.dense_wall`):
+
+```python
+blocks = problem.W.unsqueeze(0)      # tüm katman TEK tile
+qb = Qz.quantize_blocks(blocks)      # rotasyon YOK, LDLQ YOK
+```
+
+Docstring'i "the PTQ floor" diyor ama PTQ tabanı böyle çalışmıyor. Dolayısıyla
+`ratio_to_dense < 1` şunu söylüyor: **tam hat çıplak bir quantizer'ı geçiyor** —
+"gerçek bir 2-bit yöntemiyle başa çıkıyor" demiyor. §3.2'nin sorusu "**aynı**
+quantizer kompaktlanmış survivor alt-matrisinde kalitesini koruyor mu"; bugünkü
+hâliyle 224 kaydın hiçbiri o soruya dokunmuyor. Referans d≈1.0'da (B=2.0625,
+T=16) **aynı hat** olmalı.
+
+#### Beklenti hesabını da düzeltmek gerekti
+
+İlk okumada "parçaların tahmininin 5-7 katı, demek ki bir şey bozuk" denmişti.
+O çerçeve yanlış: budama tarafı Wanda-%50 ile kıyaslanamaz, çünkü buradaki maske
+16 satırın **paylaştığı** tek support (semi-structured, yapısal uca yakın);
+quantizer tarafı QuIP#'in 6.66'sı ile kıyaslanamaz, çünkü o sayı iki taraflı
+incoherence processing + fine-tuning ile alınmış, bu hat ise tek taraflı
+rotasyon, 16×2944 değere tek α, fine-tuning yok. Doğru referans sınıfı
+**QuaRot-GPTQ 2-bit = 22.07** ve 47.64 onun 2.2 katı.
+
+#### Maliyet: model nokta düzeyinde 1.4×, blok düzeyinde 2.0× iyimser
+
+| | blok başına |
+|---|---|
+| modelin aritmetiği (§6.18) | 84 s |
+| **T4 sürücüsü** | **168 s** |
+| dizüstü sürücüsü (§6.16) | 339 s |
+
+§6.16'nın 3.94×'lik açığından §6.17 1.46×'ini kapatmıştı, ~2.7× açıklanmamış
+kalıyordu (§8.6). **8 GiB'dan 14.6 GiB'a çıkmak o 2.7×'in ~1.4×'ini aldı;
+geriye 1.95× kalıyor** — bellek baskısı hikâyenin yarısıymış. Nokta düzeyinde
+model 1.14 h diyordu, gerçek 1.64 h. Tasarım F'in 13.7 saati bu oranla ~19–20
+saat eder.
+
+**Yan gözlem:** 2.8 dk/blok otuz iki blok boyunca kaymadı — ne termal kısılma ne
+biriken bellek baskısı. Kart 14.6 GiB'ın yalnız 8.1'ini tuttu, çünkü tavanlar
+8 GiB'lık karta göre sabit (`CHUNK_BUDGET_BYTES`, `cloud/README.md` §2).
+
+**Protokol kusuru:** kalibrasyon 2048 pencerede (`n_tokens: 262144` = 128×2048),
+eval 4096'da. §5.10'un kuralı "pencereyi sabitle"; bu koşu tutmuyor. Sebebi
+`cloud/run_point.py`'nin `--eval-seqlen` geçmemesi. Dokuz katlık açığı
+açıklamaz ama sayı böyle raporlanmamalı.
+
+---
+
+### 5.12 47.64 nereden geliyor: katman ayrışması ve rotasyonun ödeyemediği yer
+
+224 kaydın ortalaması **0.2450**. Ama ortalama yanıltıyor; asıl bilgi ayrışmada:
+
+| katman | ortalama hata |
+|---|---|
+| k_proj | 0.119 |
+| q_proj | 0.140 |
+| o_proj | 0.255 |
+| gate_proj | 0.262 |
+| v_proj | 0.308 |
+| up_proj | 0.310 |
+| down_proj | 0.321 |
+
+`q`/`k` diğerlerinin **yarısından az**. Ve bu ayrışma §5.3'ün üç oturum önce
+ölçtüğü şeyle birebir örtüşüyor:
+
+| blok | rotasyon, düz | rotasyon, LDLQ |
+|---|---|---|
+| Gaussian | **+%17.5 (zarar)** | +%4.8 (zarar) |
+| kalın kuyruklu | −%61.7 | −%39.0 |
+
+**Rotasyonun değeri tamamen kalın kuyruktan geliyor.** `q`/`k` kalın kuyruklu ve
+orada hat çıplak E8P'yi 6 kat geçiyor (0.098 vs 0.628). FFN matrisleri ve
+`v_proj` Gaussian'a yakın; orada rotasyon ödeyemiyor ve `ratio_to_dense`
+0.59–1.06'ya çıkıyor — yani **mekanizma orada neredeyse hiçbir şey üretmiyor.**
+
+#### 0.25 muhtemelen bir taban, hata değil
+
+Gaussian kaynak için 2 bit/boyutta rate-distortion tabanı `2^(-2R)` = 1/16
+varyans → **genlikte 0.25**. `up_proj`'un ölçülen değeri 0.2557, çıplak E8P
+referansı 0.2408. İkisi de tam orada.
+
+Yani FFN'de hat, 2 bitin teorik olarak yapabileceğini yapıyor ve kazanacak bir
+şey kalmıyor. Bu **kesin değil** — metrik H-ağırlıklı, taban ağırlıksız için
+türetiliyor — ama ayırt edici ölçüm ucuz: H-ağırlıklı hatanın ağırlıksıza
+**oranı**. Kayda eklenmeli.
+
+Doğruysa tasarım sonucu şu: **hattın rotasyon+LDLQ makinesi kalın kuyruk için
+ayarlı, parametrelerin ~2/3'ü olan FFN kalın kuyruklu değil, ve aynı muamele
+ödeme yapamayacağı yere uygulanıyor.**
+
+#### En büyük tek düğme, ama işaret çelişkili: `hessian_block=512`
+
+Sürücünün çalışma noktasında `_partition(k, 512, 8)` alt-Hessian bağlantılarının
+**k=2944'te %83.2'sini, k=7912'de %93.6'sını** atıyor. LDLQ geri beslemesi dar
+katmanlarda Hessian'ın yalnız %17'sini görüyor.
+
+Kontrollü bir sentetik ölçüm (k=2944, cond(H)=4.8e8, float32) tam genişliği
+0.00772, 512'yi 0.05504 veriyor — **7.1 kat**. Ama bu **§5.7 ile doğrudan
+çelişiyor**: gerçek bir `o_proj`'ta H512 her tile boyutunda en iyi kol çıkmış,
+tam genişliği %23.4 geçmiş.
+
+Fark ölçüm noktasında: §5.7 **512 satır ve 32,768 token**'da alındı, sürücü
+**4096 satır ve 262,144 token** koşuyor. §5.7'nin kendi mekanizması "uzun
+menzilli bağlantılar gürültülü, atmak düzenlileştirir" — bir örneklem argümanı,
+ve token 8 katına çıkınca zayıflıyor. §14.2'nin tekrar eden suçlusu tam bu
+desen: bir oranı, kaynağı değişen bir yere taşımak.
+
+> **Kayıt notu.** Bu bölümdeki `hessian_block` bulgusu **tek kaynaklı**: onu
+> üretmesi beklenen beş araştırma kolunun beşi de API hatasıyla düştü ve
+> düşmanca doğrulama aşaması hiç koşmadı. Sentetik H ile gerçek katman
+> arasındaki işaret farkı **çözülmedi**. Aşağıdaki merdivenin 3. basamağı tam
+> olarak bunu ayırmak için var; o ölçüm alınmadan bu madde bir hipotez.
+
+#### Blok içinde true-sequential değil
+
+`collect_block_statistics` blok başına **bir kez** çağrılıyor (calibrate.py:384)
+ve yedi Hessian'ın hepsi blok tamamen dense'ken toplanıyor; ağırlıklar sonra
+sırayla değişiyor. Yani `o_proj`'un H'si dense `v_proj`'un çıktısından,
+`down_proj`'unki dense `gate/up`'ın çıktısından. Bu GPTQ'nun `--true-sequential`
+ayrımı, blok içi hata birikmesi **hiçbir kayda girmiyor**, ve kayıtlar bu yüzden
+sistematik olarak iyimser. Bedeli §6.16'nın faz tablosundan biliniyor:
+`collect_block_statistics` 0.68 s, `run_config` 141.75 s — dört gruplu geçiş
+blok başına ~2 s, nokta başına %0.05.
+
+#### Elenenler — peşinden gidilmesin
+
+- **Muhasebe.** Bit tam 1.500000, sapma sıfır (yukarıda).
+- **Rotasyon/Hessian baz uyuşmazlığı.** `kronecker_factors` `structured_orthogonal`'ın
+  aynı matrisini `seed+1` dahil üretiyor; `rotate` `B Qᵀ`, `unrotate` `Q`. LDLQ
+  doğru bazdaki Hessian'ı görüyor.
+- **Kalibrasyon hacmi.** §6.16'nın 4 pencerelik koşusu o_proj 0.4199 verdi,
+  128 pencerelik koşu 0.4165. **32 kat token, hatada <%1.** H gürültüsü sebep değil.
+- **float32.** Gerçek genişlikte f32 0.00772 / f64 0.00826 — numerik açıklama yok.
+- **`rotate_kron` ve `compensate_block`.** §6.18/§8.5'te izole + yerinde
+  denetlendi; kron −0.04…0.00%, telafi bloklaması 2.7e-06.
+- **Eval yolu.** Dense 5.1143 aynı streamed yoldan ölçüldü, streamed == tam
+  model 1e-6 (§3.1).
+- **Sıra ihlali.** `prune` rotasyonlu bazda çağrılmayı reddediyor.
+
+#### Ölçüm merdiveni — GPU noktası harcamadan
+
+1. **Blok 0'ın yedi `(W, H)` problemini sürücünün token sayısında diske yaz**
+   (`m0_lever_audit.py --build`). Bir model yüklemesi, ~20-40 dk, tek sefer.
+   Aşağıdakilerin hepsi bu önbellekten okuyor.
+2. **Quantizer'ı hiç koşmadan üç teşhis:** 256 tile'ın support kümelerinin
+   Jaccard örtüşmesi (maske semi-structured mı, yoksa fiilen yapısal kanal
+   budaması mı — skor `‖X_j‖²·Σ_i w_ij²` ve `‖X_j‖²` 10-100 kat oynuyor);
+   `quantize=False, align=8` ile yalnız-budama hatası (§8.6'nın açık
+   ablasyonu); döndürülmüş alt-Hessian'ın koşul sayısı. **Katman başına saniyeler.**
+3. **H512 vs full, gerçek katmanda, sürücünün çalışma noktasında** — tam satır
+   sayısı, 262k token, T=16; kontrol kolu `--rows 512` ile §5.7'yi yeniden
+   üretsin. Yukarıdaki çelişkiyi karara bağlar. **Katman başına dakikalar.**
+4. **Saf quantizer kolu:** budama yok (d≈1.0, B=2.0625), aynı rotasyon + LDLQ.
+   d≈1'de hata 0.05-0.10'a inerse quantizer sağlam ve bedel budamada; 0.25'te
+   kalırsa **2 bitin tabanı bu** ve çözüm ne `hessian_block` ne maske.
+5. **True-sequential'ın bedeli:** `o_proj`'un H'sini `v_proj` sıkıştırıldıktan
+   sonra biriktir, iki H ile sıkıştır, ikisini de taze H ile puanla.
+6. **Ancak 3-5 bir şey söylediyse** tek teşhis noktası, `--max-eval-windows 20`.
+   **Kural: blok 0'ın katmanları ~0.15'in altına inmiyorsa koşma** — 0.25-0.35
+   katman hatasıyla ppl'in 47.6 olduğu artık ölçüldü.
 
 ---
 
