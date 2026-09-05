@@ -2,7 +2,10 @@
 
 > **Bağlam kaybolduğunda projeye kaldığı yerden devam edebilmek için var.**
 > Kod ne yaptığını söyler; bu belge **neden öyle olduğunu** söyler.
-> Son güncelleme: 2026-09-04 · İlk gerçek sıkıştırılmış ppl §5.11'de, teşhisi §5.12'de
+> Son güncelleme: 2026-09-05 · İlk gerçek sıkıştırılmış ppl §5.11'de, teşhisi §5.12'de
+> **§5.12'nin hipotezleri §5.13'te ölçüldü ve hepsi düştü.** Eksik kontrol §5.14'te
+> alındı: **hat bozuk değil (13.97, QuaRot-GPTQ'nun 1.6× önünde), Kapı A düşüyor.**
+> Sırada tek şey var: bütçe ekseninde ara nokta (B≈1.75).
 > Bu oturumun ölçüm dersleri **§14**'te — hız kazançlarından daha taşınabilir.
 
 ---
@@ -399,6 +402,11 @@ açıklamaz ama sayı böyle raporlanmamalı.
 
 ### 5.12 47.64 nereden geliyor: katman ayrışması ve rotasyonun ödeyemediği yer
 
+> ⚠️ **Bu bölümün hipotezleri koşuldu ve düştü — §5.13.** `hessian_block`
+> maddesi ve "0.25 bir rate-distortion tabanıdır" tezi ölçümle geçersiz. Aşağıdaki
+> ölçüm merdiveni **koşuldu**; peşinden gidilecek iş §5.13'ün sonundadır. Bu
+> bölüm, düşen bir teşhisin nasıl kurulduğunun kaydı olarak duruyor.
+
 224 kaydın ortalaması **0.2450**. Ama ortalama yanıltıyor; asıl bilgi ayrışmada:
 
 | katman | ortalama hata |
@@ -509,6 +517,256 @@ blok başına ~2 s, nokta başına %0.05.
 6. **Ancak 3-5 bir şey söylediyse** tek teşhis noktası, `--max-eval-windows 20`.
    **Kural: blok 0'ın katmanları ~0.15'in altına inmiyorsa koşma** — 0.25-0.35
    katman hatasıyla ppl'in 47.6 olduğu artık ölçüldü.
+
+---
+
+### 5.13 ⭐ Merdiven koştu: §5.12'nin hipotezlerinin **hepsi** düştü
+
+**2026-09-04, RTX 5060 Laptop (8 GiB).** §5.12'nin altı basamağı da koşuldu.
+Kod `experiments/m1_ladder.py`, kayıtlar `results/rung*.json`,
+`results/m1_ladder_spectrum.json`. Önbellek sürücünün noktasında yeniden
+kuruldu (`results/block0_problems_262k/`, 262,144 token) — **2 dakika**, çünkü
+checkpoint mmap'le yükleniyor ve §5.12'nin "20-40 dk" tahmini fazlaydı.
+
+> **Bu bölüm §5.12'nin iki maddesini geçersiz kılıyor:** `hessian_block`
+> hipotezi ve "0.25 bir rate-distortion tabanıdır" tezi. İkisi de aşağıda
+> ölçümle düşüyor. §5.12 okunurken bu not birlikte okunmalı.
+
+#### Basamak basamak
+
+| basamak | soru | cevap |
+|---|---|---|
+| 2a | maske fiilen yapısal kanal budaması mı? | **hayır** — tile'lar arası Jaccard 0.61-0.85, `gate`/`up`'ta ortak sütun 2944'ün yalnız 60-66'sı |
+| 2b | budama tek başına ne kadar? | **0.0009-0.175**, tam hattın 0.097-0.429'una karşı |
+| 2c | koşullanma | rotasyon ortogonal, spektrumu değiştirmiyor (kontrol olarak doğru) |
+| 3 | `hessian_block` 512 vs tam | **±%18, işaret karışık** — ne 7.1×, ne %23.4 |
+| 4 | budama tamamen kalkarsa | **hata 0.086-0.418'de kalıyor** |
+| 5 | blok-bir-kez Hessian ne gizliyor | **hiçbir şey** — iyimserlik 0.995 ve 1.001 |
+| 6 | teşhis noktası | merdivenin kendi kuralı "koşma" diyor |
+
+#### Kapı A'nın gerçek suçlusu budama değil
+
+Rung 4, `d=1.0`'da (B=2.0625, aynı rotasyon+LDLQ, 262k token):
+
+| katman | d=0.719 | **d=1.0** | kazanç |
+|---|---|---|---|
+| q_proj | 0.0973 | 0.0862 | −%11 |
+| k_proj | 0.1039 | 0.0954 | −%8 |
+| v_proj | 0.1806 | 0.1633 | −%10 |
+| **o_proj** | 0.4128 | **0.4176** | **+%1** |
+| gate_proj | 0.2358 | 0.1816 | −%23 |
+| up_proj | 0.2446 | 0.1672 | −%32 |
+| down_proj | 0.2731 | 0.2450 | −%10 |
+
+Merdivenin kuralı "0.05-0.10'a inerse bedel budamada"ydı. Ağırlıkların
+%28'ini silmekten **sıfıra** geçmek %8-32 alıyor.
+
+> ⚠️ **Buradan "bedel quantizer'da" sonucu çıkarıldı ve bu YANLIŞTI.** Aynı
+> değişiklik model düzeyinde ppl'i **3.4 kat** düşürüyor (§5.14). Katman
+> düzeyindeki %8-32'lik oran model düzeyine taşınmıyor: ppl bu rejimde katman
+> hatasına aşırı doğrusal olmayan bağlı. §14.2'nin tekrar eden hatası — bir
+> oranı, kaynağı değişen bir yere taşımak — bu kez bu belgenin kendi içinde
+> yapıldı. Katman hatası bir **teşhis** aracı; **karar** ppl'den okunur.
+
+Ve `up_proj` aynı 2 bit/ağırlıkta **0.167**'ye iniyor — §5.12'nin "0.25 taban"
+tezinin %33 altı. O tez zaten "metrik H-ağırlıklı, taban ağırlıksız için
+türetiliyor" diye çekinceliydi; artık ölçüldü ve **düştü**.
+
+#### `hessian_block`: her iki eksende de kaldıraç değil
+
+§5.12 sentetik 7.1× ile §5.7'nin gerçek −%23.4'ü arasındaki farkı ölçüm
+noktasına bağlamıştı (512 satır/32k token vs tam satır/262k token). **İki
+eksen de tek tek oynatıldı, fark oynamadı.** `tam/512` oranı:
+
+| katman | 32k token | 262k token |
+|---|---|---|
+| v_proj | 0.821 | 0.820 |
+| up_proj | 0.879 | 0.906 |
+| gate_proj | 0.934 | 0.942 |
+| down_proj | 1.039 | 1.010 |
+| o_proj | 1.043 | 1.039 |
+| q_proj | 1.049 | 1.043 |
+| k_proj | 1.074 | 1.066 |
+
+Token'ı 8 katına çıkarmak üçüncü hanede oynuyor. §5.12'nin açıklaması yanlıştı;
+sentetik ölçüm gerçek katmana **hiç** taşınmıyor.
+
+#### Blok-bir-kez Hessian bir kusur değilmiş
+
+Rung 5, iki dikişte, 262k token:
+
+| dikiş | H sapması | kayıtlı | dürüst | true-seq | iyimserlik |
+|---|---|---|---|---|---|
+| `v→o_proj` | **%49.2** | 0.4128 | 0.4107 | 0.3913 | **0.995** |
+| `gate,up→down_proj` | %23.8 | 0.2731 | 0.2733 | 0.2745 | **1.001** |
+
+Hessian %24-49 kayıyor, **hata umursamıyor**. §5.12 "kayıtlar sistematik olarak
+iyimser" diyordu; iyimserlik sıfır. True-sequential'a geçmek `o_proj`'ta %4.7
+alıyor, `down_proj`'ta %0.4 kaybettiriyor. §8'in listesinden düşürülebilir.
+
+#### Numerik, gerçek katmanda ikinci kez eleniyor
+
+`o_proj` float32 **0.40983659** / float64 **0.40983453**; `v_proj` aynı.
+Alt-Hessian'ın koşul sayısı float32'nin taşıyabileceğinin 40 katı olmasına
+rağmen. `percdamp=0.01` küçük özdeğerleri zaten sönümlüyor.
+
+#### Yerine geçen bulgu: iki mekanizma katmanlara uyumsuz dağılıyor
+
+Ablasyon (32k önbellek, `d=1.0`, eşit hizalama). Çıplak E8P → +rotasyon → +LDLQ:
+
+| katman | çıplak | +rot | +LDLQ | rotasyon | LDLQ |
+|---|---|---|---|---|---|
+| q_proj | 0.643 | 0.137 | 0.0863 | **−%79** | −%37 |
+| k_proj | 0.577 | 0.165 | 0.0957 | **−%71** | −%42 |
+| v_proj | 0.503 | 0.502 | 0.1622 | **+%0.4** | **−%68** |
+| o_proj | 0.774 | 0.472 | 0.4153 | −%39 | **−%12** |
+| gate_proj | 0.360 | 0.245 | 0.1763 | −%32 | −%28 |
+| up_proj | 0.242 | 0.224 | 0.1612 | **−%7** | −%28 |
+| down_proj | 0.425 | 0.344 | 0.2451 | −%19 | −%29 |
+
+**`q`, `k`, `v` aynı H'yi paylaşıyor** — üçü de aynı layernorm çıktısını okuyor,
+ve ölçülen `cond` üçünde de birebir 1.25e14. Girdi sabit, rotasyon aynı, ama
+kazanç −%79 / −%71 / **%0**. Yani rotasyonun değeri tamamen **ağırlık
+dağılımından** geliyor (§5.3'ün mekanizması, artık girdi kontrol edilerek
+izole). LDLQ tersine dağılıyor: `v_proj` −%68, `o_proj` −%12.
+
+#### Hâlâ açık: `o_proj`
+
+Her eksende aykırı. En kötü çıplak hata (0.774), her iki mekanizmanın da en zayıf
+olduğu yer, **budama kaldırılınca kötüleşen tek katman**, ve
+`tr(EHEᵀ)`'yi H'nin özyönlerine ayırdığında **`ratio_top1`'i 1'in üstünde olan
+tek katman** (1.014 — hatayı H'nin en çok baktığı yöne nötr bir quantizer'dan
+*daha fazla* yığıyor).
+
+| katman | hata | cond | sig_top1 | ratio_top1 |
+|---|---|---|---|---|
+| down_proj | 0.2731 | 1.15e5 | 0.730 | 0.824 |
+| o_proj | 0.4128 | 1.06e8 | 0.983 | **1.014** |
+| gate_proj | 0.2358 | 4.48e9 | 0.685 | 0.397 |
+| up_proj | 0.2446 | 4.48e9 | 0.572 | 0.138 |
+| q_proj | 0.0973 | 1.25e14 | 0.999 | 0.997 |
+| k_proj | 0.1039 | 1.25e14 | 0.998 | 0.995 |
+| v_proj | 0.1806 | 1.25e14 | 0.886 | 0.739 |
+
+**Koşullanma açıklama değil:** en kötü `cond`'a sahip `q`/`k` en düşük hatayı
+veriyor, en iyi `cond`'a sahip `down_proj` yüksek hata veriyor.
+
+`sig_top1` ile `ratio_top1` neredeyse monoton: sinyal ne kadar az yöne
+toplanmışsa LDLQ o kadar az şekillendirebiliyor. Bu **şekillendirmeyi**
+açıklıyor, hata büyüklüğünü değil.
+
+> **Düşen tahmin, kayda geçsin.** `hessian_block`'un işaretinin `ratio_top1`'e
+> göre ayrıştığı öne sürüldü (ratio<0.8 → tam genişlik yardım ediyor; ratio≈1 →
+> zarar veriyor) ve `down_proj` için ratio≈1 tahmin edildi. **Ölçülen 0.824.**
+> Ayrım altı katmanlık bir tesadüftü. Mekanizma bilinmiyor.
+
+#### Tek gerçek kaldıraç: ölçek granülerliği — ama yetmiyor
+
+Bir tile 16 satırın **tek indeks kümesi, tek rotasyon, tek α** paylaşması demek.
+Rotasyon yalnız indeks eksenini karıştırdığı için satırlar arası norm farkı
+düzeltilmeden geçiyor; QuIP#'in iki taraflı incoherence processing'inin eksik
+yarısı tam bu. Yoğunluk **1.000**'de sabitlenip yalnız `T` süpürüldü:
+
+| katman | T=16 | T=64 | T=max | max/16 |
+|---|---|---|---|---|
+| q_proj | 0.0862 | 0.1167 | 0.1703 | **1.98×** |
+| k_proj | 0.0954 | 0.1360 | 0.1690 | 1.77× |
+| **o_proj** | 0.4176 | 0.6778 | **0.7344** | 1.76× |
+| down_proj | 0.2450 | 0.3358 | 0.3509 | 1.43× |
+| gate_proj | 0.1816 | 0.2067 | 0.2157 | 1.19× |
+| v_proj | 0.1633 | 0.1819 | 0.1834 | 1.12× |
+| **up_proj** | 0.1672 | 0.1668 | **0.1664** | **1.00×** |
+
+`up_proj` **tamamen düz**: 11008 satırın tek α paylaşması ona hiçbir şeye mal
+olmuyor. Etki süpürmenin eseri değil — satırları homojen olan katman düz
+kalıyor, heterojen olanlar dikleşiyor. Ve bu, bu soruşturmada **`o_proj`'u
+oynatan tek şey**.
+
+Üç çekince, üçü de bağlayıcı:
+
+1. **Yön sınanmadı.** Kanıt yukarı yönden; istenen aşağı (`T<16`). `d=1.0`'da
+   `T=1` demek `n_out` ayrı rotasyon + LDLQ demek — 4096-geniş bir katmanda
+   saatler. Başlatıldı, kesildi.
+2. **Bedava değil.** `d=1.0`'da bit maliyeti `T` ile ters: T=max 2.0000,
+   T=64 2.0156, T=16 2.0625, T=1 3.0. Granülerlik tam da §2'nin çekirdek
+   özdeşliğinin fiyatladığı şeyi ödüyor.
+3. **Büyüklük yetmiyor.** `T`'yi 4 kat düşürmek `q_proj`'ta %26 aldı; aynı
+   hızla T=1 ~0.055 eder. Gereken 3-10×.
+
+Tile'ı bölmeden ölçeği inceltmek kod işi: `run_config`'in `scale` parametresi
+bugün `per_tile` ve `per_layer`; `per_row` yok. Ölçülmeden önce yazılması
+gereken şey bu.
+
+Merdivenin 6. basamağının "koşma" kuralı eksik kontrole işlemiyordu: o bir
+kaldıraç sınaması değil, hiç alınmamış referans. Koşuldu — §5.14.
+
+---
+
+### 5.14 ⭐ Eksik kontrol alındı: **13.97** — hat bozuk değil, Kapı A düşüyor
+
+**2026-09-05, RTX 5060 Laptop.** §5.11'in kendi cümlesi — *"Referans d≈1.0'da
+(B=2.0625, T=16) aynı hat olmalı"* — nihayet ölçüldü. Kayıt:
+`results/m1_points/Llama-2-7b-hf_b2.0625_t16_d0.json`. Protokol 47.64 koşusuyla
+**birebir** (`--calib-seqlen 2048 --eval-seqlen 4096 --datasets wikitext2`),
+§5.11'in pencere kusuru dahil: kontrolün işi seyrekliği izole etmek, protokolü
+düzeltmek değil. Tek değişken yoğunluk.
+
+```
+nokta   B=2.0625, T=16, d=1.000, çekiliş 0
+ppl     13.9700   WikiText-2, seqlen 4096, 83 pencere
+süre    6.28 h    11.46 dk/blok, 32 blok boyunca %2 sapma (kayma yok)
+```
+
+| | ppl @4096 | ortalama katman hatası |
+|---|---|---|
+| dense | 5.1143 | — |
+| QuIP# 2-bit | 6.66 | — |
+| **bu hat, d≈1.0, 2.0625 bit** | **13.97** | **0.1957** |
+| QuaRot-GPTQ 2-bit | 22.07 | — |
+| bu hat, d=0.719, 1.5 bit | 47.64 | 0.2450 |
+
+#### Quantizer bozuk değil — soru yanlış sorulmuştu
+
+Hat kendi ~2-bit noktasında **QuaRot-GPTQ'yu 1.6× geçiyor**, QuIP#'in 2.1×
+gerisinde. Bu fark §5.11'in yöntem sınıfı argümanıyla zaten öngörülmüştü: tek
+taraflı rotasyon, 16×2944 değere tek α, fine-tuning yok. §5.13'ün bütün
+"quantizer neden bu kadar zayıf" araştırması **var olmayan bir arızayı**
+kovalıyordu. Hat sınıfının makul bir üyesi.
+
+#### Kapı A: seyreklik bedelini ödemiyor
+
+0.5625 bit tasarruf, hattın **kendi** referansına karşı **3.4× ppl** ödetiyor
+(13.97 → 47.64). Literatürün tabanına karşı 7.2×. Tez, seyrekliğin ~2 bitlik
+PTQ tabanının altına **kârlı** şekilde inmeyi sağladığıydı; bu noktada
+sağlamıyor.
+
+Tile ekseni bunu kurtaramaz — §5.11 ölçmüştü: B=1.5'te T=16 ulaşılabilir
+yoğunluğun %95.8'inde, tüm eksende kalan pay 1.04×.
+
+#### Ama **bütçe ekseni** hâlâ boş — ve karar oradan çıkar
+
+Elimizde iki nokta var, arası yok:
+
+| B | d | ppl |
+|---|---|---|
+| 1.5 | 0.719 | 47.64 |
+| 2.0625 | 1.000 | 13.97 |
+
+Eğrinin düz mü olduğu, yoksa bir dizde mi kırıldığı **bilinmiyor**. Kapı A'yı
+tek bir uç noktayla kapatmak, §5.11'in `dense_wall`'la yaptığı hatanın aynısı
+olur. **Sıradaki nokta B≈1.75 (d≈0.85)** — bu makinede ~4 saat, ve üç nokta bir
+eğrinin şeklini söyler.
+
+Ve Kapı B (optimum `T` içeride mi, uçta mı) bu sonuçtan **bağımsız** duruyor:
+§2'nin yazdığı gibi A düşerken B ayakta kalabilir, o durumda çerçeve daralır,
+proje durmaz.
+
+#### Bu bölümün kendi dersi
+
+Katman hatası ile ppl arasındaki ilişki bu rejimde **aşırı doğrusal olmayan**:
+ortalama katman hatasında %20 iyileşme (0.2450 → 0.1957) ppl'de 3.4× yapıyor.
+§5.13 bunu bilmeden katman oranlarından model düzeyinde sonuç çıkardı ve
+yanıldı. **Katman hatası teşhis içindir; karar ppl'den okunur.** §14'e.
 
 ---
 
@@ -1908,6 +2166,7 @@ yok. §8.1'in checkpoint'i bu yüzden kritik yolda.
 | `experiments/m1_run.py` | **tam model sürücüsü** — kalibre et, sıkıştır, ölç; blok granülerliğinde checkpoint |
 | `experiments/m0_lever_audit.py` | bir kaldıracı **iki kez** ölçer — terim tek başına, ve terim yerinde; `--rot-sweep` ile ızgaranın her genişliğinde kron/yoğun |
 | `experiments/m0_localize_gap.py` | modelin katman başına tahminini ölçülen süreye terim terim koyar |
+| `experiments/m1_ladder.py` | §5.12'nin teşhis merdiveni, basamak başına bir `--stages` adı; GPU noktası harcamadan şüpheli eler (§5.13) |
 
 **Belgeler:** `docs/spec_v7.md` (şartname) · `preregistration.md` (M1 ön-kaydı,
 **dondurulmadı** — iki kutu kaldı, artık maliyet engeli yok) ·
@@ -1931,6 +2190,12 @@ python experiments/m0_cost_model.py                # ~2 dk, sabitler önbellekle
 # diske yazar), sonra istediğin kadar ölçüm; kart boş olmalı, guard fırlatır
 python -u experiments/m0_lever_audit.py --build --budget 1.5 --tile 16   # ~25 dk
 python -u experiments/m0_lever_audit.py --rot-sweep                      # ~4 dk
+# teşhis merdiveni (§5.13): önce önbelleği SÜRÜCÜNÜN token sayısında kur
+python -u experiments/m0_lever_audit.py --build --build-only --seqs 128 \
+    --cache results/block0_problems_262k                                 # ~2 dk
+python -u experiments/m1_ladder.py --stages mask prune hessian quantizer ablate
+python -u experiments/m1_ladder.py --stages spectrum                     # ~10 dk
+python -u experiments/m1_ladder.py --stages sequential   # modeli yükler, ~5 dk
 python experiments/m0_localize_gap.py                                    # saniyeler
 python experiments/m1_gates.py --synthetic --n-out 64 --n-in 128 --budgets 1.5 --draws 5
 python experiments/m0_gate_b_power.py --no-noise   # ~15 dk, σ önbellekten
