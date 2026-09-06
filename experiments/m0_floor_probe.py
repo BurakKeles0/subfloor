@@ -50,6 +50,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import accounting as A                                          # noqa: E402
 import calibrate as Cal                                         # noqa: E402
 import m1_gates as M                                            # noqa: E402
+import prune as P                                               # noqa: E402
+import quantize as Qz                                           # noqa: E402
 from m0_lever_audit import ALL_LAYERS, load_problem             # noqa: E402
 
 #: B=2.0625 at T=16 solves to d=0.997405 -- the closest the grid comes to "no
@@ -63,6 +65,55 @@ ARMS = {
     "prune_only": dict(budget_bits=1.5, quantize=False, align=8),
     "full_H":     dict(budget_bits=1.5, hessian_block=None),
 }
+
+
+def mask_stats(problem: Cal.LayerProblem, *, tile_size: int,
+               budget_bits: float = 1.5) -> dict:
+    """Is the mask semi-structured, or structured channel pruning wearing a hat?
+
+    Section 5.12 raises this and does not answer it: the saliency score varies
+    10-100x across input channels, so every tile may be choosing very nearly the
+    same columns.  If it is, `T` is not doing what the `(T, d)` plane assumes --
+    T=16 and T=max would be the same mask -- and the thesis's own axis is
+    degenerate at this budget.  No quantizer runs; this is set arithmetic on the
+    frozen support.
+
+    `union_ratio` is the number of DISTINCT columns any tile kept, over the
+    number one tile keeps.  1.0 means every tile picked the identical set
+    (structured).  Toward `n_tiles` means the tiles disagree (semi-structured).
+    """
+    scheme = {1: "unstructured", 4096: "structured"}.get(tile_size, "tile")
+    d = A.density_for_budget(scheme, budget_bits, None, problem.n_in,
+                             tile_size=tile_size, vq_bits=A.E8P_STORED_BITS)
+    pruned = P.prune(problem.W, axis="B", tile_size=tile_size, density=d,
+                     metric="wanda", act_norm=problem.act_norm,
+                     compensate=False, align=Qz.E8P_DIM)
+    sup = pruned.mask.support                       # bool [n_tiles, n_idx]
+    n_tiles, n_idx = sup.shape
+    per_tile = float(sup.sum(dim=1).float().mean())
+    union = int(sup.any(dim=0).sum())
+
+    # Pairwise Jaccard over a bounded sample; 256 tiles is 32k pairs, and the
+    # widest layer has 688.  Sampling keeps this seconds rather than minutes.
+    jac = None
+    if n_tiles > 1:
+        g = torch.Generator(device="cpu").manual_seed(0)
+        m = min(64, n_tiles)
+        pick = torch.randperm(n_tiles, generator=g)[:m]
+        sub = sup[pick].float()
+        inter = sub @ sub.T
+        size = sub.sum(dim=1)
+        uni = size[:, None] + size[None, :] - inter
+        iu = torch.triu_indices(m, m, offset=1)
+        jac = float((inter[iu[0], iu[1]] / uni[iu[0], iu[1]]).mean())
+
+    return {
+        "n_tiles": n_tiles, "n_idx": n_idx,
+        "survivors_per_tile": per_tile,
+        "union_columns": union,
+        "union_ratio": union / per_tile if per_tile else None,
+        "mean_jaccard": jac,
+    }
 
 
 def unweighted_error(problem: Cal.LayerProblem, W_hat: torch.Tensor) -> float:
@@ -93,6 +144,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cache", type=Path, default=Path("results/block0_problems"))
     ap.add_argument("--layers", nargs="*", default=list(ALL_LAYERS))
     ap.add_argument("--arms", nargs="*", default=list(ARMS))
+    ap.add_argument("--mask-only", action="store_true",
+                    help="run only the support-overlap diagnostic, which needs "
+                         "no quantizer and takes seconds a layer")
     ap.add_argument("--tile", type=int, default=16)
     ap.add_argument("--rows", type=int, default=None,
                     help="keep only the first N output rows; 512 reproduces "
@@ -120,6 +174,19 @@ def main(argv: list[str] | None = None) -> int:
                 n_tokens=problem.n_tokens)
         print(f"\n{layer}  {tuple(problem.W.shape)}  "
               f"{problem.n_tokens} tokens")
+
+        ms = mask_stats(problem, tile_size=args.tile)
+        print(f"  mask        {ms['n_tiles']} tiles x "
+              f"{ms['survivors_per_tile']:.0f} survivors of {ms['n_idx']}   "
+              f"union {ms['union_columns']} (ratio {ms['union_ratio']:.2f})   "
+              f"jaccard {ms['mean_jaccard']:.3f}"
+              if ms["mean_jaccard"] is not None else
+              f"  mask        single tile, no overlap to measure")
+        rows.append({"arm": "mask", "layer": layer, **ms})
+        if args.mask_only:
+            del problem
+            continue
+
         for arm in args.arms:
             r = run_arm(problem, arm, tile_size=args.tile)
             r["layer"] = layer
@@ -142,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nwrote {args.out}")
 
     print("\nby arm, mean over layers:")
-    for arm in args.arms:
+    for arm in ([] if args.mask_only else args.arms):
         sel = [r for r in rows if r["arm"] == arm]
         if sel:
             w = sum(r["weighted"] for r in sel) / len(sel)
