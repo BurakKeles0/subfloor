@@ -23,3 +23,6 @@ results/*
 # IDE
 .idea/
 .vscode/
+
+# Editor-local permission file: a machine preference, not a project setting.
+.claude/settings.local.json
