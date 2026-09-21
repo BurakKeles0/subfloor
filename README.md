@@ -9,9 +9,16 @@ PTQ floor.
 > **Status.** The pipeline runs end to end against a real Llama-2-7B: dense
 > perplexity reproduces the published figure to within 0.006, the full-model
 > driver compresses real weights, and an interrupted run lands where an
-> uninterrupted one does. **The compressed model's perplexity has never been
-> measured** — every quality number below is either a layer-level proxy or
-> synthetic data. Details in [`docs/STATUS.md`](docs/STATUS.md).
+> uninterrupted one does. **The compressed model has now been measured, twice**
+> (WikiText-2, seqlen 4096). At the pipeline's own ~2-bit point — `B = 2.0625`,
+> `T = 16`, nothing pruned — it reads **13.97**: 1.6× ahead of QuaRot-GPTQ
+> 2-bit, 2.1× behind QuIP#, which makes it a reasonable member of its method
+> class rather than a broken pipeline. At `B = 1.5`, `T = 16`, `d = 0.719` it
+> reads **47.64** — the 0.5625 bits that sparsity buys cost **3.4× perplexity
+> against the pipeline's own reference**, so **Gate A fails at this point**.
+> What is still open is the budget axis: two points, nothing between them, and
+> the shape of the curve there is what the decision turns on. Details in
+> [`docs/STATUS.md`](docs/STATUS.md) §5.11–§5.14.
 
 ---
 
@@ -77,7 +84,7 @@ frames deep with an unrelated-looking message.
 
 ```bash
 pip install "torch" "transformers>=5" datasets numpy pytest
-python -m pytest -q                    # 674 tests
+python -m pytest -q                    # 682 tests
 ```
 
 Synthetic smoke test — the whole pipeline including both gates, no GPU needed:
@@ -256,15 +263,33 @@ path it changed. As rules: **a test must watch the path, not the answer**, and
 
 ## Gaps
 
-- **The compressed model's perplexity.** This is the critical path; the driver
-  exists, it has not been run
-- **The E8P assumption** (above) — the project's single largest risk
+- **The budget axis — two points and nothing between them.** 47.64 at `B = 1.5`
+  (`d = 0.719`) and 13.97 at `B = 2.0625` (`d = 1.000`). Whether the curve is
+  straight or breaks at a knee is unknown, and closing Gate A from one endpoint
+  would repeat the `dense_wall` mistake of `docs/STATUS.md` §5.11. The next
+  point is `B ≈ 1.75` (`d ≈ 0.85`) — about four hours on this machine
+- **Gate B has no real data at all.** A verdict needs ≥ 5 draws and one exists;
+  of the seven tile sizes, six have not been run. Gate B stands independent of
+  Gate A's failure: the frame narrows, the project does not stop
+- **The E8P assumption** (above) — `docs/STATUS.md` §9 still carries it as the
+  project's largest single risk, but the control it was waiting for has now been
+  run: the same line at `d ≈ 1.0`. Dropping pruning entirely cuts layer error by
+  only 8–32%, and `o_proj` gets 1% *worse* — the compacted survivor submatrix is
+  not where the quantizer falls apart. §3.2 keeps it unverified anyway, for the
+  reason §5.13 learned the hard way: layer error is a diagnostic, the decision is
+  read from perplexity, and there the same change is **3.4×**
 - **Freezing the preregistration.** The `Δ(T)` prediction curve and `T*_predicted`
   are open; both depend on the `τ` sweep and the sweep script is not written
-- **The driver's context cost.** The arithmetic is priced to within 1.03× on a
-  real layer, but the driver runs the same seven layers far slower, and the
-  difference is hitting the memory ceiling — compression peaks at 5.4 GiB on an
-  8 GiB card
+- **Both measured points carry a protocol defect.** Calibration ran at seqlen
+  2048 and evaluation at 4096, against this project's own rule to fix the
+  window. The two runs carry it identically, so the comparison between them is
+  clean; neither number should be set against the literature without the note
+- **The driver's context cost — and the entry that used to stand here was half
+  wrong.** The arithmetic is priced to within 1.03× on a real layer, and the
+  remaining gap was read as the memory ceiling. Measured: moving from the 8 GiB
+  card to a 14.6 GiB one took about 1.4× of the unexplained 2.7×, so **1.95× is
+  still unaccounted for**. Per block the model's arithmetic is 84 s, the T4
+  driver 168 s and the laptop driver 339 s
 - **LDLQ for Axis A** — currently `NotImplementedError`
 
 ---
@@ -285,8 +310,10 @@ inherited.
 
 ## Notes
 
-Test code is **1.4×** the size of production code (5824 against 4115 lines, 674
-tests) and that is deliberate: most of the code carries a mathematical claim that
+Test code is **1.6×** the size of the modules it guards: **7608** lines under
+`tests/` against **4885** in the eleven modules of the Layout table above.
+`pytest -q` collects **682** tests, of which 675 pass and 7 skip without a GPU.
+That is deliberate: most of the code carries a mathematical claim that
 has to be verified, and the most expensive class of error here is silently
 producing a wrong number. Most of the tests check a **claim** rather than a
 behaviour — where the identity is valid, how the codebook is constructed, that

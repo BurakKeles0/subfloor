@@ -9,8 +9,13 @@ optimize etmek.
 > **Durum.** Hat uçtan uca çalışıyor ve gerçek Llama-2-7B'ye bağlı: dense
 > perplexity yayımlanmış değerin 0.006 içinde yeniden üretiliyor, tam model
 > sürücüsü gerçek ağırlıkları sıkıştırıyor, kesilen bir koşu kesilmeyenin
-> cevabına varıyor. **Sıkıştırılmış modelin perplexity'si henüz ölçülmedi** —
-> aşağıdaki her kalite sayısı ya katman düzeyinde bir vekil ya da sentetik veri.
+> cevabına varıyor. **Sıkıştırılmış model artık ölçüldü — iki noktada:**
+> 1.5 bit / d=0.719 → **47.64** ppl, 2.0625 bit / d=1.000 → **13.97**
+> (WikiText-2, seqlen 4096, T=16, çekiliş 0). İkincisi hattın kendi ~2-bit
+> referansı: orada QuaRot-GPTQ 2-bit'in 1.6× önünde, QuIP#'in 2.1× gerisinde —
+> yani hat bozuk değil. Ama **Kapı A bu noktada düşüyor**: 0.5625 bitlik
+> tasarruf hattın kendi referansına karşı **3.4× ppl** ödetiyor. Bütçe
+> ekseninin ortası hâlâ boş.
 > Ayrıntı: [`docs/STATUS.md`](docs/STATUS.md).
 
 ---
@@ -72,7 +77,7 @@ konvansiyona bırakılmadı.
 
 ```bash
 pip install "torch" "transformers>=5" datasets numpy pytest
-python -m pytest -q                    # 674 test
+python -m pytest -q                    # 682 test
 ```
 
 Sentetik smoke test — hattın tamamı, iki kapı dahil, GPU gerekmez:
@@ -201,10 +206,12 @@ Bu iki şeyi birden veriyor: hat yayımlanmış sayıları yeniden üretiyor, **
 literatürdeki 5.12/5.47 ayrımının sebebi dizi uzunluğu olarak doğrulandı — ölçüm
 öncesinde kaydedilmiş bir hipotezdi.
 
-**Ama sıkıştırma kalitesi hâlâ ölçülmedi.** Dense baseline dışındaki her sayı
-ya katman düzeyinde `tr(E H Eᵀ)` proxy'si ya da sentetik veri. Sentetik smoke testte hata eğrisi
-U şeklinde çıkıyor ve Kapı A geçiyor — ama **veriyi biz ürettik, bu tez lehine
-kanıt değil.**
+**Sıkıştırma kalitesi artık ölçüldü — ama yalnız iki noktada**
+(`docs/STATUS.md` §5.11 ve §5.14). Dense baseline ve o iki nokta dışındaki her
+sayı ya katman düzeyinde `tr(E H Eᵀ)` proxy'si ya da sentetik veri. Sentetik
+smoke testte hata eğrisi U şeklinde çıkıyor ve Kapı A geçiyor — ama **veriyi biz
+ürettik, bu tez lehine kanıt değil**, ve gerçek modelde Kapı A, o iki nokta
+karşılaştırıldığında **düşüyor**.
 
 ---
 
@@ -239,13 +246,32 @@ kabul edilmemeli**.
 
 ## Eksikler
 
-- **Sıkıştırılmış modelin perplexity'si.** Kritik yol bu; sürücü var, koşulmadı
-- **E8P varsayımı** (yukarıda) — projenin en büyük tek riski
+- **Bütçe ekseninin ortası.** Elde iki nokta var, arası yok: 1.5 bit → 47.64,
+  2.0625 bit → 13.97. Eğri düz mü, yoksa bir dizde mi kırılıyor bilinmiyor, ve
+  Kapı A'yı tek bir uç noktayla kapatmak §5.11'in `dense_wall`'la yaptığı
+  hatanın aynısı olur. Sıradaki nokta **B≈1.75 (d≈0.85)** — bu makinede ~4 saat
+- **Kapı B'nin hiç gerçek verisi yok.** Verdikt için ≥5 çekiliş gerekiyor, elde
+  bir tane var; yedi tile boyutunun altısı hiç koşulmadı. Kapı B, Kapı A'nın
+  düşmesinden **bağımsız**: çerçeve daralır, proje durmaz
+- **E8P varsayımı** (yukarıda) — `docs/STATUS.md` §9 onu hâlâ projenin en büyük
+  tek riski olarak taşıyor, ama beklediği kontrol artık alındı: aynı hat
+  `d≈1.0`'da. Budamayı tamamen kaldırmak katman hatasını yalnız %8–32 alıyor ve
+  `o_proj` %1 **kötüleşiyor** — yani quantizer'ın çöktüğü yer kompaktlanmış
+  survivor alt-matrisi değil. §3.2 varsayımı yine de doğrulanmamış sayıyor,
+  §5.13'ün pahalı yoldan öğrendiği sebeple: katman hatası **teşhis**, karar
+  ppl'den okunur, ve orada aynı değişiklik **3.4×**
 - **Ön-kaydın dondurulması.** `Δ(T)` tahmin eğrisi ve `T*_tahmin` kutuları açık;
   ikisi de `τ` süpürmesine bağlı ve süpürme betiği henüz yazılmadı
-- **Sürücünün bağlam bedeli.** Aritmetik gerçek katmanda 1.03× doğrulukla
-  fiyatlanıyor, ama sürücü aynı yedi katmanı çok daha yavaş koşuyor ve fark
-  bellek tavanına dayanmak — 8 GiB kartta sıkıştırma tepesi 5.4 GiB
+- **Ölçülen iki nokta da bir protokol kusuru taşıyor.** Kalibrasyon seqlen
+  2048'de, değerlendirme 4096'da — projenin kendi "pencereyi sabitle" kuralına
+  aykırı. İki koşu kusuru **birebir aynı** taşıdığı için aralarındaki
+  karşılaştırma temiz; ama iki sayı da literatürün yanına bu not olmadan
+  konmamalı
+- **Sürücünün bağlam bedeli — ve burada duran eski madde yarı yanlıştı.**
+  Aritmetik gerçek katmanda 1.03× doğrulukla fiyatlanıyor, ve kalan açık bellek
+  tavanına bağlanmıştı. Ölçüldü: 8 GiB karttan 14.6 GiB'a çıkmak açıklanmamış
+  2.7×'in ~1.4×'ini aldı, yani **1.95× hâlâ açıklanmamış**. Blok başına modelin
+  aritmetiği 84 s, T4 sürücüsü 168 s, dizüstü sürücüsü 339 s
 - **Axis A için LDLQ** — şu an `NotImplementedError`
 
 ---
@@ -265,8 +291,9 @@ yok.
 
 ## Notlar
 
-Test kodu üretim kodunun **1.4 katı** (5824 / 4115 satır, 674 test) ve bu
-bilinçli: kodun çoğu
+Test kodu koruduğu modüllerin **1.6 katı**: `tests/` altında **7608** satır,
+yukarıdaki Yerleşim tablosunun on bir modülünde **4885**. `pytest -q` **682**
+test topluyor; 675'i geçiyor, 7'si GPU olmadan atlanıyor. Bu bilinçli: kodun çoğu
 doğrulanması gereken matematiksel iddia taşıyor, ve bu projede en pahalı hata
 sınıfı sessizce yanlış bir sayı üretmek. Testlerin çoğu davranış değil,
 **iddia** sınıyor — özdeşliğin geçerlilik alanı, codebook'un kurgusu,
