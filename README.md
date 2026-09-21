@@ -84,7 +84,7 @@ frames deep with an unrelated-looking message.
 
 ```bash
 pip install "torch" "transformers>=5" datasets numpy pytest
-python -m pytest -q                    # 682 tests
+python -m pytest -q                    # 689 tests
 ```
 
 Synthetic smoke test — the whole pipeline including both gates, no GPU needed:
@@ -310,9 +310,9 @@ inherited.
 
 ## Notes
 
-Test code is **1.6×** the size of the modules it guards: **7608** lines under
+Test code is **1.6×** the size of the modules it guards: **7742** lines under
 `tests/` against **4885** in the eleven modules of the Layout table above.
-`pytest -q` collects **682** tests, of which 675 pass and 7 skip without a GPU.
+`pytest -q` collects **689** tests, of which 682 pass and 7 skip without a GPU.
 That is deliberate: most of the code carries a mathematical claim that
 has to be verified, and the most expensive class of error here is silently
 producing a wrong number. Most of the tests check a **claim** rather than a

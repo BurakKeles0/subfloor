@@ -77,7 +77,7 @@ konvansiyona bırakılmadı.
 
 ```bash
 pip install "torch" "transformers>=5" datasets numpy pytest
-python -m pytest -q                    # 682 test
+python -m pytest -q                    # 689 test
 ```
 
 Sentetik smoke test — hattın tamamı, iki kapı dahil, GPU gerekmez:
@@ -291,9 +291,9 @@ yok.
 
 ## Notlar
 
-Test kodu koruduğu modüllerin **1.6 katı**: `tests/` altında **7608** satır,
-yukarıdaki Yerleşim tablosunun on bir modülünde **4885**. `pytest -q` **682**
-test topluyor; 675'i geçiyor, 7'si GPU olmadan atlanıyor. Bu bilinçli: kodun çoğu
+Test kodu koruduğu modüllerin **1.6 katı**: `tests/` altında **7742** satır,
+yukarıdaki Yerleşim tablosunun on bir modülünde **4885**. `pytest -q` **689**
+test topluyor; 682'si geçiyor, 7'si GPU olmadan atlanıyor. Bu bilinçli: kodun çoğu
 doğrulanması gereken matematiksel iddia taşıyor, ve bu projede en pahalı hata
 sınıfı sessizce yanlış bir sayı üretmek. Testlerin çoğu davranış değil,
 **iddia** sınıyor — özdeşliğin geçerlilik alanı, codebook'un kurgusu,
