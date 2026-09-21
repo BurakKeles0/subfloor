@@ -256,15 +256,21 @@ toplama pencere sayısıyla ölçekleniyor, yani ekstrapolasyon ölçülmüş de
 `run_point.py` bütçe dolduğunda ayrıca düz metinle söylüyor: `budget spent after
 N block(s) this session; …`. Yani 42'yi kaçırsanız bile ekranda yazıyor.
 
-> **Devam ederken bayrakları değiştirmeyin.** İki ayrı sonuç doğuruyor.
-> `--calib-seqlen`'i değiştirirseniz aktivasyonlar diskten eski uzunlukta gelir,
-> causal mask ve rotary yenisinde kurulur; checkpoint bunu reddetmiyor.
-> `--calib-samples` sessizce yok sayılıyor, çünkü `inputs` checkpoint'ten
-> okunuyor. Daha pahalısı: `--tile`, `--budget`, `--draw` ya da `--model`
+> **Devam ederken bayrakları değiştirmeyin.** İki ayrı sonuç doğuruyor ve
+> artık yalnız biri sessiz. `--calib-samples`, `--calib-seqlen`, `--datasets`
+> ya da `--max-eval-windows` değişirse `Checkpoint.load` duruyor: protokol
+> `state.json`'a yazılıyor ve devam ederken karşılaştırılıyor, "refusing to
+> resume across protocols" diyor. Eski değeri geri verin ya da noktaya
+> sıfırdan başlayın. Eskiden `--calib-seqlen` sessizce devam ediyordu —
+> aktivasyonlar diskten eski uzunlukta gelir, causal mask ve rotary yenisinde
+> kurulurdu — ve nokta tek bir perplexity altında iki protokol olurdu. Daha
+> pahalısı hâlâ sessiz: `--tile`, `--budget`, `--draw` ya da `--model`
 > değişirse **slug değişiyor**, yani hata almazsınız — yeni ve boş bir
 > checkpoint dizini açılır ve eskisinin ~16 GiB'ı 20 GB'lık diskte öylece
 > kalır. `Checkpoint.load`'un "refusing to resume across configurations"
-> koruması bu yüzden neredeyse hiç ateşlemiyor.
+> koruması bu yüzden hâlâ neredeyse hiç ateşlemiyor; protokol koruması
+> bilerek slug'a konmadı, çünkü slug hem checkpoint dizininin hem de bitmiş
+> nokta dosyasının adı — onu değiştirmek diskteki kaydı öksüz bırakırdı.
 
 **İkinci T4 tek kutuda kullanılamıyor.** Burada bir zamanlar iki
 `CUDA_VISIBLE_DEVICES` süreci başlatan bir reçete vardı; darboğaz GPU değil host.
@@ -384,6 +390,7 @@ var ama JSON **yok**; dosya ancak nokta 0 ile bittiğinde oluşuyor.
 | alan | ne |
 |---|---|
 | `spec` | model, bütçe, tile, çekiliş — yedi nokta dosyasını ayıran şey |
+| `protocol` | `calib_samples`, `calib_seqlen`, `eval_seqlen`, `eval_datasets`, `max_eval_windows` — noktanın hangi protokolle ölçüldüğü. Ölçülmüş iki nokta bu alandan önce yazıldı, onlarda **yok** |
 | `perplexity` | dataset başına. Defter yalnız `wikitext2` koşturuyor, yani tek anahtar olacak; ön-kayıt C4'ü de istiyor |
 | `records` | katman başına `rel_output_error`, artı `block`/`name`/`layer`/`n_in`/`n_out`/`n_tokens` — 224 kayıt. **SNR yok** |
 | `diagnostics` | blok 0'ın yoğun E8P referansı, `ratio_to_dense`, `assumption_broken`, `dense_e8p_snr_db` |
@@ -395,7 +402,8 @@ SNR'nin katman kayıtlarında olmaması bir eksiklik: `run_config` hesaplıyor a
 sürücü ondan yalnız `W_hat`'i alıyor. JSON'daki tek SNR blok 0'ın referansı.
 
 **JSON'da olmayanlar**, elle not düşün: GPU adı, torch ve transformers
-sürümleri, `has_triton()`. `calib_seqlen` alan olarak yok ama her kayıttaki
+sürümleri, `has_triton()`. `calib_seqlen` artık `protocol` alanında; ondan önce
+yazılmış iki nokta dosyasında yok ve orada her kayıttaki
 `n_tokens` onu ele veriyor — 128 × 2048 → 262144, 128 × 4096 → 524288. Ayırt
 edilemeyen şey **slug ve `PointSpec`**, dosyanın içeriği değil.
 

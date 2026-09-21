@@ -29,6 +29,11 @@ import m1_run as R
 
 SPEC = R.PointSpec(model="tiny", budget_bits=1.5, tile_size=4, draw=0)
 
+#: The protocol beside it.  `eval_datasets` is a tuple because that is what
+#: `run_point` passes, and `state.json` hands it back a list.
+PROTOCOL = {"calib_samples": 8, "calib_seqlen": 2048, "eval_seqlen": 4096,
+            "eval_datasets": ("wikitext2",)}
+
 
 def _block(seed: int) -> torch.nn.Module:
     torch.manual_seed(seed)
@@ -162,8 +167,13 @@ def test_the_state_carries_the_diagnostics_and_the_elapsed_time(tmp_path):
 def test_a_checkpoint_written_before_these_fields_existed_still_resumes(
         tmp_path):
     """Whatever is on the card when this lands has to keep working; a resume
-    that raises KeyError would strand hours of compressed blocks."""
-    ckpt = R.Checkpoint(tmp_path, SPEC)
+    that raises KeyError would strand hours of compressed blocks.
+
+    `protocol` is the third such field, and the one that could refuse rather
+    than raise: the state below predates it, so there is nothing to compare
+    and the resume has to go ahead anyway.
+    """
+    ckpt = R.Checkpoint(tmp_path, SPEC, PROTOCOL)
     ckpt.dir.mkdir(parents=True, exist_ok=True)
     ckpt.state_path.write_text(json.dumps({
         "spec": {"model": "tiny", "budget_bits": 1.5, "tile_size": 4,
@@ -176,6 +186,68 @@ def test_a_checkpoint_written_before_these_fields_existed_still_resumes(
     assert state["next_block"] == 3
     assert state.get("diagnostics", []) == []
     assert float(state.get("seconds", 0.0)) == 0.0
+    assert "protocol" not in state
+
+
+def test_resuming_a_different_configuration_is_refused(tmp_path):
+    """`Checkpoint.load` is the only thing standing between one point's
+    blocks and another point's perplexity, and nothing in this file checked
+    that it stands.  `tests/test_hf_llama.py` has the end-to-end version,
+    but it is behind `importorskip("transformers")` -- so on a machine
+    without it the guard went untested, and this file exists precisely
+    because that is the machine most likely to be interrupted.
+    """
+    ckpt = R.Checkpoint(tmp_path, SPEC)
+    ckpt.save_block(0, _block(0), _inputs(1.0), [{"block": 0}])
+
+    other = R.Checkpoint(tmp_path, R.PointSpec(
+        model="tiny", budget_bits=2.0, tile_size=4, draw=0))
+    other.dir = ckpt.dir           # what a hand-moved directory looks like
+
+    with pytest.raises(ValueError, match="across configurations"):
+        other.load()
+
+
+def test_resuming_with_a_different_protocol_is_refused(tmp_path):
+    """The expensive one, because it needs no hand-moved directory.
+
+    The directory is named after the spec alone, so a half-finished point
+    relaunched with a different `--calib-seqlen` lands in its own checkpoint
+    and used to continue: the activations come back at the old length while
+    the causal mask and the rotary embeddings are rebuilt at the new one,
+    and the point finishes as one perplexity over two protocols with nothing
+    in the result file to say so.  `cloud/README.md` has carried this as a
+    trap the operator must remember; remembering is not a mechanism.
+    """
+    ckpt = R.Checkpoint(tmp_path, SPEC, PROTOCOL)
+    ckpt.save_block(0, _block(0), _inputs(1.0), [{"block": 0}])
+
+    longer = R.Checkpoint(tmp_path, SPEC, {**PROTOCOL, "calib_seqlen": 4096})
+    # The collision is the point: same spec, same slug, same directory.  If
+    # the protocol were in the slug this would be a different path and the
+    # checkpoint on the card would have lost its.
+    assert longer.dir == ckpt.dir
+
+    with pytest.raises(ValueError, match="across protocols"):
+        longer.load()
+
+
+def test_an_unchanged_protocol_survives_the_round_trip_through_the_state(
+        tmp_path):
+    """The guard's own failure mode, and the reason it is worth a test of
+    its own: `eval_datasets` is a tuple in memory and a list once it has
+    been through `state.json`, so a comparison made against the in-memory
+    form refuses every correct resume.  That trades a silently wrong answer
+    for a checkpoint nobody can continue -- on a cloud disk that holds one
+    point and nothing else, the worse trade.
+    """
+    ckpt = R.Checkpoint(tmp_path, SPEC, PROTOCOL)
+    ckpt.save_block(0, _block(0), _inputs(1.0), [{"block": 0}])
+
+    state = R.Checkpoint(tmp_path, SPEC, PROTOCOL).load()
+    assert state["next_block"] == 1
+    # And it really did come back from disk in the other shape.
+    assert state["protocol"]["eval_datasets"] == ["wikitext2"]
 
 
 def test_a_finished_block_leaves_no_temporary_files(tmp_path):

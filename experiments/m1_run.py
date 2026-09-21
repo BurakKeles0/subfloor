@@ -20,7 +20,8 @@ is final and the activations are exactly what the next one will see.  Anything
 finer would have to checkpoint mid-Hessian; anything coarser loses the point.
 
     resume/                       one directory per point
-      state.json                  which block is next, and the records so far
+      state.json                  the protocol, which block is next, and the
+                                  records so far
       inputs.pt                   the NEXT block's inputs -- overwritten
       block-<i>.pt                that block's compressed weights -- appended
 
@@ -93,7 +94,19 @@ EARLY_WARNING_RATIO = 2.0
 
 @dataclass(frozen=True)
 class PointSpec:
-    """One grid point.  Also the checkpoint key (`docs/STATUS.md` section 8.1)."""
+    """One grid point, and the checkpoint's directory name (`docs/STATUS.md`
+    section 8.1).
+
+    It is not the whole checkpoint key, and deliberately so.  The protocol
+    that produced a point -- how many calibration windows, how long, at what
+    evaluation length -- belongs to the point as much as its budget does, but
+    folding it in here would rewrite every slug, and a slug is a path twice
+    over: the checkpoint directory under `results/m1_resume/` and the
+    finished point's file under `results/m1_points/`.  Rewriting it would
+    orphan whatever checkpoint is on the card and stop the results already
+    measured from naming the runs that produced them.  The protocol is
+    carried beside the spec instead; see `Checkpoint.__init__`.
+    """
     model: str = DEFAULT_MODEL
     budget_bits: float = 1.5
     tile_size: int | str = 16
@@ -129,9 +142,18 @@ class Checkpoint:
     would mean rewriting gigabytes to advance a counter.
     """
 
-    def __init__(self, root: Path, spec: PointSpec) -> None:
+    def __init__(self, root: Path, spec: PointSpec,
+                 protocol: dict | None = None) -> None:
         self.dir = root / spec.slug()
         self.spec = spec
+        # Round-tripped through JSON because that is the form it comes back
+        # in: `eval_datasets` is a tuple here and a list once it has been
+        # through `state.json`, and comparing the two would refuse every
+        # correct resume -- a checkpoint nobody can continue, which on the
+        # 20 GB cloud disk `cloud/README.md` budgets for is the worse of the
+        # two failures.  Empty when the caller names no protocol, which is
+        # what makes this argument optional for the tests that predate it.
+        self.protocol = json.loads(json.dumps(protocol or {}))
 
     @property
     def state_path(self) -> Path:
@@ -153,6 +175,16 @@ class Checkpoint:
             raise ValueError(
                 f"{self.dir} holds a checkpoint for {state.get('spec')}, not "
                 f"{asdict(self.spec)} -- refusing to resume across configurations"
+            )
+        # Compared only when the stored state names one.  A checkpoint
+        # written before this field existed cannot answer the question, and
+        # refusing it would strand exactly the hours of compressed blocks
+        # this class exists to save.
+        stored = state.get("protocol")
+        if stored is not None and stored != self.protocol:
+            raise ValueError(
+                f"{self.dir} holds a checkpoint calibrated with {stored}, "
+                f"not {self.protocol} -- refusing to resume across protocols"
             )
         return state
 
@@ -191,6 +223,7 @@ class Checkpoint:
                 lambda p: torch.save([t.detach().cpu() for t in inputs], p))
         _atomic(self.state_path, lambda p: p.write_text(json.dumps({
             "spec": asdict(self.spec),
+            "protocol": self.protocol,
             "next_block": index + 1,
             "records": records,
             "diagnostics": list(diagnostics or []),
@@ -267,7 +300,22 @@ def run_point(
     t0 = time.time()
     harness = HF.load_llama(spec.model, dtype=torch.float16)
     blocks = harness.blocks
-    ckpt = Checkpoint(resume_root, spec) if resume_root else None
+    # What `spec` does not say.  None of it used to reach the checkpoint or
+    # the output file, and both consequences were real: a finished point's
+    # only trace of its calibration length was `records[i].n_tokens`, and a
+    # point relaunched with a different `--calib-seqlen` resumed without
+    # complaint -- the activations come off the disk at the old length while
+    # the causal mask and the rotary embeddings are rebuilt at the new one,
+    # so the point finishes as one perplexity over two protocols.
+    # `cloud/README.md` documents that as a trap the operator must remember.
+    protocol = {
+        "calib_samples": calib_samples,
+        "calib_seqlen": calib_seqlen,
+        "eval_seqlen": eval_seqlen,
+        "eval_datasets": eval_datasets,
+        "max_eval_windows": max_eval_windows,
+    }
+    ckpt = Checkpoint(resume_root, spec, protocol) if resume_root else None
 
     state = ckpt.load() if ckpt else None
     start_block = state["next_block"] if state else 0
@@ -360,6 +408,7 @@ def run_point(
     # resumed point could be the evaluation and nothing else.
     out = {
         "spec": asdict(spec),
+        "protocol": protocol,
         "seconds": seconds_before + (time.time() - t0),
         "seconds_this_session": time.time() - t0,
         "perplexity": ppl,
