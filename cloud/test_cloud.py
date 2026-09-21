@@ -163,3 +163,60 @@ def test_the_checkpoint_estimate_matches_what_a_point_really_writes():
     activations_gib = 128 * 2048 * 4096 * 2 / 2 ** 30
     expected = 32 * per_block_gib + 2 * activations_gib
     assert PF.POINT_CHECKPOINT_GIB == pytest.approx(expected, abs=0.05)
+
+
+# --------------------------------------------------------------------------- #
+# The protocol the runner hands to the driver
+# --------------------------------------------------------------------------- #
+
+def test_the_evaluation_window_reaches_the_driver_instead_of_defaulting(
+        tmp_path, monkeypatch):
+    """`--calib-seqlen` was overridden here and `--eval-seqlen` was not exposed
+    at all, so every cloud point calibrated at 2048 and evaluated at whatever
+    `m1_run` defaulted to -- 4096 -- with nothing on either side saying the two
+    disagreed.  That is the protocol defect `docs/STATUS.md` section 5.11
+    records, and both measured points carry it.
+
+    What is patched is `m1_run.run_point`, NOT this module's `run`.  There are
+    two hops -- argparse to `run`, and `run` to the driver -- and patching
+    `run` would leave the second one untested while the test's name claims it.
+    A flag that parses and is then dropped one frame later looks identical from
+    the command line, which is exactly the failure being guarded.
+    """
+    seen = {}
+
+    def fake_run_point(spec, **kw):
+        seen.update(kw)
+        return {"spec": {}, "seconds": 1.0, "perplexity": {"wikitext2": 9.0}}
+
+    monkeypatch.setattr(RP.R, "run_point", fake_run_point)
+    assert RP.main(["--resume-root", str(tmp_path), "--device", "cpu",
+                    "--eval-seqlen", "2048"]) == 0
+    assert seen["eval_seqlen"] == 2048
+    assert seen["calib_seqlen"] == 2048
+
+
+def test_the_runners_evaluation_default_is_the_drivers(tmp_path, monkeypatch):
+    """The two runners must agree on the evaluation window, and the way to make
+    that true is to have one constant rather than two literals -- which is what
+    `--calib-seqlen` already does through `CALIB_SEQLEN`.
+
+    Comparing the two argparse defaults to each other would be satisfied by
+    both being wrong together, so what is pinned is the shared constant.
+    `--calib-seqlen` deliberately DOES differ (2048 here against the driver's
+    4096, the C4 sampler's limit), which is why the other one cannot be left to
+    look after itself.
+    """
+    seen = {}
+
+    def fake_run_point(spec, **kw):
+        seen.update(kw)
+        return {"spec": {}, "seconds": 1.0, "perplexity": {}}
+
+    monkeypatch.setattr(RP.R, "run_point", fake_run_point)
+    RP.main(["--resume-root", str(tmp_path), "--device", "cpu"])
+    assert seen["eval_seqlen"] == R.EVAL_SEQLEN
+    assert seen["calib_seqlen"] != R.CALIB_SEQLEN, (
+        "the two windows are the same again; if that is deliberate, the C4 "
+        "sampler must have been fixed and this test should say so"
+    )

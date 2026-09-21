@@ -256,15 +256,22 @@ toplama pencere sayısıyla ölçekleniyor, yani ekstrapolasyon ölçülmüş de
 `run_point.py` bütçe dolduğunda ayrıca düz metinle söylüyor: `budget spent after
 N block(s) this session; …`. Yani 42'yi kaçırsanız bile ekranda yazıyor.
 
-> **Devam ederken bayrakları değiştirmeyin.** İki ayrı sonuç doğuruyor.
-> `--calib-seqlen`'i değiştirirseniz aktivasyonlar diskten eski uzunlukta gelir,
-> causal mask ve rotary yenisinde kurulur; checkpoint bunu reddetmiyor.
-> `--calib-samples` sessizce yok sayılıyor, çünkü `inputs` checkpoint'ten
-> okunuyor. Daha pahalısı: `--tile`, `--budget`, `--draw` ya da `--model`
+> **Devam ederken bayrakları değiştirmeyin.** İki ayrı sonuç doğuruyor ve
+> artık yalnız biri sessiz. `--calib-samples`, `--calib-seqlen`, `--datasets`,
+> `--eval-seqlen` ya da `--max-eval-windows` değişirse `Checkpoint.load`
+> duruyor: protokol
+> `state.json`'a yazılıyor ve devam ederken karşılaştırılıyor, "refusing to
+> resume across protocols" diyor. Eski değeri geri verin ya da noktaya
+> sıfırdan başlayın. Eskiden `--calib-seqlen` sessizce devam ediyordu —
+> aktivasyonlar diskten eski uzunlukta gelir, causal mask ve rotary yenisinde
+> kurulurdu — ve nokta tek bir perplexity altında iki protokol olurdu. Daha
+> pahalısı hâlâ sessiz: `--tile`, `--budget`, `--draw` ya da `--model`
 > değişirse **slug değişiyor**, yani hata almazsınız — yeni ve boş bir
 > checkpoint dizini açılır ve eskisinin ~16 GiB'ı 20 GB'lık diskte öylece
 > kalır. `Checkpoint.load`'un "refusing to resume across configurations"
-> koruması bu yüzden neredeyse hiç ateşlemiyor.
+> koruması bu yüzden hâlâ neredeyse hiç ateşlemiyor; protokol koruması
+> bilerek slug'a konmadı, çünkü slug hem checkpoint dizininin hem de bitmiş
+> nokta dosyasının adı — onu değiştirmek diskteki kaydı öksüz bırakırdı.
 
 **İkinci T4 tek kutuda kullanılamıyor.** Burada bir zamanlar iki
 `CUDA_VISIBLE_DEVICES` süreci başlatan bir reçete vardı; darboğaz GPU değil host.
@@ -345,15 +352,22 @@ yetmeyeceğini doğrudan söylüyor.
 
 ### Blok 0'ın erken uyarısı
 
-`diagnostics` alanında `ratio_to_dense` var: sıkıştırılmış katmanın hatasının,
-aynı katmanın **yoğun E8P** referansına oranı. Referans blok 0'ın yedi
-katmanının fazladan bir quantizasyonuyla üretiliyor.
+`diagnostics` alanında **iki** oran var. `ratio_to_dense`, sıkıştırılmış
+katmanın hatasının `dense_wall`'a — tüm katman tek tile, rotasyon yok, LDLQ yok
+— oranı; §5.11'in ölçtüğü gibi bu yalnız "tam hat çıplak bir quantizer'ı
+geçiyor" der ve §3.2'nin sorusuna dokunmaz. Karar veren
+`ratio_to_pipeline_dense`: paydası **aynı hattın d=1.0'daki hâli** (aynı tile,
+aynı çekiliş, tek değişken seyreklik). Bedeli de çıplak referansınki değil —
+blok 0 için fazladan bir **tam hat geçişi**; dizüstünde bir d=1.0 bloğu 11.46 dk
+(§5.14), **T4'te hiç ölçülmedi**, oturum bütçesini buna göre ayırın.
 
-> **`ratio_to_dense > 2.0` ise varsayım düştü.** E8P'nin kompaktlanmış survivor
-> alt-matrisinde 2-bit *kalitesini* koruduğu, §3.2'nin açık varsayımı ve
-> projenin en büyük tek riski. Düşerse geri dönüş yolu rotasyon + GPTQ-3bit
+> **`ratio_to_pipeline_dense > 2.0` ise varsayım düştü.** E8P'nin kompaktlanmış
+> survivor alt-matrisinde 2-bit *kalitesini* koruduğu, §3.2'nin açık varsayımı
+> ve projenin en büyük tek riski. Düşerse geri dönüş yolu rotasyon + GPTQ-3bit
 > (`W = 3.148`) ve bant 1.83–2.83'e kayıyor. `assumption_broken` alanı bunu
-> ayrıca `true` yazıyor.
+> ayrıca `true` yazıyor, `assumption_broken_reference` de hangi referansın
+> karar verdiğini. Eşiğin 2.0'ı payda değiştiği hâlde **yeniden kalibre
+> edilmedi** — `m1_run.EARLY_WARNING_RATIO`'nun notu bunu yazıyor.
 
 Sonucu beklemenize gerek yok: blok 0 bittiği anda `state.json`'a yazılıyor.
 Ayrı bir hücreden:
@@ -384,9 +398,10 @@ var ama JSON **yok**; dosya ancak nokta 0 ile bittiğinde oluşuyor.
 | alan | ne |
 |---|---|
 | `spec` | model, bütçe, tile, çekiliş — yedi nokta dosyasını ayıran şey |
+| `protocol` | `calib_samples`, `calib_seqlen`, `eval_seqlen`, `eval_datasets`, `max_eval_windows` — noktanın hangi protokolle ölçüldüğü. Ölçülmüş iki nokta bu alandan önce yazıldı, onlarda **yok** |
 | `perplexity` | dataset başına. Defter yalnız `wikitext2` koşturuyor, yani tek anahtar olacak; ön-kayıt C4'ü de istiyor |
 | `records` | katman başına `rel_output_error`, artı `block`/`name`/`layer`/`n_in`/`n_out`/`n_tokens` — 224 kayıt. **SNR yok** |
-| `diagnostics` | blok 0'ın yoğun E8P referansı, `ratio_to_dense`, `assumption_broken`, `dense_e8p_snr_db` |
+| `diagnostics` | blok 0'ın **iki** referansı: `ratio_to_dense` (çıplak `dense_wall`, teşhis) ve `ratio_to_pipeline_dense` (d=1.0'daki aynı hat, **karar veren**), artı `assumption_broken`, `assumption_broken_reference`, `early_warning_ratio`, `pipeline_dense_bits`/`_density`/`_tile_size`/`_seed`/`_error`/`_reused_point`, `dense_e8p_error`, `dense_e8p_snr_db` |
 | `levers` | `rotate_kron`, `search_dtype`, `compensate_block` |
 | `seconds` | noktanın **toplam** maliyeti, oturumlar boyunca |
 | `seconds_this_session` | yalnız son oturum |
@@ -395,7 +410,8 @@ SNR'nin katman kayıtlarında olmaması bir eksiklik: `run_config` hesaplıyor a
 sürücü ondan yalnız `W_hat`'i alıyor. JSON'daki tek SNR blok 0'ın referansı.
 
 **JSON'da olmayanlar**, elle not düşün: GPU adı, torch ve transformers
-sürümleri, `has_triton()`. `calib_seqlen` alan olarak yok ama her kayıttaki
+sürümleri, `has_triton()`. `calib_seqlen` artık `protocol` alanında; ondan önce
+yazılmış iki nokta dosyasında yok ve orada her kayıttaki
 `n_tokens` onu ele veriyor — 128 × 2048 → 262144, 128 × 4096 → 524288. Ayırt
 edilemeyen şey **slug ve `PointSpec`**, dosyanın içeriği değil.
 
@@ -474,6 +490,13 @@ Yani 4096'da örnekleyici **hiçbir `n_samples` değerinde** yetişemiyor —
 Bu ana projede **düzeltilmedi**, çünkü düzeltmesi kalibrasyon protokolünü
 değiştirmek demek (belgeleri akışa birleştirmek, wikitext yolunun yaptığı gibi)
 ve o bir karar. Burada yalnız kaydedildi.
+
+**Değerlendirme penceresi buna bağlı değil.** `--eval-seqlen` artık
+`run_point.py`'de de var ve varsayılanı `m1_run.py`'ninkiyle aynı: 4096. Yani
+kalibrasyonu 2048'e çekmek değerlendirmeyi 2048 yapmıyor; iki pencere artık
+komutta ayrı ayrı yazılıyor. Bayrak yokken değerlendirme penceresi
+devralınıyordu ve komutta hiç görünmüyordu; STATUS §5.11 bunu "Protokol kusuru"
+olarak kaydediyor.
 
 ### 2. Sabitler yeniden ölçülmeli
 

@@ -427,6 +427,15 @@ def dense_wall(problem: LayerProblem, seed: int = 0) -> dict:
     NOT budget-matched with the sparse configs, and that is the point -- the
     comparison is "less than 2 bits against exactly 2 bits".  Reported with the
     offset spelled out so no table can quietly imply otherwise.
+
+    WHAT ITS ERROR IS NOT.  The whole layer is one tile, with no rotation and
+    no LDLQ, so `rel_output_error` here is a BARE quantizer's -- 0.24-0.87 on
+    block 0 of Llama-2-7B, which no real 2-bit method would report
+    (`docs/STATUS.md` section 5.11).  The BITS are the floor Gate A is measured
+    against; the ERROR is not a 2-bit method's.  A ratio to it says the
+    pipeline beats a bare quantizer and cannot say more.  Section 3.2's
+    early-warning rule needs a reference that differs from the run in sparsity
+    alone -- `pipeline_dense`, below.
     """
     blocks = problem.W.unsqueeze(0)
     qb = Qz.quantize_blocks(blocks)
@@ -441,6 +450,42 @@ def dense_wall(problem: LayerProblem, seed: int = 0) -> dict:
         "rel_output_error": problem.output_error(W_hat),
         "snr_db": Qz.quantization_snr(problem.W, W_hat),
     }
+
+
+def pipeline_dense(problem: LayerProblem, tile_size: int | str,
+                   seed: int = 0) -> dict:
+    """This same pipeline at density 1.0 -- section 3.2's actual reference.
+
+    `dense_wall` answers "does the pipeline beat a bare quantizer".  This
+    answers the question `docs/STATUS.md` section 3.2 asks, because the run and
+    this differ in SPARSITY and in nothing else: same rotation, same LDLQ, same
+    tile size, same seed, same `LayerProblem`.  Section 5.11 named it -- "the
+    reference at d~=1.0 (B=2.0625, T=16) must be the same line" -- and section
+    5.14 ran it at the model level for 13.97 ppl.
+
+    The budget is computed, not hardcoded: `bits_per_position` at density 1.0 is
+    what a dense run costs at THIS tile size, which is 2.0625 at T=16, 2.25 at
+    T=4 and 2.0 at T=max.  `axis="B"` is `run_config`'s default and `n_in` is
+    the index axis there.  Callers should check the returned
+    `density_realized` is 1.0 rather than assume it (section 14.2: count that
+    the two arms took different paths, then read the numbers).
+
+    IT IS NOT CHEAP.  This is a full pipeline pass at the most expensive
+    density there is: the one measured d=1.000 block took 11.46 min, and a
+    whole model 6.28 h (section 5.14).  How many times a SPARSE block that is,
+    the repo does not say -- section 6.16's 339 s is the only laptop d<1
+    per-block number and it predates section 6.17's 1.46x fix.  Per layer over
+    a whole model this is a second model.
+
+    Deliberately NOT budget-matched with `dense_wall`'s 2.0: at T=16 this pays
+    2.0625, the extra 1/16 being the index the sparse configs also pay.  Matching
+    it would mean moving the tile size, which is the other thing being held
+    fixed.
+    """
+    scheme = {1: "unstructured", Tl.MAX_TILE: "structured"}.get(tile_size, "tile")
+    bits = A.bits_per_position(scheme, 1.0, None, problem.n_in,
+                               tile_size=tile_size, vq_bits=E8P_BITS)
+    return run_config(problem, budget_bits=bits, tile_size=tile_size, seed=seed)
 
 
 # --------------------------------------------------------------------------- #

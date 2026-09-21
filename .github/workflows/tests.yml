@@ -1,0 +1,61 @@
+name: tests
+
+# docs/STATUS.md section 14.2: an un-run composition counts as not working.
+# The suite is the only thing that says the pipeline still composes, so it runs
+# on every push and every pull request instead of when someone remembers.
+on: [push, pull_request]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    # A hang guard, not an estimate.  The suite is slow on a CPU and a hosted
+    # runner is slower than a desktop; nobody has timed it on this runner.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          # What the repo is developed against.  The `int | str` annotations
+          # already rule out anything below 3.10.
+          python-version: "3.11"
+          cache: pip
+          # The suite has no requirements.txt -- its dependency list is the pip
+          # line below, and cloud/requirements.txt is cloud extras only -- so
+          # key the cache on this file, which changes exactly when that line
+          # does.
+          cache-dependency-path: .github/workflows/tests.yml
+
+      # README.md's "Install and run" line, with one change: torch comes from
+      # the CPU index, because the runner has no GPU and the default Linux
+      # wheel drags in CUDA libraries nothing here would ever call.
+      - name: Install
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "transformers>=5" datasets numpy pytest
+
+      # Nothing is deselected, and nothing needs to be.  Every GPU test skips
+      # itself when there is no CUDA device -- by marker, or inline in the
+      # parametrized case (tests/test_quantize.py:923) -- and the cost-model
+      # tests skip when the untracked `results/m0_rates.json` is absent, which
+      # it is in a fresh clone.  No test reaches the network:
+      # `hf_llama.tiny_llama` builds a randomly initialized model and the
+      # dataset loaders are monkeypatched.  If that stops being true, fix the
+      # test rather than adding a `-k` here.
+      #
+      # TILESPARSE_NO_COMPILE is quantize.py's own escape hatch (quantize.py:544),
+      # and it is set deliberately.  quantize.py probes `torch.compile` and falls
+      # back to eager only when the toolchain is missing; its docstring's "CPU
+      # asks for `cl` and does not find it" is true on Windows and false here,
+      # where the runner has a C++ compiler.  So without this, CI would be the
+      # first place the compiled CPU kernel has ever run -- and the gate on
+      # every push is not the place to run a composition for the first time
+      # (section 14.2 again).  The cost is that
+      # `test_compiled_and_eager_kernels_agree_bit_for_bit[cpu]` keeps skipping,
+      # exactly as it does on the machines this suite has actually been run on;
+      # exercising that path is a separate, deliberate job.
+      - name: Tests
+        env:
+          TILESPARSE_NO_COMPILE: "1"
+        run: python -m pytest -q

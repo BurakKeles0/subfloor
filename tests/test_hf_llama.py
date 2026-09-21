@@ -462,8 +462,9 @@ def test_the_checkpoint_refuses_to_resume_a_different_configuration(
 
 
 def test_the_driver_reports_the_early_warning_rule(tmp_path, monkeypatch):
-    """Section 3.2's assumption is this project's largest single risk and the
-    driver can check it for free -- it already has both numbers."""
+    """Section 3.2's assumption is this project's largest single risk, and the
+    driver carries the check for block 0 -- both references, and the one that
+    decided."""
     m1_run = _tiny_for_m1(tmp_path, monkeypatch)
     spec = m1_run.PointSpec(model="tiny", budget_bits=1.5, tile_size=4, draw=0)
     out = m1_run.run_point(spec, device="cpu", resume_root=None, calib_samples=8,
@@ -473,6 +474,18 @@ def test_the_driver_reports_the_early_warning_rule(tmp_path, monkeypatch):
     for d in out["diagnostics"]:
         assert d["block"] == 0
         assert d["ratio_to_dense"] > 0
+        assert d["ratio_to_pipeline_dense"] > 0
+        assert d["pipeline_dense_density"] == 1.0
+        assert d["assumption_broken_reference"] == "pipeline_dense"
+        # The factor section 3.2 commits to, written out.  Comparing against
+        # the module attribute would pass whatever the module happened to say.
+        assert d["early_warning_ratio"] == 2.0
         assert isinstance(d["assumption_broken"], bool)
+    # The protocol travels with the answer.  Until this branch a finished
+    # point could not say what window produced it, and the only trace of the
+    # calibration length was `records[i].n_tokens`.
+    assert out["protocol"]["calib_seqlen"] == SEQ
+    assert out["protocol"]["eval_seqlen"] == SEQ
+    assert out["protocol"]["calib_samples"] == 8
     # And the levers that produced the numbers travel with them.
     assert out["levers"]["rotate_kron"] is True

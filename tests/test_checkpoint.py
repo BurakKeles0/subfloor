@@ -24,10 +24,17 @@ from pathlib import Path
 import pytest
 import torch
 
+import calibrate as Cal
+import m1_gates as M
 import m1_run as R
 
 
 SPEC = R.PointSpec(model="tiny", budget_bits=1.5, tile_size=4, draw=0)
+
+#: The protocol beside it.  `eval_datasets` is a tuple because that is what
+#: `run_point` passes, and `state.json` hands it back a list.
+PROTOCOL = {"calib_samples": 8, "calib_seqlen": 2048, "eval_seqlen": 4096,
+            "eval_datasets": ("wikitext2",), "max_eval_windows": None}
 
 
 def _block(seed: int) -> torch.nn.Module:
@@ -162,8 +169,13 @@ def test_the_state_carries_the_diagnostics_and_the_elapsed_time(tmp_path):
 def test_a_checkpoint_written_before_these_fields_existed_still_resumes(
         tmp_path):
     """Whatever is on the card when this lands has to keep working; a resume
-    that raises KeyError would strand hours of compressed blocks."""
-    ckpt = R.Checkpoint(tmp_path, SPEC)
+    that raises KeyError would strand hours of compressed blocks.
+
+    `protocol` is the third such field, and the one that could refuse rather
+    than raise: the state below predates it, so there is nothing to compare
+    and the resume has to go ahead anyway.
+    """
+    ckpt = R.Checkpoint(tmp_path, SPEC, PROTOCOL)
     ckpt.dir.mkdir(parents=True, exist_ok=True)
     ckpt.state_path.write_text(json.dumps({
         "spec": {"model": "tiny", "budget_bits": 1.5, "tile_size": 4,
@@ -176,6 +188,89 @@ def test_a_checkpoint_written_before_these_fields_existed_still_resumes(
     assert state["next_block"] == 3
     assert state.get("diagnostics", []) == []
     assert float(state.get("seconds", 0.0)) == 0.0
+    assert "protocol" not in state
+
+
+def test_resuming_a_different_configuration_is_refused(tmp_path):
+    """`Checkpoint.load` is the only thing standing between one point's
+    blocks and another point's perplexity, and nothing in this file checked
+    that it stands.  `tests/test_hf_llama.py` has the end-to-end version,
+    but it is behind `importorskip("transformers")` -- so on a machine
+    without it the guard went untested, and this file exists precisely
+    because that is the machine most likely to be interrupted.
+    """
+    ckpt = R.Checkpoint(tmp_path, SPEC)
+    ckpt.save_block(0, _block(0), _inputs(1.0), [{"block": 0}])
+
+    other = R.Checkpoint(tmp_path, R.PointSpec(
+        model="tiny", budget_bits=2.0, tile_size=4, draw=0))
+    other.dir = ckpt.dir           # what a hand-moved directory looks like
+
+    with pytest.raises(ValueError, match="across configurations"):
+        other.load()
+
+
+def test_resuming_with_a_different_protocol_is_refused(tmp_path):
+    """The expensive one, because it needs no hand-moved directory.
+
+    The directory is named after the spec alone, so a half-finished point
+    relaunched with a different `--calib-seqlen` lands in its own checkpoint
+    and used to continue: the activations come back at the old length while
+    the causal mask and the rotary embeddings are rebuilt at the new one,
+    and the point finishes as one perplexity over two protocols with nothing
+    in the result file to say so.  `cloud/README.md` has carried this as a
+    trap the operator must remember; remembering is not a mechanism.
+    """
+    ckpt = R.Checkpoint(tmp_path, SPEC, PROTOCOL)
+    ckpt.save_block(0, _block(0), _inputs(1.0), [{"block": 0}])
+
+    longer = R.Checkpoint(tmp_path, SPEC, {**PROTOCOL, "calib_seqlen": 4096})
+    # The collision is the point: same spec, same slug, same directory.  If
+    # the protocol were in the slug this would be a different path and the
+    # checkpoint on the card would have lost its.
+    assert longer.dir == ckpt.dir
+
+    with pytest.raises(ValueError, match="across protocols"):
+        longer.load()
+
+
+def test_changing_only_the_evaluation_window_is_refused_too(tmp_path):
+    """Characterisation, not a new guard -- and worth writing down because the
+    behaviour is stricter than the reason given for it.
+
+    `--eval-seqlen` touches no compressed block, so the activations argument
+    that justifies the calibration fields does not reach it.  It is in the key
+    anyway, because the same dict is the finished point's provenance and a
+    point whose evaluation window changed halfway has a `protocol` field that
+    is a guess.  The price is real and the operator pays it: twenty blocks into
+    a point, the window cannot be changed without starting over.  If that is
+    ever judged too strict, this test is the thing to delete -- and deleting it
+    should be a decision rather than a surprise.
+    """
+    ckpt = R.Checkpoint(tmp_path, SPEC, PROTOCOL)
+    ckpt.save_block(0, _block(0), _inputs(1.0), [{"block": 0}])
+
+    other = R.Checkpoint(tmp_path, SPEC, {**PROTOCOL, "eval_seqlen": 2048})
+    with pytest.raises(ValueError, match="across protocols"):
+        other.load()
+
+
+def test_an_unchanged_protocol_survives_the_round_trip_through_the_state(
+        tmp_path):
+    """The guard's own failure mode, and the reason it is worth a test of
+    its own: `eval_datasets` is a tuple in memory and a list once it has
+    been through `state.json`, so a comparison made against the in-memory
+    form refuses every correct resume.  That trades a silently wrong answer
+    for a checkpoint nobody can continue -- on a cloud disk that holds one
+    point and nothing else, the worse trade.
+    """
+    ckpt = R.Checkpoint(tmp_path, SPEC, PROTOCOL)
+    ckpt.save_block(0, _block(0), _inputs(1.0), [{"block": 0}])
+
+    state = R.Checkpoint(tmp_path, SPEC, PROTOCOL).load()
+    assert state["next_block"] == 1
+    # And it really did come back from disk in the other shape.
+    assert state["protocol"]["eval_datasets"] == ["wikitext2"]
 
 
 def test_a_finished_block_leaves_no_temporary_files(tmp_path):
@@ -187,3 +282,69 @@ def test_a_finished_block_leaves_no_temporary_files(tmp_path):
     ckpt.save_block(0, _block(0), _inputs(1.0), [{"block": 0}])
 
     assert not [p for p in ckpt.dir.iterdir() if p.suffix == ".tmp"]
+
+
+# --------------------------------------------------------------------------- #
+# Section 3.2's early warning, and which reference decides it
+# --------------------------------------------------------------------------- #
+
+def test_the_early_warning_is_decided_by_the_dense_pipeline(monkeypatch):
+    """Section 3.2's rule only tests section 3.2's claim if the reference
+    differs from the run in SPARSITY alone, so that is what is asserted here:
+    the reference arm came back at density 1.0, and the decision followed ITS
+    ratio.
+
+    Asserting `assumption_broken` directly would prove nothing -- both ratios
+    are below 2.0 here, so a rule wired to the bare `dense_wall` would give the
+    same answer.  Section 14.2's rule is that a test must follow the PATH, not
+    the answer, so the threshold is moved between the two ratios instead: only
+    the honest one fires.  Synthetic and 64x64, so it costs no checkpoint and
+    no model.
+    """
+    p = Cal.synthetic_problem(n_out=64, n_in=64, n_samples=512, seed=3)
+    prob = Cal.LayerProblem(p.W.float(), p.X.float(), name=p.name)
+    spec = R.PointSpec(budget_bits=1.5, tile_size=4, draw=0)
+    rec = M.run_config(prob, budget_bits=spec.budget_bits,
+                       tile_size=spec.tile_size, seed=spec.draw)
+
+    d = R._early_warning(prob, rec, spec)
+    assert d["pipeline_dense_density"] == 1.0, "the reference arm was not dense"
+    # Density alone does not make it the SAME line: a reference taken at
+    # another tile size or seed also comes back dense.  Section 14.2 -- the
+    # arms must differ in one thing and agree on everything else.
+    assert d["pipeline_dense_tile_size"] == spec.tile_size
+    assert d["pipeline_dense_seed"] == spec.draw
+    assert d["pipeline_dense_bits"] > spec.budget_bits
+    assert not d["pipeline_dense_reused_point"]
+    assert d["assumption_broken_reference"] == "pipeline_dense"
+    assert d["ratio_to_dense"] < d["ratio_to_pipeline_dense"], (
+        "the two references agree on this layer, so this test cannot tell "
+        "which one decided -- pick a problem where they separate"
+    )
+
+    monkeypatch.setattr(R, "EARLY_WARNING_RATIO",
+                        (d["ratio_to_dense"] + d["ratio_to_pipeline_dense"]) / 2)
+    assert R._early_warning(prob, rec, spec)["assumption_broken"] is True
+
+
+def test_the_early_warning_reuses_a_point_that_is_already_the_reference():
+    """At density 1.0 the reference arm would recompute the run it is the
+    reference for -- eleven minutes for a ratio of exactly 1.0 (section 5.14's
+    control point is such a run)."""
+    p = Cal.synthetic_problem(n_out=64, n_in=64, n_samples=512, seed=3)
+    prob = Cal.LayerProblem(p.W.float(), p.X.float(), name=p.name)
+    spec = R.PointSpec(budget_bits=2.0625, tile_size=16, draw=0)
+    rec = M.run_config(prob, budget_bits=spec.budget_bits,
+                       tile_size=spec.tile_size, seed=spec.draw)
+    assert rec["density_realized"] == 1.0
+
+    d = R._early_warning(prob, rec, spec)
+    assert d["pipeline_dense_reused_point"] is True
+    assert d["ratio_to_pipeline_dense"] == 1.0
+    assert d["assumption_broken"] is False
+    # The reused arm must report what the run COST, not what it asked for.
+    # `budget_bits` is the request and differs from the outcome whenever the
+    # per-tile rounding moves the density -- which is the one number a
+    # reference is for.
+    assert d["pipeline_dense_bits"] == rec["bits_realized"]
+    assert d["pipeline_dense_tile_size"] == spec.tile_size
