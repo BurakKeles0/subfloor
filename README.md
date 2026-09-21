@@ -312,7 +312,12 @@ inherited.
 
 Test code is **1.6×** the size of the modules it guards: **7742** lines under
 `tests/` against **4885** in the eleven modules of the Layout table above.
-`pytest -q` collects **689** tests, of which 682 pass and 7 skip without a GPU.
+`pytest -q` collects **689** tests. Six skip on this machine: five accounting
+cells whose budget is unreachable by construction, and the compiled/eager
+comparison where no compiled backend is available. Without a CUDA device the
+GPU-marked tests skip as well, and a fresh clone skips the cost-model tests too
+— they read an untracked `results/m0_rates.json` that only a local measurement
+produces.
 That is deliberate: most of the code carries a mathematical claim that
 has to be verified, and the most expensive class of error here is silently
 producing a wrong number. Most of the tests check a **claim** rather than a

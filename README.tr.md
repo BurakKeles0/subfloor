@@ -293,7 +293,11 @@ yok.
 
 Test kodu koruduğu modüllerin **1.6 katı**: `tests/` altında **7742** satır,
 yukarıdaki Yerleşim tablosunun on bir modülünde **4885**. `pytest -q` **689**
-test topluyor; 682'si geçiyor, 7'si GPU olmadan atlanıyor. Bu bilinçli: kodun çoğu
+test topluyor. Bu makinede altısı atlanıyor: beşi kurgusu gereği
+ulaşılamaz bütçe hücresi, biri derlenmiş/eager karşılaştırması — derleme
+backend'i yoksa. CUDA yoksa GPU işaretli testler de atlanır; taze bir klonda
+maliyet modeli testleri de atlanır, çünkü izlenmeyen `results/m0_rates.json`'u
+okuyorlar ve onu ancak yerel bir ölçüm üretiyor. Bu bilinçli: kodun çoğu
 doğrulanması gereken matematiksel iddia taşıyor, ve bu projede en pahalı hata
 sınıfı sessizce yanlış bir sayı üretmek. Testlerin çoğu davranış değil,
 **iddia** sınıyor — özdeşliğin geçerlilik alanı, codebook'un kurgusu,
