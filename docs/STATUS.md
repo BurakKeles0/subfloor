@@ -313,12 +313,23 @@ ppl     47.6368   WikiText-2, seqlen 4096, 83 pencere
 süre    1.64 h    92.7 dk sıkıştırma (2.8 dk/blok) + 5.8 dk eval
 ```
 
-| | ppl @4096 |
-|---|---|
-| dense (bu hattın kendi ölçümü, §5.10) | 5.1143 |
-| QuIP# 2-bit | 6.66 |
-| QuaRot-GPTQ 2-bit | 22.07 |
-| **bu koşu, 1.5 bit** | **47.64** |
+| | ppl | protokol |
+|---|---|---|
+| dense (bu hattın kendi ölçümü, §5.10) | 5.1143 | bu hat, seqlen 4096 (`dense-5.12` ailesi) |
+| QuIP# 2-bit | 6.66 | yayımlanmış, `dense-5.47` ailesi (seqlen 2048) |
+| QuaRot-GPTQ 2-bit | 22.07 | yayımlanmış, `dense-5.47` ailesi (seqlen 2048) |
+| **bu koşu, 1.5 bit** | **47.64** | **bu hat, seqlen 4096 (`dense-5.12` ailesi)** |
+
+**Tablodaki iki literatür satırı bu hattın protokolünde alınmadı.** 6.66 ve
+22.07, `eval/perplexity.py`'deki `PUBLISHED` sözlüğünde `llama-2-7b/dense-5.47`
+altında duruyor; o ailenin dense'i burada seqlen 2048'de 5.4675. Bu hattın kendi
+iki satırı ise 4096 ailesinden. Tek bir "ppl @4096" başlığı dördünü de aynı
+protokoldeymiş gibi gösteriyordu; protokol sütunu bu yüzden eklendi. Modülün
+docstring'i nedenini yazıyor: QuIP# 2-bit kendi makalesinde 6.66, QTIP'in
+tablosunda 6.19 — 0.47'lik bu fark bir sonucu ters çevirebilir. 4096 ailesinin
+kendi 2-bit referansları QTIP 5.86 ve QuIP# 6.19'dur; o ailede QuaRot-GPTQ
+2-bit girdisi **yok**. Yani buradaki literatür kıyası bir büyüklük mertebesi
+fikri verir, aynı protokolde alınmış bir karşılaştırma değildir.
 
 **Muhasebe temiz, ve bu ilk kontrol edilen şeydi.** `density_for_budget` her iki
 genişlikte de d=0.71875 veriyor, `uniform_survivor_count` align=8 ile k=2944
@@ -372,7 +383,10 @@ O çerçeve yanlış: budama tarafı Wanda-%50 ile kıyaslanamaz, çünkü burad
 16 satırın **paylaştığı** tek support (semi-structured, yapısal uca yakın);
 quantizer tarafı QuIP#'in 6.66'sı ile kıyaslanamaz, çünkü o sayı iki taraflı
 incoherence processing + fine-tuning ile alınmış, bu hat ise tek taraflı
-rotasyon, 16×2944 değere tek α, fine-tuning yok. Doğru referans sınıfı
+rotasyon, 16×2944 değere tek α, fine-tuning yok. *(Ek not, 09-21: bu paragrafın
+"referans sınıfı" argümanı ayakta — §5.14 onu yeniden kullanıyor — ama anılan iki
+sayı `dense-5.47` ailesinden, yani seqlen 2048'den; yukarıdaki protokol notuyla
+birlikte okunmalı.)* Doğru referans sınıfı
 **QuaRot-GPTQ 2-bit = 22.07** ve 47.64 onun 2.2 katı.
 
 #### Maliyet: model nokta düzeyinde 1.4×, blok düzeyinde 2.0× iyimser
@@ -717,13 +731,28 @@ ppl     13.9700   WikiText-2, seqlen 4096, 83 pencere
 süre    6.28 h    11.46 dk/blok, 32 blok boyunca %2 sapma (kayma yok)
 ```
 
-| | ppl @4096 | ortalama katman hatası |
-|---|---|---|
-| dense | 5.1143 | — |
-| QuIP# 2-bit | 6.66 | — |
-| **bu hat, d≈1.0, 2.0625 bit** | **13.97** | **0.1957** |
-| QuaRot-GPTQ 2-bit | 22.07 | — |
-| bu hat, d=0.719, 1.5 bit | 47.64 | 0.2450 |
+| | ppl | protokol | ortalama katman hatası |
+|---|---|---|---|
+| dense | 5.1143 | bu hat, seqlen 4096 | — |
+| QuIP# 2-bit | 6.66 | yayımlanmış, `dense-5.47` (seqlen 2048) | — |
+| **bu hat, d≈1.0, 2.0625 bit** | **13.97** | **bu hat, seqlen 4096** | **0.1957** |
+| QuaRot-GPTQ 2-bit | 22.07 | yayımlanmış, `dense-5.47` (seqlen 2048) | — |
+| bu hat, d=0.719, 1.5 bit | 47.64 | bu hat, seqlen 4096 | 0.2450 |
+
+**Hangi satır hangisiyle kıyaslanabilir.** Bu hattın üç satırı — 5.1143, 13.97,
+47.64 — WikiText-2, seqlen 4096, 83 pencere ile alındı; birbirlerinden
+çıkarılabilirler. 6.66 ve 22.07 ise `eval/perplexity.py`'nin `dense-5.47`
+ailesinden, yani seqlen 2048 protokolünden: `PUBLISHED` bu sayıları aileye göre
+ayırıyor, `published()` protokol adını açıkça istiyor ve `compare()` farklı
+protokoldeki iki ölçümü birbirinden çıkarmayı reddediyor — çünkü aynı yöntem iki
+aile arasında 0.47 ppl oynuyor (QuIP# 2-bit: kendi makalesinde 6.66, QTIP'in
+tablosunda 6.19). 4096 ailesinde QuaRot-GPTQ 2-bit girdisi hiç yok; oradaki
+2-bit referansları QTIP 5.86 ve QuIP# 6.19. Aşağıdaki "1.6× geçiyor / 2.1×
+gerisinde" ve "literatürün tabanına karşı 7.2×" oranları bu yüzden aileler arası
+okunmalı: hattın kabaca nereye düştüğünü söyleyen bir konumlandırma, aynı
+protokolde alınmış bir fark değil. **Bölümün sonucu bundan etkilenmiyor**, çünkü
+Kapı A'yı düşüren karşılaştırma 47.64 ile 13.97 arasında — bu hattın kendisine
+karşı kendisi, tek protokol, tek değişken yoğunluk.
 
 #### Quantizer bozuk değil — soru yanlış sorulmuştu
 
