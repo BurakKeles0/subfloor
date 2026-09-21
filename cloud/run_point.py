@@ -178,7 +178,7 @@ def main(argv=None) -> int:
                     help="2048, not m1_run's 4096: C4 cannot supply 4096-token "
                          "windows at the sampler's try budget (0.33%% of "
                          "documents are that long)")
-    ap.add_argument("--eval-seqlen", type=int, default=4096,
+    ap.add_argument("--eval-seqlen", type=int, default=R.EVAL_SEQLEN,
                     help="m1_run's default; independent of --calib-seqlen.  "
                          "Before this flag a cloud point calibrated at 2048 "
                          "and evaluated at 4096 without saying so "

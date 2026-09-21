@@ -86,7 +86,7 @@ frames deep with an unrelated-looking message.
 
 ```bash
 pip install "torch" "transformers>=5" datasets numpy pytest
-python -m pytest -q                    # 689 tests
+python -m pytest -q                    # 690 tests
 ```
 
 Synthetic smoke test — the whole pipeline including both gates, no GPU needed:
@@ -317,9 +317,9 @@ inherited.
 
 ## Notes
 
-Test code is **1.6×** the size of the modules it guards: **7742** lines under
+Test code is **1.6×** the size of the modules it guards: **7782** lines under
 `tests/` against **4885** in the eleven modules of the Layout table above.
-`pytest -q` collects **689** tests. Six skip on this machine: five accounting
+`pytest -q` collects **690** tests. Six skip on this machine: five accounting
 cells whose budget is unreachable by construction, and the compiled/eager
 comparison where no compiled backend is available. Without a CUDA device the
 GPU-marked tests skip as well, and a fresh clone skips the cost-model tests too

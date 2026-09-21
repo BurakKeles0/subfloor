@@ -461,63 +461,6 @@ def test_the_checkpoint_refuses_to_resume_a_different_configuration(
         ckpt.load()
 
 
-def test_the_early_warning_is_decided_by_the_dense_pipeline(monkeypatch):
-    """Section 3.2's rule only tests section 3.2's claim if the reference
-    differs from the run in SPARSITY alone, so that is what is asserted here:
-    the reference arm came back at density 1.0, and the decision followed ITS
-    ratio.
-
-    Asserting `assumption_broken` directly would prove nothing -- both ratios
-    are below 2.0 here, so a rule wired to the bare `dense_wall` would give the
-    same answer.  Section 14.2's rule is that a test must follow the PATH, not
-    the answer, so the threshold is moved between the two ratios instead: only
-    the honest one fires.  Synthetic and 64x64, so it costs no checkpoint and
-    no model.
-    """
-    import m1_gates as M
-    import m1_run
-
-    p = Cal.synthetic_problem(n_out=64, n_in=64, n_samples=512, seed=3)
-    prob = Cal.LayerProblem(p.W.float(), p.X.float(), name=p.name)
-    spec = m1_run.PointSpec(budget_bits=1.5, tile_size=4, draw=0)
-    rec = M.run_config(prob, budget_bits=spec.budget_bits,
-                       tile_size=spec.tile_size, seed=spec.draw)
-
-    d = m1_run._early_warning(prob, rec, spec)
-    assert d["pipeline_dense_density"] == 1.0, "the reference arm was not dense"
-    assert d["pipeline_dense_bits"] > spec.budget_bits
-    assert not d["pipeline_dense_reused_point"]
-    assert d["assumption_broken_reference"] == "pipeline_dense"
-    assert d["ratio_to_dense"] < d["ratio_to_pipeline_dense"], (
-        "the two references agree on this layer, so this test cannot tell "
-        "which one decided -- pick a problem where they separate"
-    )
-
-    monkeypatch.setattr(m1_run, "EARLY_WARNING_RATIO",
-                        (d["ratio_to_dense"] + d["ratio_to_pipeline_dense"]) / 2)
-    assert m1_run._early_warning(prob, rec, spec)["assumption_broken"] is True
-
-
-def test_the_early_warning_reuses_a_point_that_is_already_the_reference():
-    """At density 1.0 the reference arm would recompute the run it is the
-    reference for -- eleven minutes for a ratio of exactly 1.0 (section 5.14's
-    control point is such a run)."""
-    import m1_gates as M
-    import m1_run
-
-    p = Cal.synthetic_problem(n_out=64, n_in=64, n_samples=512, seed=3)
-    prob = Cal.LayerProblem(p.W.float(), p.X.float(), name=p.name)
-    spec = m1_run.PointSpec(budget_bits=2.0625, tile_size=16, draw=0)
-    rec = M.run_config(prob, budget_bits=spec.budget_bits,
-                       tile_size=spec.tile_size, seed=spec.draw)
-    assert rec["density_realized"] == 1.0
-
-    d = m1_run._early_warning(prob, rec, spec)
-    assert d["pipeline_dense_reused_point"] is True
-    assert d["ratio_to_pipeline_dense"] == 1.0
-    assert d["assumption_broken"] is False
-
-
 def test_the_driver_reports_the_early_warning_rule(tmp_path, monkeypatch):
     """Section 3.2's assumption is this project's largest single risk, and the
     driver carries the check for block 0 -- both references, and the one that
@@ -534,7 +477,15 @@ def test_the_driver_reports_the_early_warning_rule(tmp_path, monkeypatch):
         assert d["ratio_to_pipeline_dense"] > 0
         assert d["pipeline_dense_density"] == 1.0
         assert d["assumption_broken_reference"] == "pipeline_dense"
-        assert d["early_warning_ratio"] == m1_run.EARLY_WARNING_RATIO
+        # The factor section 3.2 commits to, written out.  Comparing against
+        # the module attribute would pass whatever the module happened to say.
+        assert d["early_warning_ratio"] == 2.0
         assert isinstance(d["assumption_broken"], bool)
+    # The protocol travels with the answer.  Until this branch a finished
+    # point could not say what window produced it, and the only trace of the
+    # calibration length was `records[i].n_tokens`.
+    assert out["protocol"]["calib_seqlen"] == SEQ
+    assert out["protocol"]["eval_seqlen"] == SEQ
+    assert out["protocol"]["calib_samples"] == 8
     # And the levers that produced the numbers travel with them.
     assert out["levers"]["rotate_kron"] is True

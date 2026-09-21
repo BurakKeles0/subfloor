@@ -79,7 +79,7 @@ konvansiyona bırakılmadı.
 
 ```bash
 pip install "torch" "transformers>=5" datasets numpy pytest
-python -m pytest -q                    # 689 test
+python -m pytest -q                    # 690 test
 ```
 
 Sentetik smoke test — hattın tamamı, iki kapı dahil, GPU gerekmez:
@@ -295,8 +295,8 @@ yok.
 
 ## Notlar
 
-Test kodu koruduğu modüllerin **1.6 katı**: `tests/` altında **7742** satır,
-yukarıdaki Yerleşim tablosunun on bir modülünde **4885**. `pytest -q` **689**
+Test kodu koruduğu modüllerin **1.6 katı**: `tests/` altında **7782** satır,
+yukarıdaki Yerleşim tablosunun on bir modülünde **4885**. `pytest -q` **690**
 test topluyor. Bu makinede altısı atlanıyor: beşi kurgusu gereği
 ulaşılamaz bütçe hücresi, biri derlenmiş/eager karşılaştırması — derleme
 backend'i yoksa. CUDA yoksa GPU işaretli testler de atlanır; taze bir klonda

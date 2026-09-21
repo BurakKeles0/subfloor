@@ -105,6 +105,12 @@ DEFAULT_OUT_DIR = Path("results/m1_points")
 CALIB_SAMPLES = 128
 CALIB_SEQLEN = 4096
 
+#: The evaluation window.  Named for the same reason `CALIB_SEQLEN` is: it is
+#: read in three places -- this module's signature, this module's argparse, and
+#: `cloud/run_point.py`, which must not drift from it -- and a default written
+#: as three separate literals is a default nothing can pin.
+EVAL_SEQLEN = 4096
+
 #: Both are required for the gates (preregistration section 4).  The five
 #: zero-shot tasks are reported separately and do NOT enter the gates, so they
 #: are not run per point -- once, at the end, on the chosen configuration.
@@ -345,9 +351,21 @@ def _early_warning(problem: Cal.LayerProblem, record: dict,
         "dense_e8p_error": wall["rel_output_error"],
         "dense_e8p_snr_db": wall["snr_db"],
         "ratio_to_dense": err / max(wall["rel_output_error"], 1e-30),
-        "pipeline_dense_bits": dense["budget_bits"],
+        # `bits_realized`, not `budget_bits`.  They agree on the reference arm,
+        # which solves d=1.0 exactly; they do NOT agree on the reuse branch,
+        # where `budget_bits` is the RUN's budget and only `bits_realized` is
+        # what the dense arm actually cost.  Recording the request instead of
+        # the outcome is the mistake `run_config` already refuses to make.
+        "pipeline_dense_bits": dense["bits_realized"],
         "pipeline_dense_density": dense["density_realized"],
         "pipeline_dense_error": dense["rel_output_error"],
+        # The three fields that say the reference differed in SPARSITY ALONE.
+        # Density is not enough on its own: a reference taken at another tile
+        # size or another seed would also come back at d=1.0 and would not be
+        # the same line (section 14.2 -- count that the arms took different
+        # paths, and that they took the SAME path everywhere else).
+        "pipeline_dense_tile_size": dense.get("tile_size"),
+        "pipeline_dense_seed": dense.get("seed"),
         "pipeline_dense_reused_point": dense is record,
         "ratio_to_pipeline_dense": ratio,
         "early_warning_ratio": EARLY_WARNING_RATIO,
@@ -365,7 +383,7 @@ def run_point(
     calib_seqlen: int = CALIB_SEQLEN,
     calib_batch: int = 1,
     eval_datasets=EVAL_DATASETS,
-    eval_seqlen: int = 4096,
+    eval_seqlen: int = EVAL_SEQLEN,
     max_eval_windows: int | None = None,
     stop_after_block: int | None = None,
     progress=print,
@@ -386,6 +404,17 @@ def run_point(
     # the causal mask and the rotary embeddings are rebuilt at the new one,
     # so the point finishes as one perplexity over two protocols.
     # `cloud/README.md` documents that as a trap the operator must remember.
+    #
+    # THE EVALUATION FIELDS ARE IN HERE TOO, and that is a choice rather than
+    # an oversight.  None of them touches a compressed block on disk, so the
+    # argument above does not reach them -- but this same dict is the result
+    # file's whole provenance, and a point whose evaluation window changed
+    # halfway is a point whose `protocol` field is a guess.  The cost is that
+    # the window is free to pick at launch and fixed for the life of the
+    # checkpoint: an operator twenty blocks in cannot change it without
+    # starting the point over.  That is the strict direction, and it is the
+    # one this project has taken everywhere else a number could be quietly
+    # wrong instead of loudly absent.
     protocol = {
         "calib_samples": calib_samples,
         "calib_seqlen": calib_seqlen,
@@ -537,7 +566,7 @@ def main(argv=None) -> int:
     ap.add_argument("--no-resume", action="store_true")
     ap.add_argument("--calib-samples", type=int, default=CALIB_SAMPLES)
     ap.add_argument("--calib-seqlen", type=int, default=CALIB_SEQLEN)
-    ap.add_argument("--eval-seqlen", type=int, default=4096)
+    ap.add_argument("--eval-seqlen", type=int, default=EVAL_SEQLEN)
     ap.add_argument("--datasets", nargs="*", default=list(EVAL_DATASETS))
     ap.add_argument("--max-eval-windows", type=int, default=None)
     ap.add_argument("--stop-after-block", type=int, default=None,

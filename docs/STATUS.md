@@ -105,6 +105,15 @@ güçlendiriyor** — gerekçesi "rotasyon kalın kuyruğu düzeltir"di ve rotas
 E8P referansının 2 katını aşarsa varsayım düşmüş sayılır; geri dönüş yolu
 rotasyon + GPTQ-3bit (`W=3.148`), bant 1.83–2.83'e kayar.
 
+> *(Ek not, 09-21: buradaki "dense E8P referansı" yazıldığında `dense_wall`
+> demekti — tüm katman tek tile, rotasyon yok, LDLQ yok. §5.11 o referansın
+> §3.2'nin sorusuna dokunmadığını tespit etti; sürücü artık kararı
+> `ratio_to_pipeline_dense` ile veriyor, yani **aynı hattın `d=1.0`'daki hâli**
+> (`m1_gates.pipeline_dense`). **2 katı** çarpanı yeniden kalibre edilmedi:
+> payda blok 0'da 1.4–7.1 kat küçüldü, yani eşik katman başına eskisinden
+> başka bir yerde duruyor. `m1_run.EARLY_WARNING_RATIO`'nun yorumu bunu
+> açıkça yazıyor.)*
+
 ### 3.3 Henüz hiç ölçülmemiş
 
 *(Bu bölümün baş kalemi — sıkıştırılmış modelin perplexity'si — 09-03'te kapandı: §5.11.)*

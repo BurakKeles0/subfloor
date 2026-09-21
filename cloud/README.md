@@ -257,8 +257,9 @@ toplama pencere sayısıyla ölçekleniyor, yani ekstrapolasyon ölçülmüş de
 N block(s) this session; …`. Yani 42'yi kaçırsanız bile ekranda yazıyor.
 
 > **Devam ederken bayrakları değiştirmeyin.** İki ayrı sonuç doğuruyor ve
-> artık yalnız biri sessiz. `--calib-samples`, `--calib-seqlen`, `--datasets`
-> ya da `--max-eval-windows` değişirse `Checkpoint.load` duruyor: protokol
+> artık yalnız biri sessiz. `--calib-samples`, `--calib-seqlen`, `--datasets`,
+> `--eval-seqlen` ya da `--max-eval-windows` değişirse `Checkpoint.load`
+> duruyor: protokol
 > `state.json`'a yazılıyor ve devam ederken karşılaştırılıyor, "refusing to
 > resume across protocols" diyor. Eski değeri geri verin ya da noktaya
 > sıfırdan başlayın. Eskiden `--calib-seqlen` sessizce devam ediyordu —
@@ -400,7 +401,7 @@ var ama JSON **yok**; dosya ancak nokta 0 ile bittiğinde oluşuyor.
 | `protocol` | `calib_samples`, `calib_seqlen`, `eval_seqlen`, `eval_datasets`, `max_eval_windows` — noktanın hangi protokolle ölçüldüğü. Ölçülmüş iki nokta bu alandan önce yazıldı, onlarda **yok** |
 | `perplexity` | dataset başına. Defter yalnız `wikitext2` koşturuyor, yani tek anahtar olacak; ön-kayıt C4'ü de istiyor |
 | `records` | katman başına `rel_output_error`, artı `block`/`name`/`layer`/`n_in`/`n_out`/`n_tokens` — 224 kayıt. **SNR yok** |
-| `diagnostics` | blok 0'ın **iki** referansı: `ratio_to_dense` (çıplak `dense_wall`, teşhis) ve `ratio_to_pipeline_dense` (d=1.0'daki aynı hat, **karar veren**), artı `assumption_broken`, `assumption_broken_reference`, `early_warning_ratio`, `pipeline_dense_bits`/`_density`/`_error`, `dense_e8p_snr_db` |
+| `diagnostics` | blok 0'ın **iki** referansı: `ratio_to_dense` (çıplak `dense_wall`, teşhis) ve `ratio_to_pipeline_dense` (d=1.0'daki aynı hat, **karar veren**), artı `assumption_broken`, `assumption_broken_reference`, `early_warning_ratio`, `pipeline_dense_bits`/`_density`/`_tile_size`/`_seed`/`_error`/`_reused_point`, `dense_e8p_error`, `dense_e8p_snr_db` |
 | `levers` | `rotate_kron`, `search_dtype`, `compensate_block` |
 | `seconds` | noktanın **toplam** maliyeti, oturumlar boyunca |
 | `seconds_this_session` | yalnız son oturum |
