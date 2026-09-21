@@ -40,11 +40,35 @@ pipeline computes the compressed weight and drops it).  Both are passed here.
 
 WHAT IT REPORTS BESIDES PERPLEXITY.  Per layer: the relative output error and
 the SNR, which are free -- the pipeline already computes them.  And for block 0,
-the dense E8P reference, because section 3.2's early-warning rule is defined
-against it: if a compressed layer's error exceeds twice the dense E8P
-reference's, the assumption that E8P holds its quality on a compacted survivor
-submatrix has failed, and that assumption is this project's single largest risk.
-Checking it costs one extra quantization of seven layers.
+TWO references, because section 3.2's early-warning rule -- the check on this
+project's single largest risk -- needs the reference its own sentence describes,
+and the one it had was not it.
+
+`m1_gates.dense_wall` is the whole layer as one tile, no rotation, no LDLQ.
+`ratio_to_dense` against it says the full pipeline beats a bare quantizer.  That
+is worth knowing and it is not section 3.2's question, which is whether the SAME
+pipeline keeps its quality once the submatrix is a compacted set of survivors
+(`docs/STATUS.md` section 5.11).  Only a reference that changes SPARSITY and
+nothing else answers that, so block 0 also runs `m1_gates.pipeline_dense`: the
+identical pipeline at density 1.0, same tile size, same seed, same problem.
+`ratio_to_pipeline_dense` is what decides `assumption_broken`.
+
+WHAT THE HONEST REFERENCE COSTS, and why it stays at block 0.  It is a second
+full pipeline pass over block 0's seven layers, at the most expensive density
+there is.  The one d=1.000 block anyone has measured is section 5.14's: 11.46
+min on the laptop, 6.28 h for all 32.  So block 0 costs about 11.5 min, roughly
+5% of the ~4 h section 5.14 budgets for the next point, and running it on every
+block would add ~6.1 h and more than double that run.  Block 0 only, which is
+where the check already was.  The point that IS the reference (realized density
+1.0) reuses its own record and pays nothing.
+
+The MULTIPLE over a sparse block is deliberately not stated, because nothing in
+the repo measures it.  The only laptop d<1 per-block number is section 6.16's
+339 s, and that run predates section 6.17's measured 1.46x Hessian-release fix
+and used four calibration windows instead of 128; dividing 11.46 min by it
+would be section 14.2's "do not carry a ratio to a place where its source
+changed".  On the T4 (section 5.11: 168 s per block at d=0.719) no d=1 block
+has ever been run, so a cloud point's added wall clock is unmeasured.
 """
 
 from __future__ import annotations
@@ -89,6 +113,24 @@ EVAL_DATASETS = ("wikitext2", "c4")
 #: Section 3.2: a compressed layer whose error exceeds this multiple of the
 #: dense E8P reference means the survivor-submatrix assumption has failed.  The
 #: fallback is rotation + GPTQ-3bit and the band moves to 1.83-2.83.
+#:
+#: THE NUMBER IS INHERITED, NOT RECALIBRATED, and the denominator under it has
+#: changed.  Section 3.2 was written when "the dense E8P reference" meant
+#: `dense_wall`, a bare quantizer; `_early_warning` now decides against
+#: `pipeline_dense`, whose block-0 errors are 1.4-7.1x SMALLER than
+#: `dense_wall`'s (both sets are in the two files under `results/m1_points/`).
+#: "Twice the reference" is a different bar per layer than it was, and 2.0 is
+#: carried over because nothing measured in this repo calibrates a different
+#: one -- not because it was re-derived.
+#:
+#: AND IT IS NOT A GATE A PREDICTOR.  At B=1.5, T=16 the largest block-0 ratio
+#: against `pipeline_dense` is 1.469 (`mlp.up_proj`, from those same two files;
+#: section 5.13 rung 4 got 1.463 on its own cache) -- the rule stays silent --
+#: while that density costs 3.4x perplexity and fails Gate A (section 5.14).
+#: So `assumption_broken: false` means "sparsity did not more than double block
+#: 0's layer error", and says nothing about whether the point is any good.
+#: Sections 5.13 and 5.14: layer error is a diagnostic, the decision is read
+#: from perplexity.
 EARLY_WARNING_RATIO = 2.0
 
 
@@ -260,20 +302,56 @@ class Checkpoint:
 # One point
 # --------------------------------------------------------------------------- #
 
-def _early_warning(problem: Cal.LayerProblem, record: dict) -> dict:
-    """Section 3.2's rule, on one layer.
+def _early_warning(problem: Cal.LayerProblem, record: dict,
+                   spec: PointSpec) -> dict:
+    """Section 3.2's rule, on one layer, against two references.
 
-    The reference is dense E8P at its natural 2.0 bits -- what a PTQ method
-    would pay -- and the claim under test is that the same quantizer keeps its
-    quality on a compacted submatrix of survivors, which are the fat tail of the
-    distribution by construction.
+    The claim under test is that E8P keeps its quality on a compacted submatrix
+    of survivors, which are the fat tail of the distribution by construction.
+    Testing it needs a reference that differs from the run in SPARSITY and in
+    nothing else.  `m1_gates.dense_wall` is not that: it is the whole layer as
+    one tile with no rotation and no LDLQ, so `ratio_to_dense` says only that
+    the full pipeline beats a bare quantizer (`docs/STATUS.md` section 5.11).
+    It is kept -- it is nearly free, it is what the two finished points carry,
+    and "we beat a bare quantizer" is a real diagnostic -- but it decides
+    nothing.
+
+    `ratio_to_pipeline_dense` decides.  Its denominator is the identical
+    pipeline at density 1.0, same tile size, same seed, same `LayerProblem`:
+    section 5.11 named that reference and section 5.14 ran it at the model
+    level.  A point that already IS the reference reuses its own record rather
+    than recomputing itself for eleven minutes.
+
+    `pipeline_dense_density` travels with the ratio on purpose.  Section 14.2's
+    rule is to count that the two arms really took different paths before
+    reading the number between them; a reference that quietly came back at the
+    run's own density would report a reassuring 1.0 and mean nothing.
     """
     wall = M.dense_wall(problem)
-    ratio = record["rel_output_error"] / max(wall["rel_output_error"], 1e-30)
+    dense = (record if record["density_realized"] >= 1.0
+             else M.pipeline_dense(problem, spec.tile_size, seed=spec.draw))
+    if "rel_output_error" not in dense:
+        # Cannot happen while `bits_per_position` and `density_for_budget` are
+        # inverses, and it is checked anyway: a skipped reference would leave
+        # a zero denominator, and an infinite ratio reads as `assumption_broken`
+        # -- the project's largest risk answered by an arithmetic accident.
+        raise RuntimeError(
+            f"the d=1 reference was skipped ({dense.get('skipped')}); section "
+            "3.2's early warning has no reference and will not be guessed"
+        )
+    err = record["rel_output_error"]
+    ratio = err / max(dense["rel_output_error"], 1e-30)
     return {
         "dense_e8p_error": wall["rel_output_error"],
         "dense_e8p_snr_db": wall["snr_db"],
-        "ratio_to_dense": ratio,
+        "ratio_to_dense": err / max(wall["rel_output_error"], 1e-30),
+        "pipeline_dense_bits": dense["budget_bits"],
+        "pipeline_dense_density": dense["density_realized"],
+        "pipeline_dense_error": dense["rel_output_error"],
+        "pipeline_dense_reused_point": dense is record,
+        "ratio_to_pipeline_dense": ratio,
+        "early_warning_ratio": EARLY_WARNING_RATIO,
+        "assumption_broken_reference": "pipeline_dense",
         "assumption_broken": ratio > EARLY_WARNING_RATIO,
     }
 
@@ -361,7 +439,7 @@ def run_point(
             )
         if i == 0:
             diagnostics.append({"block": i, "name": name,
-                                **_early_warning(problem, r)})
+                                **_early_warning(problem, r, spec)})
         return r["W_hat"]
 
     def block_done(i: int, ins, recs) -> None:

@@ -351,15 +351,22 @@ yetmeyeceğini doğrudan söylüyor.
 
 ### Blok 0'ın erken uyarısı
 
-`diagnostics` alanında `ratio_to_dense` var: sıkıştırılmış katmanın hatasının,
-aynı katmanın **yoğun E8P** referansına oranı. Referans blok 0'ın yedi
-katmanının fazladan bir quantizasyonuyla üretiliyor.
+`diagnostics` alanında **iki** oran var. `ratio_to_dense`, sıkıştırılmış
+katmanın hatasının `dense_wall`'a — tüm katman tek tile, rotasyon yok, LDLQ yok
+— oranı; §5.11'in ölçtüğü gibi bu yalnız "tam hat çıplak bir quantizer'ı
+geçiyor" der ve §3.2'nin sorusuna dokunmaz. Karar veren
+`ratio_to_pipeline_dense`: paydası **aynı hattın d=1.0'daki hâli** (aynı tile,
+aynı çekiliş, tek değişken seyreklik). Bedeli de çıplak referansınki değil —
+blok 0 için fazladan bir **tam hat geçişi**; dizüstünde bir d=1.0 bloğu 11.46 dk
+(§5.14), **T4'te hiç ölçülmedi**, oturum bütçesini buna göre ayırın.
 
-> **`ratio_to_dense > 2.0` ise varsayım düştü.** E8P'nin kompaktlanmış survivor
-> alt-matrisinde 2-bit *kalitesini* koruduğu, §3.2'nin açık varsayımı ve
-> projenin en büyük tek riski. Düşerse geri dönüş yolu rotasyon + GPTQ-3bit
+> **`ratio_to_pipeline_dense > 2.0` ise varsayım düştü.** E8P'nin kompaktlanmış
+> survivor alt-matrisinde 2-bit *kalitesini* koruduğu, §3.2'nin açık varsayımı
+> ve projenin en büyük tek riski. Düşerse geri dönüş yolu rotasyon + GPTQ-3bit
 > (`W = 3.148`) ve bant 1.83–2.83'e kayıyor. `assumption_broken` alanı bunu
-> ayrıca `true` yazıyor.
+> ayrıca `true` yazıyor, `assumption_broken_reference` de hangi referansın
+> karar verdiğini. Eşiğin 2.0'ı payda değiştiği hâlde **yeniden kalibre
+> edilmedi** — `m1_run.EARLY_WARNING_RATIO`'nun notu bunu yazıyor.
 
 Sonucu beklemenize gerek yok: blok 0 bittiği anda `state.json`'a yazılıyor.
 Ayrı bir hücreden:
@@ -393,7 +400,7 @@ var ama JSON **yok**; dosya ancak nokta 0 ile bittiğinde oluşuyor.
 | `protocol` | `calib_samples`, `calib_seqlen`, `eval_seqlen`, `eval_datasets`, `max_eval_windows` — noktanın hangi protokolle ölçüldüğü. Ölçülmüş iki nokta bu alandan önce yazıldı, onlarda **yok** |
 | `perplexity` | dataset başına. Defter yalnız `wikitext2` koşturuyor, yani tek anahtar olacak; ön-kayıt C4'ü de istiyor |
 | `records` | katman başına `rel_output_error`, artı `block`/`name`/`layer`/`n_in`/`n_out`/`n_tokens` — 224 kayıt. **SNR yok** |
-| `diagnostics` | blok 0'ın yoğun E8P referansı, `ratio_to_dense`, `assumption_broken`, `dense_e8p_snr_db` |
+| `diagnostics` | blok 0'ın **iki** referansı: `ratio_to_dense` (çıplak `dense_wall`, teşhis) ve `ratio_to_pipeline_dense` (d=1.0'daki aynı hat, **karar veren**), artı `assumption_broken`, `assumption_broken_reference`, `early_warning_ratio`, `pipeline_dense_bits`/`_density`/`_error`, `dense_e8p_snr_db` |
 | `levers` | `rotate_kron`, `search_dtype`, `compensate_block` |
 | `seconds` | noktanın **toplam** maliyeti, oturumlar boyunca |
 | `seconds_this_session` | yalnız son oturum |
