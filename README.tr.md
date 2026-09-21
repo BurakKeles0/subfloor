@@ -13,7 +13,9 @@ optimize etmek.
 > 1.5 bit / d=0.719 → **47.64** ppl, 2.0625 bit / d=1.000 → **13.97**
 > (WikiText-2, seqlen 4096, T=16, çekiliş 0). İkincisi hattın kendi ~2-bit
 > referansı: orada QuaRot-GPTQ 2-bit'in 1.6× önünde, QuIP#'in 2.1× gerisinde —
-> yani hat bozuk değil. Ama **Kapı A bu noktada düşüyor**: 0.5625 bitlik
+> yani hat bozuk değil. (İki yayımlanmış sayı da seqlen-2048 `dense-5.47`
+> ailesinden; o iki oran aynı protokolde alınmış bir fark değil,
+> konumlandırma — `docs/STATUS.md` §5.14.) Ama **Kapı A bu noktada düşüyor**: 0.5625 bitlik
 > tasarruf hattın kendi referansına karşı **3.4× ppl** ödetiyor. Bütçe
 > ekseninin ortası hâlâ boş.
 > Ayrıntı: [`docs/STATUS.md`](docs/STATUS.md).
@@ -255,9 +257,10 @@ kabul edilmemeli**.
   düşmesinden **bağımsız**: çerçeve daralır, proje durmaz
 - **E8P varsayımı** (yukarıda) — `docs/STATUS.md` §9 onu hâlâ projenin en büyük
   tek riski olarak taşıyor, ama beklediği kontrol artık alındı: aynı hat
-  `d≈1.0`'da. Budamayı tamamen kaldırmak katman hatasını yalnız %8–32 alıyor ve
-  `o_proj` %1 **kötüleşiyor** — yani quantizer'ın çöktüğü yer kompaktlanmış
-  survivor alt-matrisi değil. §3.2 varsayımı yine de doğrulanmamış sayıyor,
+  `d≈1.0`'da. Model genelinde budamayı tamamen kaldırmak ortalama katman
+  hatasını yalnız 0.2450 → 0.1957 (−%20) oynatıyor ve en zayıf katman `o_proj`
+  yalnız %3.5 kazanıyor — yani quantizer'ın çöktüğü yer kompaktlanmış survivor
+  alt-matrisi değil. §3.2 varsayımı yine de doğrulanmamış sayıyor,
   §5.13'ün pahalı yoldan öğrendiği sebeple: katman hatası **teşhis**, karar
   ppl'den okunur, ve orada aynı değişiklik **3.4×**
 - **Ön-kaydın dondurulması.** `Δ(T)` tahmin eğrisi ve `T*_tahmin` kutuları açık;
@@ -269,8 +272,9 @@ kabul edilmemeli**.
   konmamalı
 - **Sürücünün bağlam bedeli — ve burada duran eski madde yarı yanlıştı.**
   Aritmetik gerçek katmanda 1.03× doğrulukla fiyatlanıyor, ve kalan açık bellek
-  tavanına bağlanmıştı. Ölçüldü: 8 GiB karttan 14.6 GiB'a çıkmak açıklanmamış
-  2.7×'in ~1.4×'ini aldı, yani **1.95× hâlâ açıklanmamış**. Blok başına modelin
+  tavanına bağlanmıştı. Ölçüldü: 8 GiB karttan 14.6 GiB'a çıkmak nokta
+  düzeyindeki 2.7×'in ~1.4×'ini aldı, yani **1.95× hâlâ açıklanmamış**
+  (`docs/STATUS.md` §5.11; zincir ve yuvarlaması oradan). Blok başına modelin
   aritmetiği 84 s, T4 sürücüsü 168 s, dizüstü sürücüsü 339 s
 - **Axis A için LDLQ** — şu an `NotImplementedError`
 

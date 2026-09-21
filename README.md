@@ -12,8 +12,10 @@ PTQ floor.
 > uninterrupted one does. **The compressed model has now been measured, twice**
 > (WikiText-2, seqlen 4096). At the pipeline's own ~2-bit point — `B = 2.0625`,
 > `T = 16`, nothing pruned — it reads **13.97**: 1.6× ahead of QuaRot-GPTQ
-> 2-bit, 2.1× behind QuIP#, which makes it a reasonable member of its method
-> class rather than a broken pipeline. At `B = 1.5`, `T = 16`, `d = 0.719` it
+> 2-bit and 2.1× behind QuIP#, which makes it a reasonable member of its method
+> class rather than a broken pipeline. (Both published figures come from the
+> seqlen-2048 `dense-5.47` family, so those two ratios are positioning, not a
+> same-protocol difference — `docs/STATUS.md` §5.14.) At `B = 1.5`, `T = 16`, `d = 0.719` it
 > reads **47.64** — the 0.5625 bits that sparsity buys cost **3.4× perplexity
 > against the pipeline's own reference**, so **Gate A fails at this point**.
 > What is still open is the budget axis: two points, nothing between them, and
@@ -224,10 +226,13 @@ This gives two things at once: the pipeline reproduces published numbers, **and*
 the 5.12/5.47 split in the literature is confirmed to be a sequence-length
 artefact — a hypothesis that was recorded before the measurement.
 
-**But compression quality is still unmeasured.** Outside the dense baseline,
-every number is either a layer-level `tr(E H Eᵀ)` proxy or synthetic data. The
-synthetic smoke test does produce a U-shaped error curve and Gate A does pass —
-**but we generated the data, so that is not evidence for the thesis.**
+**Compression quality has now been measured — but at two points only**
+(`docs/STATUS.md` §5.11 and §5.14). Outside the dense baseline and those two,
+every number is still either a layer-level `tr(E H Eᵀ)` proxy or synthetic data.
+The synthetic smoke test does produce a U-shaped error curve and Gate A does
+pass on it — **but we generated the data, so that is not evidence for the
+thesis**, and on the real model, compared across those two points, Gate A
+**fails**.
 
 ---
 
@@ -273,9 +278,10 @@ path it changed. As rules: **a test must watch the path, not the answer**, and
   Gate A's failure: the frame narrows, the project does not stop
 - **The E8P assumption** (above) — `docs/STATUS.md` §9 still carries it as the
   project's largest single risk, but the control it was waiting for has now been
-  run: the same line at `d ≈ 1.0`. Dropping pruning entirely cuts layer error by
-  only 8–32%, and `o_proj` gets 1% *worse* — the compacted survivor submatrix is
-  not where the quantizer falls apart. §3.2 keeps it unverified anyway, for the
+  run: the same line at `d ≈ 1.0`. Over the whole model, dropping pruning
+  entirely moves mean layer error only 0.2450 → 0.1957 (−20%), and `o_proj` —
+  the weakest layer — gains just 3.5% — the compacted survivor submatrix is not
+  where the quantizer falls apart. §3.2 keeps it unverified anyway, for the
   reason §5.13 learned the hard way: layer error is a diagnostic, the decision is
   read from perplexity, and there the same change is **3.4×**
 - **Freezing the preregistration.** The `Δ(T)` prediction curve and `T*_predicted`
@@ -287,8 +293,9 @@ path it changed. As rules: **a test must watch the path, not the answer**, and
 - **The driver's context cost — and the entry that used to stand here was half
   wrong.** The arithmetic is priced to within 1.03× on a real layer, and the
   remaining gap was read as the memory ceiling. Measured: moving from the 8 GiB
-  card to a 14.6 GiB one took about 1.4× of the unexplained 2.7×, so **1.95× is
-  still unaccounted for**. Per block the model's arithmetic is 84 s, the T4
+  card to a 14.6 GiB one took about 1.4× of the point-level 2.7×, so **1.95× is
+  still unaccounted for** (`docs/STATUS.md` §5.11, where the chain and its
+  rounding come from). Per block the model's arithmetic is 84 s, the T4
   driver 168 s and the laptop driver 339 s
 - **LDLQ for Axis A** — currently `NotImplementedError`
 
