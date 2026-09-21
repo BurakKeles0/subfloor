@@ -163,3 +163,48 @@ def test_the_checkpoint_estimate_matches_what_a_point_really_writes():
     activations_gib = 128 * 2048 * 4096 * 2 / 2 ** 30
     expected = 32 * per_block_gib + 2 * activations_gib
     assert PF.POINT_CHECKPOINT_GIB == pytest.approx(expected, abs=0.05)
+
+
+# --------------------------------------------------------------------------- #
+# The protocol the runner hands to the driver
+# --------------------------------------------------------------------------- #
+
+def test_the_evaluation_window_reaches_the_driver_instead_of_defaulting(
+        tmp_path, monkeypatch):
+    """`--calib-seqlen` was overridden here and `--eval-seqlen` was not exposed
+    at all, so every cloud point calibrated at 2048 and evaluated at whatever
+    `m1_run` defaulted to -- 4096 -- with nothing on either side saying the two
+    disagreed.  That is the protocol defect `docs/STATUS.md` section 5.11
+    records, and both measured points carry it.
+
+    What is checked is the THREADING, not the number: the flag has to arrive at
+    `run_point`, because a flag that parses and is then dropped looks identical
+    from the command line.
+    """
+    seen = {}
+
+    def fake_run(spec, **kw):
+        seen.update(kw)
+        return 0, None
+
+    monkeypatch.setattr(RP, "run", fake_run)
+    assert RP.main(["--resume-root", str(tmp_path), "--device", "cpu",
+                    "--eval-seqlen", "2048"]) == 0
+    assert seen["eval_seqlen"] == 2048
+    assert seen["calib_seqlen"] == 2048
+
+
+def test_the_runners_evaluation_default_is_the_drivers(tmp_path, monkeypatch):
+    """The two defaults are written in two files and must not drift: a cloud
+    point and a local one at the same flags have to be the same point.
+    `--calib-seqlen` deliberately DOES differ (2048 against 4096, the C4
+    sampler's limit), which is exactly why the other one has to be pinned
+    rather than assumed to match.
+    """
+    import inspect
+
+    seen = {}
+    monkeypatch.setattr(RP, "run", lambda spec, **kw: (seen.update(kw), (0, None))[1])
+    RP.main(["--resume-root", str(tmp_path), "--device", "cpu"])
+    assert seen["eval_seqlen"] == (
+        inspect.signature(R.run_point).parameters["eval_seqlen"].default)

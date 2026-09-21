@@ -490,6 +490,13 @@ Bu ana projede **düzeltilmedi**, çünkü düzeltmesi kalibrasyon protokolünü
 değiştirmek demek (belgeleri akışa birleştirmek, wikitext yolunun yaptığı gibi)
 ve o bir karar. Burada yalnız kaydedildi.
 
+**Değerlendirme penceresi buna bağlı değil.** `--eval-seqlen` artık
+`run_point.py`'de de var ve varsayılanı `m1_run.py`'ninkiyle aynı: 4096. Yani
+kalibrasyonu 2048'e çekmek değerlendirmeyi 2048 yapmıyor; iki pencere artık
+komutta ayrı ayrı yazılıyor. Bayrak yokken değerlendirme penceresi
+devralınıyordu ve komutta hiç görünmüyordu; STATUS §5.11 bunu "Protokol kusuru"
+olarak kaydediyor.
+
 ### 2. Sabitler yeniden ölçülmeli
 
 Bu projedeki her zamanlama sabiti "bu makinede ölçüldü" diyor ve öyle demeyi

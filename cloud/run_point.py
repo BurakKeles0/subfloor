@@ -122,7 +122,7 @@ def make_progress(resume_root: Path, spec: R.PointSpec, *, deadline: float,
 
 
 def run(spec: R.PointSpec, *, resume_root: Path, hours: float,
-        calib_samples: int, calib_seqlen: int, eval_datasets,
+        calib_samples: int, calib_seqlen: int, eval_datasets, eval_seqlen: int,
         max_eval_windows: int | None, device: str = "cuda",
         min_free_gib: float = POINT_CHECKPOINT_GIB
         ) -> tuple[int, dict | None]:
@@ -149,7 +149,8 @@ def run(spec: R.PointSpec, *, resume_root: Path, hours: float,
         out = R.run_point(
             spec, device=device, resume_root=resume_root,
             calib_samples=calib_samples, calib_seqlen=calib_seqlen,
-            eval_datasets=eval_datasets, max_eval_windows=max_eval_windows,
+            eval_datasets=eval_datasets, eval_seqlen=eval_seqlen,
+            max_eval_windows=max_eval_windows,
             progress=progress)
     except BudgetSpent:
         print(f"\nbudget spent after {fired['blocks']} block(s) this session; "
@@ -177,6 +178,11 @@ def main(argv=None) -> int:
                     help="2048, not m1_run's 4096: C4 cannot supply 4096-token "
                          "windows at the sampler's try budget (0.33%% of "
                          "documents are that long)")
+    ap.add_argument("--eval-seqlen", type=int, default=4096,
+                    help="m1_run's default; independent of --calib-seqlen.  "
+                         "Before this flag a cloud point calibrated at 2048 "
+                         "and evaluated at 4096 without saying so "
+                         "(docs/STATUS.md section 5.11)")
     ap.add_argument("--datasets", nargs="*", default=["wikitext2"],
                     help="evaluation sets; the preregistration wants c4 too, "
                          "and it has never been timed")
@@ -201,7 +207,7 @@ def main(argv=None) -> int:
     code, out = run(
         spec, resume_root=args.resume_root, hours=args.hours,
         calib_samples=args.calib_samples, calib_seqlen=args.calib_seqlen,
-        eval_datasets=tuple(args.datasets),
+        eval_datasets=tuple(args.datasets), eval_seqlen=args.eval_seqlen,
         max_eval_windows=args.max_eval_windows, device=args.device)
 
     if code == 0 and out is not None:

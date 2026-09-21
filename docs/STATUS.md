@@ -409,8 +409,18 @@ biriken bellek baskısı. Kart 14.6 GiB'ın yalnız 8.1'ini tuttu, çünkü tava
 
 **Protokol kusuru:** kalibrasyon 2048 pencerede (`n_tokens: 262144` = 128×2048),
 eval 4096'da. §5.10'un kuralı "pencereyi sabitle"; bu koşu tutmuyor. Sebebi
-`cloud/run_point.py`'nin `--eval-seqlen` geçmemesi. Dokuz katlık açığı
+`cloud/run_point.py`'nin `--eval-seqlen` geçmemesiydi — **09-21'de eklendi**,
+yani pencere artık sessizce miras alınmıyor; ama bu koşunun kendisi kusurlu
+kaldı ve §5.14'ün kontrolü onu bilerek birebir tekrarladı. Dokuz katlık açığı
 açıklamaz ama sayı böyle raporlanmamalı.
+
+Asıl kısıt daha derinde ve **açık duruyor**: `load_calibration_tokens`'ın C4
+kolu belge başına örnekliyor, C4 belgelerinin yalnız %0.33'ü 4096'yı aşıyor
+(`cloud/README.md` §1), yani `--calib-seqlen 4096` örnekleyicinin deneme
+bütçesinde hiç yetişmiyor. Kalibrasyonu 4096'ya taşımak wikitext kolundaki gibi
+akış tabanlı bir C4 yolu gerektiriyor — ve o, kalibrasyon dağılımını
+değiştirdiği için ölçülmüş iki noktayı gelecek noktalarla kıyaslanamaz kılar.
+Karar verilmedi.
 
 ---
 
